@@ -1,0 +1,18 @@
+[Unit]
+Description=Annodock local production proxy
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/kim_3090/dev/harness-claude/claude-project/deeplabel
+EnvironmentFile=/home/kim_3090/dev/harness-claude/claude-project/deeplabel/.env
+ExecStartPre=/bin/bash -lc 'npm --prefix frontend run build'
+ExecStart=/home/kim_3090/.local/bin/caddy run --config deploy/Caddyfile --adapter caddyfile
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

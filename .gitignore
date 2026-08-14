@@ -1,0 +1,38 @@
+# Local environment and harness build artifacts
+.env
+.claude/
+plan.md
+specs/
+DESIGN.md
+.source/
+.sources/
+
+# Python
+backend/.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Runtime state
+storage/
+backend/storage/
+backend/weights/
+*.pt
+.dev-logs/
+.dev.pids
+.prod-logs/
+.prod.caddy.pid
+.prod-runtime/
+*.log
+.gstack/
+
+# Cloudflare Tunnel credentials are account secrets and stay outside source.
+.cloudflared/
+deploy/*.credentials.json
+
+# --- 대시보드에서 제외 (harness) ---
+/url.txt

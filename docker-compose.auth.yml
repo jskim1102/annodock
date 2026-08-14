@@ -1,0 +1,48 @@
+services:
+  auth:
+    restart: unless-stopped
+    build:
+      context: ../../modules/auth-service
+      dockerfile: Dockerfile
+    env_file:
+      - ../../modules/auth-service/.env
+    environment:
+      # Provider credentials are deployment-specific. These project-level
+      # values intentionally override the reusable auth module's dev app.
+      NAVER_CLIENT_ID: ${NAVER_CLIENT_ID:-}
+      NAVER_CLIENT_SECRET: ${NAVER_CLIENT_SECRET:-}
+      KAKAO_CLIENT_ID: ${KAKAO_CLIENT_ID:-}
+      KAKAO_CLIENT_SECRET: ${KAKAO_CLIENT_SECRET:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      NAVER_SCOPE: "${NAVER_SCOPE:-name email}"
+      KAKAO_SCOPE: "${KAKAO_SCOPE-}"
+      GOOGLE_SCOPE: "${GOOGLE_SCOPE:-openid email profile}"
+
+      # The browser reaches auth through the canonical same-origin proxy. The
+      # callback path is explicit because auth-service compares full URIs.
+      ALLOWED_REDIRECT_URIS: >-
+        ${PUBLIC_APP_URL:?set PUBLIC_APP_URL in .env},${PUBLIC_APP_URL}/auth/callback
+      CORS_ORIGINS: ${PUBLIC_APP_URL:?set PUBLIC_APP_URL in .env}
+      OAUTH_REDIRECT_BASE: ${PUBLIC_APP_URL:?set PUBLIC_APP_URL in .env}
+      APP_BASE_URL: ${PUBLIC_APP_URL:?set PUBLIC_APP_URL in .env}
+      COOKIE_SECURE: "true"
+      JWT_PRIVATE_KEY_PATH: /app/keys/jwt_private.pem
+      JWT_PUBLIC_KEY_PATH: /app/keys/jwt_public.pem
+    ports:
+      - "${AUTH_PORT:?set AUTH_PORT in .env}:8000"
+    volumes:
+      - ../../modules/auth-service/keys:/app/keys:ro
+    depends_on:
+      - mailhog
+    networks:
+      - default
+      - harness-shared-pg
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    restart: unless-stopped
+
+networks:
+  harness-shared-pg:
+    external: true

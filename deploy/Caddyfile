@@ -1,0 +1,26 @@
+{
+	admin off
+	auto_https off
+}
+
+http://:{$PROXY_PORT} {
+	bind 127.0.0.1
+	root * frontend/dist
+	encode zstd gzip
+
+	route {
+		# These are browser-owned landing pages even though they share the
+		# /auth namespace with auth-service.
+		@spa_exact path /auth/callback /reset
+		rewrite @spa_exact /index.html
+
+		@api path /api/*
+		reverse_proxy @api 127.0.0.1:{$BACKEND_PORT}
+
+		@auth path /auth/*
+		reverse_proxy @auth 127.0.0.1:{$AUTH_PORT}
+
+		try_files {path} /index.html
+		file_server
+	}
+}

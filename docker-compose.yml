@@ -1,0 +1,40 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile-gpu
+    env_file:
+      - .env
+    environment:
+      DEEPLABEL_RUNTIME: docker
+      STORAGE_DIR: /app/storage
+    command:
+      - sh
+      - -c
+      - alembic upgrade head && exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "${BACKEND_PORT:?set BACKEND_PORT in .env}:8000"
+    volumes:
+      - ./backend/storage:/app/storage
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - default
+      - harness-shared-pg
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "${FRONTEND_PORT:?set FRONTEND_PORT in .env}:80"
+    depends_on:
+      - backend
+
+networks:
+  harness-shared-pg:
+    external: true

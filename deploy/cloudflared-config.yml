@@ -1,0 +1,7 @@
+tunnel: 0f7796f7-4ae1-41f9-966f-aeba8f73b113
+credentials-file: /home/kim_3090/.cloudflared/0f7796f7-4ae1-41f9-966f-aeba8f73b113.json
+
+ingress:
+  - hostname: app.annodock.com
+    service: http://127.0.0.1:__PROXY_PORT__
+  - service: http_status:404
