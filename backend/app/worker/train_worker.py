@@ -117,6 +117,7 @@ def mark_run_failed(
     error: str,
     *,
     out_dir: Path | None = None,
+    storage_dir: Path | None = None,
 ) -> bool:
     """Compatibility wrapper around the shared idempotent failure recorder."""
     return persist_worker_failure(
@@ -130,6 +131,7 @@ def mark_run_failed(
             exit_code=None,
         ),
         out_dir=out_dir,
+        storage_dir=storage_dir,
     )
 
 
@@ -184,7 +186,7 @@ def complete_run(
                         owner_id,
                         artifact_bytes,
                     )
-    except Exception:
+    except BaseException:
         restore_staged_deletion(staged)
         raise
     if not updated:
@@ -238,6 +240,7 @@ def run_training(run_id: int, owner_id: int, dsn: str) -> None:
                 dsn,
                 report.reason,
                 out_dir=config.out_dir if config is not None else None,
+                storage_dir=get_settings().storage_dir,
             )
         except Exception as write_error:
             print(f"failed to persist worker error: {write_error}", flush=True)

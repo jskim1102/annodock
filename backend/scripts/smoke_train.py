@@ -193,42 +193,45 @@ def _json_body(response: httpx.Response) -> Any:
         raise AssertionError("API returned a non-JSON success response") from error
 
 
+# One dedicated account is reused across every smoke run instead of minting a
+# fresh signup per run — 18 smoke-<uuid> accounts had accumulated in the live
+# user directory before this (2026-08-18 cleanup).
+SMOKE_USERNAME = "smoke-dedicated"
+SMOKE_EMAIL = "smoke-dedicated@annodock.internal"
+SMOKE_PASSWORD = "Smoke-dedicated-A1!"
+
+
 def _create_smoke_auth(
     auth_base_url: str,
     *,
     transport: httpx.BaseTransport | None = None,
 ) -> SmokeAuth:
-    suffix = uuid.uuid4().hex
-    username = f"smoke-{suffix[:24]}"
-    email = f"smoke-{suffix}@annodock.com"
-    password = f"Smoke-{suffix}-A1!"
     with httpx.Client(
         base_url=auth_base_url,
         timeout=HTTP_TIMEOUT_SECONDS,
         transport=transport,
     ) as client:
-        signup = _json_body(
+        login_payload = {
+            "identifier": SMOKE_EMAIL,
+            "password": SMOKE_PASSWORD,
+        }
+        login = client.post("/auth/login", json=login_payload)
+        if login.status_code != 200:
+            # First run on a fresh environment: register the dedicated
+            # account once, then log in normally.
             _expect(
                 client.post(
                     "/auth/signup",
                     json={
-                        "username": username,
-                        "email": email,
-                        "password": password,
+                        "username": SMOKE_USERNAME,
+                        "email": SMOKE_EMAIL,
+                        "password": SMOKE_PASSWORD,
                     },
                 ),
                 201,
             )
-        )
-        tokens = _json_body(
-            _expect(
-                client.post(
-                    "/auth/login",
-                    json={"identifier": email, "password": password},
-                ),
-                200,
-            )
-        )
+            login = client.post("/auth/login", json=login_payload)
+        tokens = _json_body(_expect(login, 200))
         access_token = tokens.get("access_token")
         refresh_token = tokens.get("refresh_token")
         if not isinstance(access_token, str) or not access_token:
@@ -244,9 +247,9 @@ def _create_smoke_auth(
                 200,
             )
         )
-        user_id = int(signup["id"])
-        if int(me.get("id", -1)) != user_id:
-            raise AssertionError("auth /me returned a different user")
+        user_id = int(me.get("id", -1))
+        if user_id < 0:
+            raise AssertionError("auth /me did not return a user id")
         return SmokeAuth(
             user_id=user_id,
             access_token=access_token,
@@ -790,6 +793,13 @@ def main() -> None:
                         http_sizes,
                     )
                 )
+                # Self-clean: the dedicated smoke account must not accumulate
+                # a dataset (and its storage) per verification run.
+                _expect(
+                    client.delete(f"/api/runs/{run_id}?confirm=true"), 204
+                )
+                _expect(client.delete(f"/api/datasets/{dataset_id}"), 204)
+                _emit("smoke_cleanup=PASS")
     finally:
         _logout_smoke_auth(auth_base_url, smoke_auth)
         _emit("auth_logout=PASS")

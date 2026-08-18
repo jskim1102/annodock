@@ -9,8 +9,13 @@ from pathlib import Path
 import psycopg
 import torch
 
+from app.services.cleanup import stage_run_workdir
 from app.services.quota import increase_bytes_used_sync, path_tree_bytes
 from app.services.rundir import collect_run_artifacts
+from app.services.storage import (
+    finalize_staged_deletion,
+    restore_staged_deletion,
+)
 
 
 OOM_PATTERN = re.compile(
@@ -143,28 +148,40 @@ def persist_worker_failure(
     report: FailureReport,
     *,
     out_dir: str | Path | None = None,
+    storage_dir: Path | None = None,
 ) -> bool:
     """Persist the first failure exactly once from the synchronous worker."""
     artifact_bytes = 0
+    staged = None
     if out_dir is not None:
         try:
             artifact_bytes = collect_run_artifacts(out_dir)
+            if storage_dir is not None:
+                staged = stage_run_workdir(storage_dir, out_dir)
         except (OSError, ValueError):
             artifact_bytes = path_tree_bytes(Path(out_dir) / "artifacts")
-    with psycopg.connect(dsn, connect_timeout=5) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE training_runs
-                SET state='failed',
-                    finished_at=COALESCE(finished_at, now()),
-                    error=COALESCE(error, %s),
-                    artifact_bytes=%s
-                WHERE id=%s AND owner_id=%s AND state='running'
-                """,
-                (report.reason, artifact_bytes, run_id, owner_id),
-            )
-            updated = cursor.rowcount == 1
-            if updated:
-                increase_bytes_used_sync(cursor, owner_id, artifact_bytes)
-            return updated
+    try:
+        with psycopg.connect(dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE training_runs
+                    SET state='failed',
+                        finished_at=COALESCE(finished_at, now()),
+                        error=COALESCE(error, %s),
+                        artifact_bytes=%s
+                    WHERE id=%s AND owner_id=%s AND state='running'
+                    """,
+                    (report.reason, artifact_bytes, run_id, owner_id),
+                )
+                updated = cursor.rowcount == 1
+                if updated:
+                    increase_bytes_used_sync(cursor, owner_id, artifact_bytes)
+    except BaseException:
+        restore_staged_deletion(staged)
+        raise
+    if not updated:
+        restore_staged_deletion(staged)
+        return False
+    finalize_staged_deletion(staged)
+    return True

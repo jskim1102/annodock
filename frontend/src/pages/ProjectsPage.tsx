@@ -5,6 +5,7 @@ import {
   createProject,
   deleteDataset,
   deleteProject,
+  extractDatasetClasses,
   extendMergedDataset,
   getDatasetImages,
   getProjects,
@@ -34,6 +35,7 @@ import {
   toggleDatasetSelection,
 } from "../utils/datasetSelectionSummary";
 import { getProjectSummary } from "../utils/projectSummary";
+import { sortProjects, type ProjectSortOrder } from "../utils/projectSort";
 
 function statusLabel(row: ProjectDatasetSourceRow) {
   if (row.active_job) {
@@ -131,6 +133,11 @@ interface MergeDialogTarget {
   purpose: MergeActionPurpose;
 }
 
+interface ClassExtractionDialogTarget {
+  project: ProjectRow;
+  datasets: ProjectDatasetRow[];
+}
+
 interface DeleteDialogState extends ProjectDeleteConfirmation {
   project: ProjectRow;
 }
@@ -140,17 +147,21 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [search, setSearch] = useState("");
   const [filterOn, setFilterOn] = useState(false);
-  const [view, setView] = useState<"list" | "grid">("list");
+  const [sortOrder, setSortOrder] = useState<ProjectSortOrder>("recent");
   const [dialogOpen, setDialogOpen] = useState(initialDialogOpen);
   const [createdProject, setCreatedProject] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectRow[]>([]);
   const [thumbs, setThumbs] = useState<Map<number, string>>(new Map());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const [mergeTarget, setMergeTarget] = useState<MergeDialogTarget | null>(null);
   const [mergeBusy, setMergeBusy] = useState(false);
   const [mergeError, setMergeError] = useState<string | null>(null);
   const [mergeConflict, setMergeConflict] = useState<DatasetMergeOverlap | null>(null);
+  const [classExtractionTarget, setClassExtractionTarget] = useState<ClassExtractionDialogTarget | null>(null);
+  const [classExtractionBusy, setClassExtractionBusy] = useState(false);
+  const [classExtractionError, setClassExtractionError] = useState<string | null>(null);
   const [renameTarget, setRenameTarget] = useState<ProjectRow | null>(null);
   const [classEditTarget, setClassEditTarget] = useState<ProjectRow | null>(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState<DeleteDialogState | null>(null);
@@ -165,6 +176,11 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
   useEffect(() => {
     let active = true;
     let timer: number | undefined;
+    const scheduleRefresh = () => {
+      if (!active) return;
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = window.setTimeout(() => void refresh(), 2000);
+    };
     const refresh = async () => {
       try {
         const response = await getProjects();
@@ -174,13 +190,25 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
         const datasets = response.items.flatMap((project) => project.datasets);
         const thumbnailEntries = await loadThumbnailEntries(datasets);
         if (active) {
-          setThumbs(new Map(thumbnailEntries.filter((entry): entry is readonly [number, string] => entry !== null)));
+          const liveDatasetIds = new Set(datasets.map((dataset) => dataset.id));
+          setThumbs((current) => {
+            const next = new Map(
+              [...current].filter(([datasetId]) => liveDatasetIds.has(datasetId)),
+            );
+            thumbnailEntries.forEach((entry) => {
+              if (entry !== null) next.set(entry[0], entry[1]);
+            });
+            return next;
+          });
         }
         if (datasets.some((dataset) => dataset.active_job !== null)) {
-          timer = window.setTimeout(() => void refresh(), 2000);
+          scheduleRefresh();
         }
       } catch (reason: unknown) {
-        if (active) setError(reason instanceof Error ? reason.message : "프로젝트 목록을 불러오지 못했습니다.");
+        if (active) {
+          setError(reason instanceof Error ? reason.message : "프로젝트 목록을 불러오지 못했습니다.");
+          scheduleRefresh();
+        }
       } finally {
         if (active) setLoading(false);
       }
@@ -190,18 +218,31 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, []);
+  }, [loadAttempt]);
+
+  useEffect(() => {
+    if (!createdProject) return;
+    const timer = window.setTimeout(() => setCreatedProject(null), 4000);
+    return () => window.clearTimeout(timer);
+  }, [createdProject]);
+
+  const retryProjectLoad = () => {
+    setError(null);
+    setLoading(true);
+    setLoadAttempt((current) => current + 1);
+  };
 
   const visibleProjects = useMemo(() => {
     const needle = search.trim().toLowerCase();
-    return projects.filter((project) => {
+    const filtered = projects.filter((project) => {
       const matchesName = needle.length === 0
         || project.name.toLowerCase().includes(needle)
         || project.datasets.some((dataset) => dataset.name.toLowerCase().includes(needle));
       if (!matchesName) return false;
       return !filterOn || project.datasets.some((dataset) => dataset.status === "ready");
     });
-  }, [filterOn, projects, search]);
+    return sortProjects(filtered, sortOrder);
+  }, [filterOn, projects, search, sortOrder]);
 
   const allDatasets = projects.flatMap((project) => project.datasets);
   const totalImages = projects.reduce((sum, project) => sum + project.image_count, 0);
@@ -219,7 +260,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
     });
   };
 
-  const syncProjectsAfterMerge = async () => {
+  const syncProjectsAfterDatasetMutation = async () => {
     const response = await getProjects();
     const datasets = response.items.flatMap((project) => project.datasets);
     const liveDatasetIds = new Set(
@@ -248,12 +289,21 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
     setMergeTarget({ project, datasets, purpose });
   };
 
+  const openClassExtractionDialog = (
+    project: ProjectRow,
+    datasets: ProjectDatasetRow[],
+  ) => {
+    if (datasets.length === 0 || project.classes.length === 0) return;
+    setClassExtractionError(null);
+    setClassExtractionTarget({ project, datasets });
+  };
+
   const continueMergedAction = async (
     datasetId: number,
     purpose: MergeActionPurpose,
   ) => {
     try {
-      await syncProjectsAfterMerge();
+      await syncProjectsAfterDatasetMutation();
     } catch {
       setError("병합은 완료되었지만 프로젝트 목록을 새로고침하지 못했습니다.");
     }
@@ -313,6 +363,32 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
       );
     } finally {
       setMergeBusy(false);
+    }
+  };
+
+  const submitClassExtraction = async (name: string, classIds: number[]) => {
+    const target = classExtractionTarget;
+    if (!target || classExtractionBusy || classIds.length === 0) return;
+    setClassExtractionBusy(true);
+    setClassExtractionError(null);
+    try {
+      await extractDatasetClasses({
+        name,
+        dataset_ids: [...new Set(target.datasets.map((dataset) => dataset.id))],
+        class_ids: [...new Set(classIds)],
+      });
+      try {
+        await syncProjectsAfterDatasetMutation();
+      } catch {
+        setError("분리는 완료되었지만 프로젝트 목록을 새로고침하지 못했습니다.");
+      }
+      setClassExtractionTarget(null);
+    } catch (reason: unknown) {
+      setClassExtractionError(
+        reason instanceof Error ? reason.message : "데이터셋을 분리하지 못했습니다.",
+      );
+    } finally {
+      setClassExtractionBusy(false);
     }
   };
 
@@ -479,6 +555,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
 
   const anyDialogOpen = dialogOpen
     || mergeTarget !== null
+    || classExtractionTarget !== null
     || renameTarget !== null
     || deleteConfirmation !== null
     || deleteDatasetTarget !== null
@@ -500,7 +577,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
           </div>
 
           {createdProject ? <div className="created-toast" role="status"><span className="tag tag-ok"><span className="dot" />생성됨</span>{createdProject}</div> : null}
-          {error ? <div className="created-toast" role="alert">{error}</div> : null}
+          {error && projects.length > 0 ? <div className="created-toast" role="alert">{error}</div> : null}
 
           <section className="project-stats" aria-label="프로젝트 요약">
             <div className="card stat-card"><Icon name="folder" /><span>전체</span><strong className="mono">{summary.total}</strong></div>
@@ -513,6 +590,15 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
             <section className="card project-loading-state" role="status">
               프로젝트를 불러오는 중…
             </section>
+          ) : error && projects.length === 0 ? (
+            <section className="card project-load-error-state" role="alert">
+              <Icon name="warning" size={24} />
+              <strong>프로젝트 목록을 불러오지 못했습니다.</strong>
+              <span>{error}</span>
+              <button className="btn btn-secondary" type="button" onClick={retryProjectLoad}>
+                다시 시도
+              </button>
+            </section>
           ) : projects.length === 0 ? (
             <section className="card project-empty-state">
               <Icon name="folder" size={24} />
@@ -520,16 +606,12 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
               <span>새 프로젝트를 만들어 시작하세요.</span>
             </section>
           ) : (
-            <section className="card project-list-card" aria-labelledby="project-list-title" data-view={view}>
+            <section className="card project-list-card" aria-labelledby="project-list-title">
               <h2 className="sr-only" id="project-list-title">프로젝트 목록</h2>
               <div className="project-toolbar">
                 <label className="search-field"><Icon name="search" size={15} /><span className="sr-only">프로젝트 또는 데이터셋 이름 검색</span><input value={search} placeholder="이름 검색" onChange={(event) => setSearch(event.target.value)} /></label>
                 <button className={`btn btn-secondary btn-sm${filterOn ? " is-active" : ""}`} type="button" aria-pressed={filterOn} onClick={() => setFilterOn((current) => !current)}><Icon name="filter" size={14} /> 필터</button>
-                <SelectMenu className="sort-select" defaultValue="recent" ariaLabel="정렬" options={[{ value: "recent", label: "최근 생성순" }, { value: "name", label: "이름순" }]} />
-                <div className="seg view-seg" aria-label="보기 방식">
-                  <button className="seg-opt" type="button" aria-label="목록 보기" aria-pressed={view === "list"} onClick={() => setView("list")}><Icon name="list" size={14} /></button>
-                  <button className="seg-opt" type="button" aria-label="그리드 보기" aria-pressed={view === "grid"} onClick={() => setView("grid")}><Icon name="grid" size={14} /></button>
-                </div>
+                <SelectMenu className="sort-select" value={sortOrder} onChange={(value) => setSortOrder(value as ProjectSortOrder)} ariaLabel="정렬" options={[{ value: "recent", label: "최근 생성순" }, { value: "name", label: "이름순" }]} />
               </div>
               <div className="project-card-list">
                 {visibleProjects.map((project) => {
@@ -558,6 +640,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
                         });
                       }}
                       onMergeAction={(purpose) => openMergeDialog(project, selectedRows, purpose)}
+                      onExtractAction={() => openClassExtractionDialog(project, selectedRows)}
                       onRename={() => {
                         setProjectMutationError(null);
                         setRenameTarget(project);
@@ -611,6 +694,19 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
           }}
           onSubmit={(name, targetDatasetId) => void submitMerge(name, targetDatasetId)}
           onUseExisting={() => void useExistingMergedDataset()}
+        />
+      ) : null}
+      {classExtractionTarget ? (
+        <ClassExtractionDialog
+          target={classExtractionTarget}
+          busy={classExtractionBusy}
+          error={classExtractionError}
+          onClose={() => {
+            if (classExtractionBusy) return;
+            setClassExtractionTarget(null);
+            setClassExtractionError(null);
+          }}
+          onSubmit={(name, classIds) => void submitClassExtraction(name, classIds)}
         />
       ) : null}
       {classEditTarget ? (
@@ -689,6 +785,7 @@ interface ProjectRowsProps {
   onSelect: (datasetId: number, mutuallyExclusiveIds?: readonly number[]) => void;
   onSelectAll: (datasetIds: number[], shouldSelect: boolean) => void;
   onMergeAction: (purpose: MergeActionPurpose) => void;
+  onExtractAction: () => void;
   onRename: () => void;
   onEditClasses: () => void;
   onDelete: () => void;
@@ -714,6 +811,7 @@ function ProjectRows({
   onSelect,
   onSelectAll,
   onMergeAction,
+  onExtractAction,
   onRename,
   onEditClasses,
   onDelete,
@@ -833,6 +931,12 @@ function ProjectRows({
               disabled={selectedRows.length < 2}
               onClick={() => onMergeAction("merge")}
             ><Icon name="layers" size={13} />병합</button>
+            <button
+              className="btn btn-secondary btn-sm"
+              type="button"
+              disabled={selectedRows.length === 0 || project.classes.length === 0}
+              onClick={onExtractAction}
+            ><Icon name="filter" size={13} />분리</button>
             <a className="btn btn-secondary btn-sm" href={appHref(`/upload?project_id=${project.id}`)}><Icon name="plus" size={13} />데이터셋</a>
           </span>
         ) : null}
@@ -1444,6 +1548,180 @@ function MergeDatasetsDialog({
   );
 }
 
+interface ClassExtractionDialogProps {
+  target: ClassExtractionDialogTarget;
+  busy: boolean;
+  error: string | null;
+  onClose: () => void;
+  onSubmit: (name: string, classIds: number[]) => void;
+}
+
+function ClassExtractionDialog({
+  target,
+  busy,
+  error,
+  onClose,
+  onSubmit,
+}: ClassExtractionDialogProps) {
+  const [name, setName] = useState("");
+  const [selectedClassIds, setSelectedClassIds] = useState<Set<number>>(new Set());
+  const [classImageCounts, setClassImageCounts] = useState<ProjectClassImageCount[] | null>(null);
+  const [classImageCountError, setClassImageCountError] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const normalizedName = name.trim();
+  const sourceDatasetKey = target.datasets.map((dataset) => dataset.id).join(",");
+  const classImageCountById = new Map(
+    (classImageCounts ?? []).map((item) => [item.class_id, item.image_count]),
+  );
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [busy, onClose]);
+
+  useEffect(() => {
+    let active = true;
+    const sourceDatasetIds = sourceDatasetKey.split(",").map(Number);
+    setClassImageCounts(null);
+    setClassImageCountError(null);
+    void getProjectClassImageCounts(target.project.id, sourceDatasetIds)
+      .then((response) => {
+        if (active) setClassImageCounts(response.items);
+      })
+      .catch(() => {
+        if (active) {
+          setClassImageCounts([]);
+          setClassImageCountError("이미지 수를 불러오지 못했습니다.");
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [sourceDatasetKey, target.project.id]);
+
+  const toggleClass = (classId: number) => {
+    setSelectedClassIds((current) => {
+      const next = new Set(current);
+      if (next.has(classId)) next.delete(classId);
+      else next.add(classId);
+      return next;
+    });
+  };
+
+  const selectedClassIdsInProjectOrder = target.project.classes
+    .filter((projectClass) => selectedClassIds.has(projectClass.class_id))
+    .map((projectClass) => projectClass.class_id);
+
+  return (
+    <div
+      className="dialog-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !busy) onClose();
+      }}
+    >
+      <section
+        className="dialog project-action-dialog class-extraction-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="class-extraction-title"
+        aria-describedby="class-extraction-description"
+      >
+        <button
+          className="btn btn-ghost btn-sm dialog-close"
+          type="button"
+          aria-label="닫기"
+          disabled={busy}
+          onClick={onClose}
+        ><Icon name="x" size={16} /></button>
+        <h2 className="dialog-title" id="class-extraction-title">클래스 분리</h2>
+        <p className="merge-dataset-copy" id="class-extraction-description">
+          선택한 데이터셋을 원본으로 사용해 고른 클래스의 이미지와 라벨로 새 데이터셋을 만듭니다. 선택한 클래스의 라벨이 하나도 없는 이미지는 제외되며, 포함된 이미지에서도 선택하지 않은 클래스의 라벨은 제외됩니다. 원본 데이터셋은 변경되지 않습니다.
+        </p>
+        <ul className="class-extraction-source-list" aria-label="분리 원본 데이터셋">
+          {target.datasets.map((dataset) => (
+            <li key={dataset.id}>
+              <span>{dataset.name}</span>
+              <span className="mono">이미지 {dataset.image_count.toLocaleString()}개</span>
+            </li>
+          ))}
+        </ul>
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (normalizedName && selectedClassIdsInProjectOrder.length > 0) {
+              onSubmit(normalizedName, selectedClassIdsInProjectOrder);
+            }
+          }}
+        >
+          <div className="field class-extraction-name-field">
+            <label htmlFor="class-extraction-name">새 데이터셋 이름</label>
+            <input
+              className={`input${error ? " is-error" : ""}`}
+              id="class-extraction-name"
+              ref={inputRef}
+              value={name}
+              maxLength={255}
+              placeholder="새 데이터셋 이름 입력"
+              disabled={busy}
+              onChange={(event) => setName(event.target.value)}
+            />
+          </div>
+          <fieldset className="class-extraction-fieldset" disabled={busy}>
+            <legend>분리할 클래스</legend>
+            <div className="class-extraction-class-list">
+              {target.project.classes.map((projectClass) => (
+                <label className="class-input-option class-extraction-class-option" key={projectClass.class_id}>
+                  <input
+                    type="checkbox"
+                    name="class-extraction-classes"
+                    value={projectClass.class_id}
+                    checked={selectedClassIds.has(projectClass.class_id)}
+                    onChange={() => toggleClass(projectClass.class_id)}
+                  />
+                  <i aria-hidden="true" style={{ background: projectClass.color }} />
+                  <span className="class-extraction-class-name">{projectClass.name}</span>
+                  <span className="class-extraction-class-image-count mono">
+                    {classImageCounts === null
+                      ? "집계 중…"
+                      : classImageCountError
+                        ? "이미지 —"
+                        : `이미지 ${(classImageCountById.get(projectClass.class_id) ?? 0).toLocaleString()}장`}
+                  </span>
+                </label>
+              ))}
+            </div>
+            <span className="class-extraction-count" role="status">
+              선택한 클래스 {selectedClassIds.size.toLocaleString()}개
+            </span>
+            {classImageCountError ? (
+              <span className="class-extraction-count is-error" role="status">
+                {classImageCountError}
+              </span>
+            ) : null}
+          </fieldset>
+          {error ? <div className="error-text project-dialog-error" role="alert">{error}</div> : null}
+          <div className="dialog-actions">
+            <button className="btn btn-secondary" type="button" disabled={busy} onClick={onClose}>취소</button>
+            <button
+              className="btn btn-primary"
+              type="submit"
+              disabled={busy || !normalizedName || selectedClassIds.size === 0}
+            >{busy ? "분리 중…" : "분리"}</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
 interface RenameProjectDialogProps {
   project: ProjectRow;
   busy: boolean;
@@ -1610,6 +1888,9 @@ function RenameProjectDialog({
   useEffect(() => {
     inputRef.current?.focus();
     inputRef.current?.select();
+  }, []);
+
+  useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !busy) onClose();
     };
@@ -1690,6 +1971,9 @@ function DeleteProjectDialog({
 
   useEffect(() => {
     cancelRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !busy) onClose();
     };
@@ -1771,6 +2055,9 @@ function RenameDatasetDialog({
   useEffect(() => {
     inputRef.current?.focus();
     inputRef.current?.select();
+  }, []);
+
+  useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !busy) onClose();
     };

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import tempfile
@@ -15,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.class_colors import class_color
 from app.config import Settings
+from app.db import is_lock_not_available
 from app.models import (
     Annotation,
     Dataset,
@@ -307,7 +309,8 @@ async def ingest_collected(
             else None
         )
     except Exception as error:
-        await fail_job(session_factory, job_id, str(error))
+        if not is_lock_not_available(error):
+            await fail_job(session_factory, job_id, str(error))
         raise
 
     consumed_documents = coco_paths | voc_paths
@@ -338,6 +341,7 @@ async def ingest_collected(
     )
     staging: Path | None = None
     final_batch: Path | None = None
+    commit_attempted = False
 
     try:
         async with session_factory() as session:
@@ -1006,6 +1010,7 @@ async def ingest_collected(
             staging = None
             if before_commit is not None:
                 before_commit()
+            commit_attempted = True
             await session.commit()
     except ClassResolutionRequired:
         if staging is not None:
@@ -1013,12 +1018,19 @@ async def ingest_collected(
         if final_batch is not None:
             shutil.rmtree(final_batch, ignore_errors=True)
         raise
+    except asyncio.CancelledError:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        if final_batch is not None and not commit_attempted:
+            shutil.rmtree(final_batch, ignore_errors=True)
+        raise
     except Exception as error:
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
-        if final_batch is not None:
+        if final_batch is not None and not commit_attempted:
             shutil.rmtree(final_batch, ignore_errors=True)
-        await fail_job(session_factory, job_id, str(error))
+        if not is_lock_not_available(error):
+            await fail_job(session_factory, job_id, str(error))
         raise
 
     if phase_observer is not None:
@@ -1118,15 +1130,29 @@ async def run_upload_batch_job(
         )
     except ClassResolutionRequired:
         preserve_uploads = True
+    except asyncio.CancelledError:
+        preserve_uploads = True
+        raise
     except ZipSafetyError as error:
-        await fail_job(
-            session_factory,
-            job_id,
-            str(error),
-            path=error.issue.path,
-        )
+        try:
+            await fail_job(
+                session_factory,
+                job_id,
+                str(error),
+                path=error.issue.path,
+            )
+        except BaseException:
+            preserve_uploads = True
+            raise
     except Exception as error:
-        await fail_job(session_factory, job_id, str(error))
+        if is_lock_not_available(error):
+            preserve_uploads = True
+            raise
+        try:
+            await fail_job(session_factory, job_id, str(error))
+        except BaseException:
+            preserve_uploads = True
+            raise
     finally:
         if not preserve_uploads:
             for upload_id in upload_ids:

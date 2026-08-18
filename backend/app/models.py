@@ -615,3 +615,17 @@ class RunMetric(Base):
     lr: Mapped[dict[str, float] | None] = mapped_column(JSON, nullable=True)
 
     run: Mapped[TrainingRun] = relationship(back_populates="metrics")
+
+
+class AdminUser(Base):
+    """Operator grant for the read-only admin dashboard (F26)."""
+
+    __tablename__ = "admin_users"
+
+    # Logical auth-service user reference; no cross-database FK is possible.
+    owner_id: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=False
+    )
+    granted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

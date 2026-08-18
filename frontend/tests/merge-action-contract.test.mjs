@@ -65,7 +65,7 @@ test("one selected merged dataset becomes the fixed append target", () => {
   assert.match(projectsPage, /await extendMergedDataset\(targetDataset\.id, \{/);
   assert.match(
     projectsPage,
-    /const continueMergedAction[\s\S]*?await syncProjectsAfterMerge\(\);[\s\S]*?if \(purpose === "train"\) navigate/,
+    /const continueMergedAction[\s\S]*?await syncProjectsAfterDatasetMutation\(\);[\s\S]*?if \(purpose === "train"\) navigate/,
   );
   assert.match(projectsPage, /<strong>\{targetDataset\.name\}<\/strong>에 추가/);
   assert.doesNotMatch(projectsPage, /병합 데이터셋은 다른 데이터셋과 다시 합칠 수 없습니다/);

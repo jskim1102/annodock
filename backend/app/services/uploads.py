@@ -16,7 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.models import Dataset, UploadJob, UploadSession
-from app.services.storage import storage_root
+from app.services.storage import (
+    finalize_staged_deletion,
+    restore_staged_deletion,
+    stage_dataset_deletion_async,
+    storage_root,
+)
 
 
 def upload_directory(settings: Settings, upload_id: int) -> Path:
@@ -84,6 +89,39 @@ def require_open(upload: UploadSession) -> None:
         raise HTTPException(status_code=409, detail="이미 완료된 업로드입니다.")
 
 
+async def abort_upload(
+    session: AsyncSession,
+    settings: Settings,
+    upload_id: int,
+) -> None:
+    """Abort one unconsumed upload and atomically quarantine its files."""
+    upload = await locked_upload(session, upload_id)
+    if upload.state not in {"open", "aborted"}:
+        raise HTTPException(
+            status_code=409,
+            detail="이미 처리 중이거나 완료된 업로드는 중단할 수 없습니다.",
+        )
+    staged = await stage_dataset_deletion_async(
+        settings.storage_dir,
+        upload_directory(settings, upload_id),
+    )
+    try:
+        if upload.state == "open":
+            upload.state = "aborted"
+            await session.commit()
+    except BaseException as error:
+        restore_staged_deletion(staged)
+        try:
+            await session.rollback()
+        except BaseException as rollback_error:
+            error.add_note(
+                "upload abort rollback also failed: "
+                f"{type(rollback_error).__name__}"
+            )
+        raise
+    await asyncio.to_thread(finalize_staged_deletion, staged)
+
+
 def _publish_chunk(temporary: Path, target: Path) -> None:
     if target.exists():
         if filecmp.cmp(target, temporary, shallow=False):
@@ -94,6 +132,15 @@ def _publish_chunk(temporary: Path, target: Path) -> None:
             detail="같은 번호의 청크 내용이 기존 전송과 다릅니다.",
         )
     os.replace(temporary, target)
+
+
+def _refresh_upload_activity(path: Path) -> None:
+    try:
+        os.utime(path, None)
+    except FileNotFoundError:
+        # Abort/GC may have quarantined the directory.  The final row-state
+        # validation below turns that race into the canonical 409 response.
+        pass
 
 
 async def inspect_chunk(
@@ -116,6 +163,16 @@ async def store_chunk_stream(
     stream: AsyncIterable[bytes],
     expected_size: int,
 ) -> None:
+    # Validate under the row lock, then leave a filesystem activity marker and
+    # release the transaction before waiting on the request body.  The sweeper
+    # uses the marker mtime to distinguish an active transfer from a stale one.
+    upload = await locked_upload(session, upload_id)
+    require_open(upload)
+    if expected_chunk_size(upload, chunk_number) != expected_size:
+        raise HTTPException(
+            status_code=409,
+            detail="업로드 세션의 청크 크기가 변경되었습니다.",
+        )
     chunk_directory = upload_directory(settings, upload_id) / "chunks"
     chunk_directory.mkdir(parents=True, exist_ok=True)
     target = chunk_directory / f"{chunk_number}.part"
@@ -123,18 +180,19 @@ async def store_chunk_stream(
     output = await asyncio.to_thread(temporary.open, "xb")
     received_size = 0
     try:
-        try:
-            async for content in stream:
-                if not content:
-                    continue
-                if received_size + len(content) > expected_size:
-                    raise HTTPException(
-                        status_code=413,
-                        detail="청크 본문이 허용 크기를 초과했습니다.",
-                    )
-                await asyncio.to_thread(output.write, content)
-                received_size += len(content)
-        finally:
+        await session.commit()
+        async for content in stream:
+            if not content:
+                continue
+            if received_size + len(content) > expected_size:
+                raise HTTPException(
+                    status_code=413,
+                    detail="청크 본문이 허용 크기를 초과했습니다.",
+                )
+            await asyncio.to_thread(output.write, content)
+            received_size += len(content)
+            await asyncio.to_thread(_refresh_upload_activity, temporary)
+        if not output.closed:
             await asyncio.to_thread(output.close)
         if received_size != expected_size:
             raise HTTPException(
@@ -157,6 +215,8 @@ async def store_chunk_stream(
         )
         await session.commit()
     finally:
+        if not output.closed:
+            await asyncio.to_thread(output.close)
         temporary.unlink(missing_ok=True)
 
 

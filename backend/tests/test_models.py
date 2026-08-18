@@ -36,6 +36,7 @@ EXPECTED_TABLES = {
     "import_issues",
     "exports",
     "user_storage",
+    "admin_users",
     "orgs",
     "teams",
     "memberships",

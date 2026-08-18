@@ -34,6 +34,9 @@ class Settings(BaseSettings):
 
     database_url: str = Field(min_length=1)
     auth_base_url: AnyHttpUrl
+    # Read-only directory lookups (emails, signup dates) for the admin
+    # dashboard; the auth-service module itself stays untouched.
+    auth_database_url: str | None = Field(default=None)
     storage_dir: Path
     cors_origins: Annotated[tuple[str, ...], NoDecode]
     max_zip_bytes: int = Field(gt=0)
@@ -45,6 +48,8 @@ class Settings(BaseSettings):
     quota_bytes_per_user: int = Field(default=100 * 1024**3, gt=0)
     run_artifact_keep_count: int = Field(default=10, ge=0)
     run_artifact_keep_days: int = Field(default=30, ge=0)
+    upload_gc_ttl_hours: int = Field(default=24, gt=0)
+    upload_gc_resolution_ttl_days: int = Field(default=7, gt=0)
 
     @field_validator("storage_dir", mode="after")
     @classmethod

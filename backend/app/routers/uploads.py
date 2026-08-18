@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -9,13 +10,15 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import get_session
+from app.db import get_session, set_local_lock_timeout
 from app.deps import CurrentUserDep
 from app.models import Dataset, UploadSession
 from app.services.uploads import (
+    abort_upload,
     complete_upload,
     complete_upload_batch,
     inspect_chunk,
+    locked_upload,
     store_chunk_stream,
     upload_directory,
 )
@@ -103,8 +106,10 @@ async def _upload_or_404(
     session: AsyncSession,
     upload_id: int,
     owner_id: int,
+    *,
+    for_update: bool = False,
 ) -> UploadSession:
-    upload = await session.scalar(
+    statement = (
         select(UploadSession)
         .join(Dataset, Dataset.id == UploadSession.dataset_id)
         .where(
@@ -112,9 +117,34 @@ async def _upload_or_404(
             Dataset.owner_id == owner_id,
         )
     )
+    if for_update:
+        statement = statement.with_for_update(of=UploadSession)
+    upload = await session.scalar(statement)
     if upload is None:
         raise HTTPException(status_code=404, detail="업로드 세션을 찾을 수 없습니다.")
     return upload
+
+
+@router.delete("/api/uploads/{upload_id}", status_code=204)
+async def delete_upload(
+    upload_id: int,
+    request: Request,
+    session: Session,
+    current_user: CurrentUserDep,
+) -> Response:
+    await set_local_lock_timeout(session)
+    await _upload_or_404(
+        session,
+        upload_id,
+        current_user.id,
+        for_update=True,
+    )
+    await abort_upload(
+        session,
+        request.app.state.settings,
+        upload_id,
+    )
+    return Response(status_code=204)
 
 
 async def _owned_batch_or_404(
@@ -230,14 +260,26 @@ async def create_upload(
     )
     session.add(upload)
     await session.flush()
-    upload_directory(request.app.state.settings, upload.id).mkdir(
-        parents=True,
-        exist_ok=False,
-    )
+    upload_id = upload.id
+    chunk_size = upload.chunk_size
+    # Publish the database row before its directory.  The GC can therefore
+    # never observe a real upload directory whose owning row is still hidden
+    # inside this transaction and mistake it for an orphan.
     await session.commit()
+    try:
+        await asyncio.to_thread(
+            upload_directory(request.app.state.settings, upload_id).mkdir,
+            parents=True,
+            exist_ok=False,
+        )
+    except Exception:
+        failed_upload = await locked_upload(session, upload_id)
+        failed_upload.state = "aborted"
+        await session.commit()
+        raise
     return UploadCreated(
-        upload_id=upload.id,
-        chunk_size=upload.chunk_size,
+        upload_id=upload_id,
+        chunk_size=chunk_size,
         received=[],
     )
 

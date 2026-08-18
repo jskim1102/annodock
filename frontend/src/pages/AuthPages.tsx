@@ -182,6 +182,11 @@ export function SignupPage() {
     const username = formValue(event.currentTarget, "username").trim();
     const email = formValue(event.currentTarget, "email").trim();
     const password = formValue(event.currentTarget, "password");
+    const confirmation = formValue(event.currentTarget, "confirmation");
+    if (password !== confirmation) {
+      setError("비밀번호가 서로 일치하지 않습니다.");
+      return;
+    }
     setSubmitting(true);
     setError(null);
     try {
@@ -240,6 +245,20 @@ export function SignupPage() {
             disabled={submitting}
           />
           <div className="hint">8자 이상 · 영문/숫자 포함</div>
+        </div>
+        <div className="field">
+          <label htmlFor="signup-password-confirm">비밀번호 확인</label>
+          <input
+            className="input"
+            id="signup-password-confirm"
+            name="confirmation"
+            type="password"
+            placeholder="••••••••"
+            autoComplete="new-password"
+            minLength={8}
+            required
+            disabled={submitting}
+          />
         </div>
         <button className="btn btn-primary auth-submit" type="submit" disabled={submitting}>{submitting ? "가입 중…" : "회원가입"}</button>
       </form>

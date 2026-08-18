@@ -10,11 +10,12 @@ import { logoutCurrentSession } from "../api/auth";
 import { appHref } from "../navigation";
 import { useAuthSession } from "../store/auth";
 import { getAccountPresentation } from "../utils/accountPresentation";
+import { probeAdminOverview, resetAdminProbe } from "../utils/adminAccess";
 import { Icon } from "./Icon";
 import { ThemeToggle } from "./ThemeToggle";
 
 interface AppShellProps extends PropsWithChildren {
-  active: "projects" | "runs";
+  active: "projects" | "runs" | "admin";
   breadcrumb?: ReactNode;
   mainClassName?: string;
 }
@@ -22,7 +23,11 @@ interface AppShellProps extends PropsWithChildren {
 export function Brand({ inverse = false }: { inverse?: boolean }) {
   return (
     <span className={`brand${inverse ? " brand-inverse" : ""}`}>
-      Anno<span>dock</span>
+      <img className="brand-mark brand-mark-light" src="/assets/annodock-mark-on-light.svg" alt="" />
+      <img className="brand-mark brand-mark-dark" src="/assets/annodock-mark-on-dark.svg" alt="" />
+      <span className="brand-word">
+        Anno<span>dock</span>
+      </span>
     </span>
   );
 }
@@ -55,6 +60,25 @@ export function AppShell({
 }: AppShellProps) {
   const session = useAuthSession();
   const [loggingOut, setLoggingOut] = useState(false);
+  // Server response is the source of truth for admin access; nothing is
+  // persisted client-side, so the link simply stays hidden until the probe
+  // confirms the grant for this page load.
+  const [adminVisible, setAdminVisible] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    probeAdminOverview()
+      .then((overview) => {
+        if (alive) setAdminVisible(overview !== null);
+      })
+      .catch(() => {
+        // Network or auth hiccups keep the link hidden; the probe result is
+        // advisory here — the /admin route re-checks with the server anyway.
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const accountMenuRef = useRef<HTMLDivElement>(null);
   const accountTriggerRef = useRef<HTMLButtonElement>(null);
@@ -85,6 +109,7 @@ export function AppShell({
   }, [accountMenuOpen]);
 
   const handleLogout = async () => {
+    resetAdminProbe();
     if (loggingOut) return;
     setAccountMenuOpen(false);
     setLoggingOut(true);
@@ -119,6 +144,16 @@ export function AppShell({
             <Icon name="cpu" size={15} />
             AI 학습
           </a>
+          {adminVisible && (
+            <a
+              className="sidebar-link"
+              href={appHref("/admin")}
+              aria-current={active === "admin" ? "page" : undefined}
+            >
+              <Icon name="users" size={15} />
+              관리자
+            </a>
+          )}
         </nav>
         <StorageMeter />
       </aside>

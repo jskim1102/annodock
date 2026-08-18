@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from uuid import uuid4
 
@@ -18,8 +19,13 @@ from app.models import (
     TrainingRun,
     UserStorage,
 )
+from app.services import dataset_merge as dataset_merge_service
 from app.services import training
-from app.services.storage import contained_storage_path, storage_relative_path
+from app.services.storage import (
+    contained_storage_path,
+    stage_deletions_async as real_stage_deletions_async,
+    storage_relative_path,
+)
 
 
 pytestmark = pytest.mark.asyncio
@@ -1022,6 +1028,180 @@ async def test_extend_merged_dataset_consolidates_merged_snapshots_and_preserves
         usage_after = await session.get(UserStorage, 1)
         assert usage_after is not None
         assert usage_after.bytes_used == bytes_before
+
+
+async def _merged_consolidation_fixture(
+    client: httpx.AsyncClient,
+    app,
+    *,
+    suffix: str,
+) -> tuple[int, list[int]]:
+    project = await client.post(
+        "/api/projects",
+        json={"name": f"test-merge-{suffix}-{uuid4().hex}", "classes": []},
+    )
+    assert project.status_code == 201
+    project_id = project.json()["id"]
+    source_ids = [
+        await create_ready_dataset(
+            client,
+            app,
+            project_id=project_id,
+            suffix=f"{suffix}-source-{index}",
+            classes={0: "person"},
+            annotation_class_id=0,
+            content=f"{suffix}-{index}".encode(),
+        )
+        for index in range(6)
+    ]
+    merged_ids: list[int] = []
+    for role, start in (("target", 0), ("loser-a", 2), ("loser-b", 4)):
+        response = await client.post(
+            "/api/datasets/merge",
+            json={
+                "name": f"test-merge-{suffix}-{role}-{uuid4().hex}",
+                "dataset_ids": source_ids[start : start + 2],
+            },
+        )
+        assert response.status_code == 201
+        merged_ids.append(response.json()["id"])
+    return merged_ids[0], merged_ids[1:]
+
+
+async def test_extend_merged_dataset_stages_all_losing_merges_in_one_request_scope(
+    client: httpx.AsyncClient,
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_id, losing_ids = await _merged_consolidation_fixture(
+        client,
+        app,
+        suffix="bulk-stage",
+    )
+    async with app.state.session_factory() as session:
+        losing_rows = [
+            await session.get(Dataset, dataset_id) for dataset_id in losing_ids
+        ]
+        assert all(row is not None for row in losing_rows)
+        losing_roots = {
+            contained_storage_path(app.state.settings.storage_dir, row.storage_path)
+            for row in losing_rows
+            if row is not None
+        }
+
+    observations: list[tuple[set[Path], set[Path]]] = []
+
+    async def observe_request_scope(root: Path, stored_paths) -> list:
+        paths = tuple(stored_paths)
+        staged = await real_stage_deletions_async(root, paths)
+        observations.append(
+            (
+                {contained_storage_path(root, path) for path in paths},
+                {
+                    item.quarantine
+                    for item in staged
+                    if item is not None
+                },
+            )
+        )
+        return staged
+
+    monkeypatch.setattr(
+        dataset_merge_service,
+        "stage_deletions_async",
+        observe_request_scope,
+    )
+
+    response = await client.post(
+        f"/api/datasets/{target_id}/merge-sources",
+        json={"dataset_ids": losing_ids},
+    )
+
+    assert response.status_code == 200
+    assert len(observations) == 1
+    observed_roots, quarantine_scopes = observations[0]
+    assert observed_roots == losing_roots
+    assert len(quarantine_scopes) == 1
+
+
+async def test_extend_merged_dataset_cancellation_restores_files_before_failed_rollback(
+    client: httpx.AsyncClient,
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_id, losing_ids = await _merged_consolidation_fixture(
+        client,
+        app,
+        suffix="cancel-restore",
+    )
+    async with app.state.session_factory() as session:
+        target = await session.get(Dataset, target_id)
+        losing_rows = [
+            await session.get(Dataset, dataset_id) for dataset_id in losing_ids
+        ]
+        assert target is not None
+        assert all(row is not None for row in losing_rows)
+        target_root = contained_storage_path(
+            app.state.settings.storage_dir,
+            target.storage_path,
+        )
+        losing_roots = [
+            contained_storage_path(app.state.settings.storage_dir, row.storage_path)
+            for row in losing_rows
+            if row is not None
+        ]
+    target_files_before = {
+        path.relative_to(target_root)
+        for path in target_root.rglob("*")
+        if path.is_file()
+    }
+    markers = []
+    for index, root in enumerate(losing_roots):
+        marker = root / f"rollback-marker-{index}.bin"
+        marker.write_bytes(f"loser-{index}".encode())
+        markers.append(marker)
+
+    rollback_attempted = False
+    async with app.state.session_factory() as session:
+        async def cancel_commit() -> None:
+            await session.flush()
+            raise asyncio.CancelledError
+
+        async def fail_rollback() -> None:
+            nonlocal rollback_attempted
+            rollback_attempted = True
+            raise RuntimeError("forced merge rollback failure")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(session, "commit", cancel_commit)
+            patch.setattr(session, "rollback", fail_rollback)
+            with pytest.raises(asyncio.CancelledError):
+                await dataset_merge_service.extend_merged_dataset(
+                    app.state.settings,
+                    session,
+                    merged_dataset_id=target_id,
+                    dataset_ids=losing_ids,
+                    owner_id=1,
+                )
+        await session.rollback()
+
+    assert rollback_attempted is True
+    assert {
+        path.relative_to(target_root)
+        for path in target_root.rglob("*")
+        if path.is_file()
+    } == target_files_before
+    assert [marker.read_bytes() for marker in markers] == [b"loser-0", b"loser-1"]
+    pending_root = app.state.settings.storage_dir / ".delete-pending"
+    assert not pending_root.exists() or not any(pending_root.iterdir())
+    async with app.state.session_factory() as session:
+        target = await session.get(Dataset, target_id)
+        assert target is not None
+        assert target.image_count == 2
+        losing_rows = [
+            await session.get(Dataset, dataset_id) for dataset_id in losing_ids
+        ]
+        assert all(row is not None for row in losing_rows)
 
 
 async def test_extend_merged_dataset_rejects_losing_merge_with_active_training(

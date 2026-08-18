@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 from collections import defaultdict
@@ -39,9 +40,9 @@ from app.services.quota import (
 from app.services.storage import (
     contained_storage_path,
     create_dataset_storage,
-    finalize_staged_deletion,
-    restore_staged_deletion,
-    stage_dataset_deletion,
+    finalize_staged_deletions,
+    restore_staged_deletions,
+    stage_deletions_async,
     storage_relative_path,
 )
 
@@ -99,7 +100,7 @@ def _safe_filename(value: str) -> str:
     return filename
 
 
-def _copy_source_images(
+def copy_source_images(
     settings: Settings,
     *,
     target_dataset_id: int,
@@ -110,6 +111,7 @@ def _copy_source_images(
     occupied_keys: set[PairKey],
     reserved_keys: set[PairKey],
     created_files: list[Path] | None = None,
+    included_class_ids: frozenset[int] | None = None,
 ) -> _CopiedImages:
     copied_images: list[Image] = []
     annotation_count = 0
@@ -118,6 +120,29 @@ def _copy_source_images(
 
     for source in sources:
         for source_image in images_by_dataset[source.id]:
+            annotations = []
+            for annotation in source_image.annotations:
+                target_class_id = class_remap[
+                    (source.id, annotation.class_id)
+                ]
+                if (
+                    included_class_ids is not None
+                    and target_class_id not in included_class_ids
+                ):
+                    continue
+                annotations.append(
+                    Annotation(
+                        class_id=target_class_id,
+                        cx=annotation.cx,
+                        cy=annotation.cy,
+                        w=annotation.w,
+                        h=annotation.h,
+                        serialized_bytes=annotation.serialized_bytes,
+                    )
+                )
+            if included_class_ids is not None and not annotations:
+                continue
+
             filename = _safe_filename(source_image.filename)
             key = (source_image.split, source_image.stem)
             storage_key = key
@@ -187,17 +212,6 @@ def _copy_source_images(
                 )
             accounted_bytes += original_bytes + display_bytes + thumb_bytes
 
-            annotations = [
-                Annotation(
-                    class_id=class_remap[(source.id, annotation.class_id)],
-                    cx=annotation.cx,
-                    cy=annotation.cy,
-                    w=annotation.w,
-                    h=annotation.h,
-                    serialized_bytes=annotation.serialized_bytes,
-                )
-                for annotation in source_image.annotations
-            ]
             annotation_count += len(annotations)
             copied_images.append(
                 Image(
@@ -511,7 +525,7 @@ async def merge_datasets(
             settings.storage_dir,
             storage_path,
         )
-        copied = _copy_source_images(
+        copied = copy_source_images(
             settings,
             target_dataset_id=dataset.id,
             target_storage=storage_path,
@@ -816,7 +830,7 @@ async def extend_merged_dataset(
     copied_files: list[Path] = []
     staged_deletions = []
     try:
-        copied = _copy_source_images(
+        copied = copy_source_images(
             settings,
             target_dataset_id=target.id,
             target_storage=target_storage,
@@ -885,12 +899,12 @@ async def extend_merged_dataset(
                 session,
                 losing_merge.id,
             )
-            staged_deletions.append(
-                stage_dataset_deletion(
-                    settings.storage_dir,
-                    losing_merge.storage_path,
-                )
-            )
+
+        staged_deletions = await stage_deletions_async(
+            settings.storage_dir,
+            [losing_merge.storage_path for losing_merge in losing_merges],
+        )
+        for losing_merge in losing_merges:
             await session.delete(losing_merge)
 
         target.image_count += len(copied.images)
@@ -904,13 +918,31 @@ async def extend_merged_dataset(
             await decrease_bytes_used(session, owner_id, -quota_delta)
         await session.commit()
         await session.refresh(target)
-    except Exception:
-        await session.rollback()
-        for staged in reversed(staged_deletions):
-            restore_staged_deletion(staged)
-        _remove_created_files(copied_files, stop_at=target_storage)
+    except BaseException as error:
+        try:
+            restored = restore_staged_deletions(reversed(staged_deletions))
+            if not restored:
+                error.add_note("one or more merged dataset paths could not be restored")
+        except BaseException as restore_error:
+            error.add_note(
+                "merged dataset restore also failed: "
+                f"{type(restore_error).__name__}"
+            )
+        try:
+            _remove_created_files(copied_files, stop_at=target_storage)
+        except BaseException as cleanup_error:
+            error.add_note(
+                "merged dataset copied-file cleanup also failed: "
+                f"{type(cleanup_error).__name__}"
+            )
+        try:
+            await session.rollback()
+        except BaseException as rollback_error:
+            error.add_note(
+                "merged dataset rollback also failed: "
+                f"{type(rollback_error).__name__}"
+            )
         raise
 
-    for staged in staged_deletions:
-        finalize_staged_deletion(staged)
+    await asyncio.to_thread(finalize_staged_deletions, staged_deletions)
     return DatasetMergeResult(dataset=target, sources=result_sources)

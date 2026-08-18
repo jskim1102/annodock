@@ -38,6 +38,9 @@ export function NewProjectDialog({ projects, onClose, onCreate }: NewProjectDial
 
   useEffect(() => {
     nameRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         onClose();

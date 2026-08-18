@@ -8,6 +8,7 @@ import { TrainPage } from "./pages/TrainPage";
 import { UploadPage } from "./pages/UploadPage";
 import { ViewerPage } from "./pages/Viewer";
 import { appHref } from "./navigation";
+import { AdminPage } from "./pages/AdminPage";
 import { useAuthSession } from "./store/auth";
 import { ThemeProvider } from "./theme";
 
@@ -41,6 +42,7 @@ function Screen() {
   if (path === "/projects" || path === "/datasets") return <ProjectsPage />;
   if (path === "/projects/new") return <ProjectsPage initialDialogOpen />;
   if (path === "/upload") return <UploadPage />;
+  if (path === "/admin") return <AdminPage />;
   const datasetMatch = path.match(/^\/datasets\/(\d+)\/(viewer|train)$/);
   if (datasetMatch) {
     const datasetId = Number(datasetMatch[1]);

@@ -212,10 +212,17 @@ async def test_reaper_lifespan_starts_and_stops_periodic_task(
         storage_dir: Path,
         keep_count: int,
         keep_days: int,
+        upload_ttl_hours: int,
+        resolution_ttl_days: int,
     ) -> None:
         assert storage_dir == test_settings.storage_dir
         assert keep_count == test_settings.run_artifact_keep_count
         assert keep_days == test_settings.run_artifact_keep_days
+        assert upload_ttl_hours == test_settings.upload_gc_ttl_hours
+        assert (
+            resolution_ttl_days
+            == test_settings.upload_gc_resolution_ttl_days
+        )
         started.set()
         await asyncio.Event().wait()
 

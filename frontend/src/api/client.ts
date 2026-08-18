@@ -71,6 +71,12 @@ export interface DatasetMergeInput {
   dataset_ids: number[];
 }
 
+export interface DatasetClassExtractionInput {
+  name: string;
+  dataset_ids: number[];
+  class_ids: number[];
+}
+
 export interface DatasetMergeSourcesInput {
   dataset_ids: number[];
 }
@@ -385,6 +391,12 @@ export function mergeDatasets(input: DatasetMergeInput): Promise<DatasetListItem
   return requestJson<DatasetListItem>("/api/datasets/merge", jsonInit("POST", input));
 }
 
+export function extractDatasetClasses(
+  input: DatasetClassExtractionInput,
+): Promise<DatasetRow> {
+  return requestJson<DatasetRow>("/api/datasets/extract", jsonInit("POST", input));
+}
+
 export function extendMergedDataset(
   mergedDatasetId: number,
   input: DatasetMergeSourcesInput,
@@ -488,4 +500,26 @@ export async function downloadResponse(
 ): Promise<Blob> {
   const response = await responseOrThrow(await apiFetch(path, init));
   return response.blob();
+}
+
+export interface AdminUserRow {
+  id: number;
+  email: string | null;
+  username: string | null;
+  created_at: string;
+  login_methods: string[];
+  bytes_used: number;
+}
+
+export interface AdminOverview {
+  user_count: number;
+  storage_total_bytes: number;
+}
+
+export function getAdminOverview(): Promise<AdminOverview> {
+  return requestJson("/api/admin/overview");
+}
+
+export function getAdminUsers(): Promise<{ users: AdminUserRow[] }> {
+  return requestJson("/api/admin/users");
 }

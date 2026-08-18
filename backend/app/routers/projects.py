@@ -12,7 +12,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import get_session
+from app.db import get_session, set_local_lock_timeout
 from app.deps import CurrentUserDep
 from app.models import (
     Annotation,
@@ -24,8 +24,9 @@ from app.models import (
     ProjectClass,
     TrainingRun,
     UploadJob,
+    UploadSession,
 )
-from app.services.cleanup import stage_training_run_deletion
+from app.services.cleanup import contained_training_run_path
 from app.services.quota import (
     dataset_accounted_bytes,
     decrease_bytes_used,
@@ -34,10 +35,11 @@ from app.services.quota import (
 from app.services.storage import (
     StorageBoundaryError,
     contained_storage_path,
-    finalize_staged_deletion,
-    restore_staged_deletion,
-    stage_dataset_deletion,
+    finalize_staged_deletions,
+    restore_staged_deletions,
+    stage_deletions_async,
 )
+from app.services.uploads import upload_directory
 
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -718,33 +720,46 @@ async def delete_project(
             },
         )
 
-    storage_dir = request.app.state.settings.storage_dir
-    staged_deletions = []
-    accounted_bytes = 0
-    try:
-        for dataset in datasets:
-            accounted_bytes += await dataset_accounted_bytes(
-                session,
-                dataset.id,
-            )
-            if dataset.storage_path:
-                staged_deletions.append(
-                    await asyncio.to_thread(
-                        stage_dataset_deletion,
-                        storage_dir,
-                        dataset.storage_path,
-                    )
+    if dataset_ids:
+        await set_local_lock_timeout(session)
+        upload_ids = list(
+            (
+                await session.scalars(
+                    select(UploadSession.id)
+                    .where(UploadSession.dataset_id.in_(dataset_ids))
+                    .order_by(UploadSession.id)
+                    .with_for_update()
                 )
-        for run in runs:
-            accounted_bytes += await _run_accounted_bytes(request, run)
-            staged_deletions.append(
-                await asyncio.to_thread(
-                    stage_training_run_deletion,
-                    storage_dir,
-                    run.out_dir,
-                )
-            )
+            ).all()
+        )
+    else:
+        upload_ids = []
 
+    storage_dir = request.app.state.settings.storage_dir
+    accounted_bytes = 0
+    deletion_paths = []
+    for dataset in datasets:
+        accounted_bytes += await dataset_accounted_bytes(
+            session,
+            dataset.id,
+        )
+        if dataset.storage_path:
+            deletion_paths.append(dataset.storage_path)
+    deletion_paths.extend(
+        upload_directory(request.app.state.settings, upload_id)
+        for upload_id in upload_ids
+    )
+    for run in runs:
+        accounted_bytes += await _run_accounted_bytes(request, run)
+        deletion_paths.append(
+            contained_training_run_path(storage_dir, run.out_dir)
+        )
+
+    staged_deletions = await stage_deletions_async(
+        storage_dir,
+        deletion_paths,
+    )
+    try:
         for run in runs:
             await session.delete(run)
         await session.flush()
@@ -753,14 +768,18 @@ async def delete_project(
         await session.flush()
         await session.delete(project)
         await session.commit()
-    except Exception:
-        await session.rollback()
-        for staged in reversed(staged_deletions):
-            await asyncio.to_thread(restore_staged_deletion, staged)
+    except BaseException as error:
+        restore_staged_deletions(reversed(staged_deletions))
+        try:
+            await session.rollback()
+        except BaseException as rollback_error:
+            error.add_note(
+                "project delete rollback also failed: "
+                f"{type(rollback_error).__name__}"
+            )
         raise
 
-    for staged in staged_deletions:
-        await asyncio.to_thread(finalize_staged_deletion, staged)
+    await asyncio.to_thread(finalize_staged_deletions, staged_deletions)
     if accounted_bytes:
         await decrease_bytes_used(
             session,

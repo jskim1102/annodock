@@ -18,10 +18,22 @@ import { AppShell, BreadcrumbLink } from "../components/AppShell";
 import { Icon } from "../components/Icon";
 import { SelectMenu } from "../components/SelectMenu";
 import { appHref, navigate } from "../navigation";
+import {
+  hasTrainingFormNumericErrors,
+  validateTrainingFormNumericValues,
+  type TrainingFormNumericErrors,
+  type TrainingNumericField,
+} from "../utils/trainingFormValidation";
 import { getRecommendedRatios } from "../utils/trainingRatios";
 import { RTX_3090_TRAINING_DEFAULTS } from "../utils/trainingArguments";
 
 type SplitKey = "train" | "valid" | "test";
+
+const RATIO_FIELD_BY_KEY: Record<SplitKey, TrainingNumericField> = {
+  train: "trainRatio",
+  valid: "validRatio",
+  test: "testRatio",
+};
 
 export function TrainPage({ datasetId }: { datasetId: number }) {
   const [dataset, setDataset] = useState<DatasetDetail | null>(null);
@@ -31,7 +43,7 @@ export function TrainPage({ datasetId }: { datasetId: number }) {
   const [models, setModels] = useState<ModelPreset[]>([]);
   const [weights, setWeights] = useState("");
   const [splitMode, setSplitMode] = useState<"2way" | "3way">("3way");
-  const [ratios, setRatios] = useState({ train: 70, valid: 20, test: 10 });
+  const [ratioInputs, setRatioInputs] = useState({ train: "70", valid: "20", test: "10" });
   const [excludeUnlabeledImages, setExcludeUnlabeledImages] = useState<boolean>(RTX_3090_TRAINING_DEFAULTS.exclude_unlabeled_images);
   const [includeUnlabeledImagesInTest, setIncludeUnlabeledImagesInTest] = useState<boolean>(RTX_3090_TRAINING_DEFAULTS.include_unlabeled_images_in_test);
   const [epochs, setEpochs] = useState(String(RTX_3090_TRAINING_DEFAULTS.epochs));
@@ -60,6 +72,7 @@ export function TrainPage({ datasetId }: { datasetId: number }) {
   const [savePeriod, setSavePeriod] = useState(String(RTX_3090_TRAINING_DEFAULTS.save_period));
   const [seed, setSeed] = useState("");
   const [multiScale, setMultiScale] = useState(String(RTX_3090_TRAINING_DEFAULTS.multi_scale));
+  const [fieldErrors, setFieldErrors] = useState<TrainingFormNumericErrors>({});
   const [error, setError] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [runId, setRunId] = useState<number | null>(null);
@@ -117,6 +130,7 @@ export function TrainPage({ datasetId }: { datasetId: number }) {
     setScale(String(next.scale));
     setAmp(next.amp);
     setCompile(next.compile);
+    setFieldErrors({});
   };
 
   const loadRecommendation = async (options?: { useCurrentValues?: boolean }) => {
@@ -171,6 +185,11 @@ export function TrainPage({ datasetId }: { datasetId: number }) {
     return () => { active = false; };
   }, [dataset, weights, excludeUnlabeledImages, includeUnlabeledImagesInTest]);
 
+  const ratios = {
+    train: Number(ratioInputs.train),
+    valid: Number(ratioInputs.valid),
+    test: Number(ratioInputs.test),
+  };
   const totalImages = dataset?.image_count ?? 0;
   const eligibleImages = (
     excludeUnlabeledImages
@@ -208,14 +227,75 @@ export function TrainPage({ datasetId }: { datasetId: number }) {
   const setMode = (mode: "2way" | "3way") => {
     setSplitMode(mode);
     if (mode === "2way") setIncludeUnlabeledImagesInTest(false);
-    setRatios(mode === "2way"
-      ? { train: 80, valid: 20, test: 0 }
-      : { train: 70, valid: 20, test: 10 });
+    setRatioInputs(mode === "2way"
+      ? { train: "80", valid: "20", test: "0" }
+      : { train: "70", valid: "20", test: "10" });
+    setFieldErrors((current) => {
+      const next = { ...current };
+      delete next.trainRatio;
+      delete next.validRatio;
+      delete next.testRatio;
+      return next;
+    });
     setError(null);
+  };
+
+  const clearFieldError = (field: TrainingNumericField) => {
+    setFieldErrors((current) => {
+      if (!current[field]) return current;
+      const next = { ...current };
+      delete next[field];
+      return next;
+    });
+  };
+
+  const numericInputProps = (field: TrainingNumericField, invalid = false) => {
+    const message = fieldErrors[field];
+    return {
+      className: `input${message || invalid ? " is-error" : ""}`,
+      "aria-invalid": message ? true : undefined,
+      "aria-describedby": message ? `${field}-error` : undefined,
+    };
+  };
+
+  const numericFieldError = (field: TrainingNumericField) => {
+    const message = fieldErrors[field];
+    return message
+      ? <div className="error-text" id={`${field}-error`} role="alert">{message}</div>
+      : null;
   };
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    const numericErrors = validateTrainingFormNumericValues({
+      trainRatio: ratioInputs.train,
+      validRatio: ratioInputs.valid,
+      testRatio: ratioInputs.test,
+      epochs,
+      imgsz,
+      batch,
+      lr0,
+      lrf,
+      warmupEpochs,
+      patience,
+      mosaic,
+      mixup,
+      hsvH,
+      hsvS,
+      hsvV,
+      fliplr,
+      scale,
+      translate,
+      workers,
+      savePeriod,
+      multiScale,
+      seed,
+    });
+    setFieldErrors(numericErrors);
+    if (hasTrainingFormNumericErrors(numericErrors)) {
+      setError("표시된 숫자 입력값을 확인하세요.");
+      return;
+    }
     if (ratioTotal !== 100) {
       setError(`분할 비율의 합은 100이어야 합니다. 현재 ${ratioTotal}입니다.`);
       return;
@@ -286,7 +366,7 @@ export function TrainPage({ datasetId }: { datasetId: number }) {
       breadcrumb={<><BreadcrumbLink href="/projects">프로젝트</BreadcrumbLink><span>/</span><BreadcrumbLink href="/projects">{dataset?.name ?? `데이터셋 ${datasetId}`}</BreadcrumbLink><span>/</span><strong>학습</strong></>}
     >
       <h1 className="page-title">학습 설정</h1>
-      <form onSubmit={(event) => void submit(event)}>
+      <form noValidate onSubmit={(event) => void submit(event)}>
         <div className="training-layout">
           <section className="card training-form-card">
             <div className="field">
@@ -300,7 +380,28 @@ export function TrainPage({ datasetId }: { datasetId: number }) {
                 <button className="seg-opt" type="button" aria-pressed={splitMode === "3way"} onClick={() => setMode("3way")}>3-way · train/valid/test</button>
               </div>
               <div className={`ratio-grid ratio-${splitMode}`}>
-                {splitKeys.map((key) => <label key={key}><span className="sr-only">{key} %</span><input className={`input${ratioTotal !== 100 ? " is-error" : ""}`} data-numeric type="number" min="0" max="100" value={ratios[key]} aria-label={`${key} %`} onChange={(event) => setRatios((current) => ({ ...current, [key]: Number(event.target.value) }))} /></label>)}
+                {splitKeys.map((key) => {
+                  const field = RATIO_FIELD_BY_KEY[key];
+                  return (
+                    <label key={key}>
+                      <span className="sr-only">{key} %</span>
+                      <input
+                        {...numericInputProps(field, ratioTotal !== 100)}
+                        data-numeric
+                        type="number"
+                        min="0"
+                        max="100"
+                        value={ratioInputs[key]}
+                        aria-label={`${key} %`}
+                        onChange={(event) => {
+                          setRatioInputs((current) => ({ ...current, [key]: event.target.value }));
+                          clearFieldError(field);
+                        }}
+                      />
+                      {numericFieldError(field)}
+                    </label>
+                  );
+                })}
               </div>
               <div className={`split-ratio-guidance${ratioGap === 0 ? "" : " is-warning"}`}>
                 <span>권장값 · {recommendedRatioText}</span>
@@ -392,11 +493,11 @@ export function TrainPage({ datasetId }: { datasetId: number }) {
             ) : null}
             {recommendationError ? <p className="training-recommendation-error" role="alert">{recommendationError}</p> : null}
             <div className="two-field-grid">
-              <div className="field"><label htmlFor="epochs">epochs</label><input className="input" id="epochs" data-numeric required type="number" min="1" value={epochs} onChange={(event) => setEpochs(event.target.value)} /></div>
-              <div className="field"><label htmlFor="imgsz">imgsz</label><input className="input" id="imgsz" data-numeric required type="number" min="1" value={imgsz} onChange={(event) => setImgsz(event.target.value)} /></div>
+              <div className="field"><label htmlFor="epochs">epochs</label><input {...numericInputProps("epochs")} id="epochs" data-numeric required type="number" min="1" value={epochs} onChange={(event) => { setEpochs(event.target.value); clearFieldError("epochs"); }} />{numericFieldError("epochs")}</div>
+              <div className="field"><label htmlFor="imgsz">imgsz</label><input {...numericInputProps("imgsz")} id="imgsz" data-numeric required type="number" min="1" value={imgsz} onChange={(event) => { setImgsz(event.target.value); clearFieldError("imgsz"); }} />{numericFieldError("imgsz")}</div>
             </div>
             <div className="two-field-grid">
-              <div className="field"><label htmlFor="batch">batch</label><input className="input" id="batch" data-numeric required type="number" min="-1" value={batch} onChange={(event) => setBatch(event.target.value)} /><div className="hint">모델·최대 해상도 기준 RTX 3090 권장값</div></div>
+              <div className="field"><label htmlFor="batch">batch</label><input {...numericInputProps("batch")} id="batch" data-numeric required type="number" min="-1" value={batch} onChange={(event) => { setBatch(event.target.value); clearFieldError("batch"); }} />{numericFieldError("batch")}<div className="hint">모델·최대 해상도 기준 RTX 3090 권장값</div></div>
             </div>
             <div className="training-parameter-sections">
               <section className="training-parameter-section">
@@ -404,14 +505,14 @@ export function TrainPage({ datasetId }: { datasetId: number }) {
                 <div className="training-parameter-panel">
                   <div className="two-field-grid">
                     <div className="field"><label htmlFor="optimizer">optimizer</label><SelectMenu id="optimizer" value={optimizer} options={["AdamW", "Adam", "Adamax", "NAdam", "RAdam", "RMSProp", "SGD", "MuSGD", "auto"].map((item) => ({ value: item, label: item }))} onChange={(nextValue) => setOptimizer(nextValue as TrainingOptimizer)} /></div>
-                    <div className="field"><label htmlFor="lr0">lr0</label><input className="input" id="lr0" data-numeric required type="number" min="0.000001" max="1" step="any" value={lr0} onChange={(event) => setLr0(event.target.value)} /></div>
+                    <div className="field"><label htmlFor="lr0">lr0</label><input {...numericInputProps("lr0")} id="lr0" data-numeric required type="number" min="0.000001" max="1" step="any" value={lr0} onChange={(event) => { setLr0(event.target.value); clearFieldError("lr0"); }} />{numericFieldError("lr0")}</div>
                   </div>
                   <div className="two-field-grid">
-                    <div className="field"><label htmlFor="lrf">lrf</label><input className="input" id="lrf" data-numeric required type="number" min="0" max="1" step="any" value={lrf} onChange={(event) => setLrf(event.target.value)} /></div>
-                    <div className="field"><label htmlFor="warmup-epochs">warmup epochs</label><input className="input" id="warmup-epochs" data-numeric required type="number" min="0" step="any" value={warmupEpochs} onChange={(event) => setWarmupEpochs(event.target.value)} /></div>
+                    <div className="field"><label htmlFor="lrf">lrf</label><input {...numericInputProps("lrf")} id="lrf" data-numeric required type="number" min="0" max="1" step="any" value={lrf} onChange={(event) => { setLrf(event.target.value); clearFieldError("lrf"); }} />{numericFieldError("lrf")}</div>
+                    <div className="field"><label htmlFor="warmup-epochs">warmup epochs</label><input {...numericInputProps("warmupEpochs")} id="warmup-epochs" data-numeric required type="number" min="0" step="any" value={warmupEpochs} onChange={(event) => { setWarmupEpochs(event.target.value); clearFieldError("warmupEpochs"); }} />{numericFieldError("warmupEpochs")}</div>
                   </div>
                   <div className="two-field-grid">
-                    <div className="field"><label htmlFor="patience">patience</label><input className="input" id="patience" data-numeric required type="number" min="0" value={patience} onChange={(event) => setPatience(event.target.value)} /></div>
+                    <div className="field"><label htmlFor="patience">patience</label><input {...numericInputProps("patience")} id="patience" data-numeric required type="number" min="0" value={patience} onChange={(event) => { setPatience(event.target.value); clearFieldError("patience"); }} />{numericFieldError("patience")}</div>
                   </div>
                   <div className="training-option-list">
                     <label><input type="checkbox" checked={cosLr} onChange={(event) => setCosLr(event.target.checked)} /><span><b>Cosine LR</b><small>후반 학습률을 부드럽게 낮춤</small></span></label>
@@ -423,7 +524,7 @@ export function TrainPage({ datasetId }: { datasetId: number }) {
                 <div className="training-parameter-panel">
                   <div className="two-field-grid">
                     <div className="field"><label htmlFor="device">device</label><input className="input" id="device" data-numeric type="number" value="0" disabled readOnly /><div className="hint">RTX 3090 단일 GPU</div></div>
-                    <div className="field"><label htmlFor="workers">workers</label><input className="input" id="workers" data-numeric required type="number" min="0" max="128" value={workers} onChange={(event) => setWorkers(event.target.value)} /></div>
+                    <div className="field"><label htmlFor="workers">workers</label><input {...numericInputProps("workers")} id="workers" data-numeric required type="number" min="0" max="128" value={workers} onChange={(event) => { setWorkers(event.target.value); clearFieldError("workers"); }} />{numericFieldError("workers")}</div>
                   </div>
                   <div className="two-field-grid">
                     <div className="field"><label htmlFor="cache">cache</label><SelectMenu id="cache" value={cache} options={[{ value: "none", label: "사용 안 함" }, { value: "ram", label: "RAM" }, { value: "disk", label: "Disk" }]} onChange={(nextValue) => setCache(nextValue as "none" | "ram" | "disk")} /><div className="hint">시스템 메모리 여유 시 RAM 권장</div></div>
@@ -442,23 +543,23 @@ export function TrainPage({ datasetId }: { datasetId: number }) {
                     <label><input type="checkbox" checked={augment} onChange={(event) => setAugment(event.target.checked)} /><span><b>Augment</b><small>학습 데이터 증강 사용</small></span></label>
                   </div>
                   <div className="two-field-grid">
-                    <div className="field"><label htmlFor="mosaic">mosaic</label><input className="input" id="mosaic" data-numeric required type="number" min="0" max="1" step="any" value={mosaic} onChange={(event) => setMosaic(event.target.value)} /></div>
-                    <div className="field"><label htmlFor="mixup">mixup</label><input className="input" id="mixup" data-numeric required type="number" min="0" max="1" step="any" value={mixup} onChange={(event) => setMixup(event.target.value)} /></div>
+                    <div className="field"><label htmlFor="mosaic">mosaic</label><input {...numericInputProps("mosaic")} id="mosaic" data-numeric required type="number" min="0" max="1" step="any" value={mosaic} onChange={(event) => { setMosaic(event.target.value); clearFieldError("mosaic"); }} />{numericFieldError("mosaic")}</div>
+                    <div className="field"><label htmlFor="mixup">mixup</label><input {...numericInputProps("mixup")} id="mixup" data-numeric required type="number" min="0" max="1" step="any" value={mixup} onChange={(event) => { setMixup(event.target.value); clearFieldError("mixup"); }} />{numericFieldError("mixup")}</div>
                   </div>
                   <div className="two-field-grid">
-                    <div className="field"><label htmlFor="hsv-h">hsv h</label><input className="input" id="hsv-h" data-numeric required type="number" min="0" max="1" step="any" value={hsvH} onChange={(event) => setHsvH(event.target.value)} /></div>
+                    <div className="field"><label htmlFor="hsv-h">hsv h</label><input {...numericInputProps("hsvH")} id="hsv-h" data-numeric required type="number" min="0" max="1" step="any" value={hsvH} onChange={(event) => { setHsvH(event.target.value); clearFieldError("hsvH"); }} />{numericFieldError("hsvH")}</div>
                   </div>
                   <div className="two-field-grid">
-                    <div className="field"><label htmlFor="hsv-s">hsv s</label><input className="input" id="hsv-s" data-numeric required type="number" min="0" max="1" step="any" value={hsvS} onChange={(event) => setHsvS(event.target.value)} /></div>
-                    <div className="field"><label htmlFor="hsv-v">hsv v</label><input className="input" id="hsv-v" data-numeric required type="number" min="0" max="1" step="any" value={hsvV} onChange={(event) => setHsvV(event.target.value)} /></div>
+                    <div className="field"><label htmlFor="hsv-s">hsv s</label><input {...numericInputProps("hsvS")} id="hsv-s" data-numeric required type="number" min="0" max="1" step="any" value={hsvS} onChange={(event) => { setHsvS(event.target.value); clearFieldError("hsvS"); }} />{numericFieldError("hsvS")}</div>
+                    <div className="field"><label htmlFor="hsv-v">hsv v</label><input {...numericInputProps("hsvV")} id="hsv-v" data-numeric required type="number" min="0" max="1" step="any" value={hsvV} onChange={(event) => { setHsvV(event.target.value); clearFieldError("hsvV"); }} />{numericFieldError("hsvV")}</div>
                   </div>
                   <div className="two-field-grid">
-                    <div className="field"><label htmlFor="fliplr">fliplr</label><input className="input" id="fliplr" data-numeric required type="number" min="0" max="1" step="any" value={fliplr} onChange={(event) => setFliplr(event.target.value)} /></div>
-                    <div className="field"><label htmlFor="scale">scale</label><input className="input" id="scale" data-numeric required type="number" min="0" max="1" step="any" value={scale} onChange={(event) => setScale(event.target.value)} /></div>
+                    <div className="field"><label htmlFor="fliplr">fliplr</label><input {...numericInputProps("fliplr")} id="fliplr" data-numeric required type="number" min="0" max="1" step="any" value={fliplr} onChange={(event) => { setFliplr(event.target.value); clearFieldError("fliplr"); }} />{numericFieldError("fliplr")}</div>
+                    <div className="field"><label htmlFor="scale">scale</label><input {...numericInputProps("scale")} id="scale" data-numeric required type="number" min="0" max="1" step="any" value={scale} onChange={(event) => { setScale(event.target.value); clearFieldError("scale"); }} />{numericFieldError("scale")}</div>
                   </div>
                   <div className="two-field-grid">
-                    <div className="field"><label htmlFor="translate">translate</label><input className="input" id="translate" data-numeric required type="number" min="0" max="1" step="any" value={translate} onChange={(event) => setTranslate(event.target.value)} /></div>
-                    <div className="field"><label htmlFor="multi-scale">multi scale</label><input className="input" id="multi-scale" data-numeric required type="number" min="0" max="1" step="any" value={multiScale} onChange={(event) => { const value = event.target.value; setMultiScale(value); if (Number(value) > 0) setCompile(false); }} /><div className="hint">0 = 꺼짐 · 켜면 최대 해상도로 batch 계산</div></div>
+                    <div className="field"><label htmlFor="translate">translate</label><input {...numericInputProps("translate")} id="translate" data-numeric required type="number" min="0" max="1" step="any" value={translate} onChange={(event) => { setTranslate(event.target.value); clearFieldError("translate"); }} />{numericFieldError("translate")}</div>
+                    <div className="field"><label htmlFor="multi-scale">multi scale</label><input {...numericInputProps("multiScale")} id="multi-scale" data-numeric required type="number" min="0" max="1" step="any" value={multiScale} onChange={(event) => { const value = event.target.value; setMultiScale(value); clearFieldError("multiScale"); if (Number(value) > 0) setCompile(false); }} />{numericFieldError("multiScale")}<div className="hint">0 = 꺼짐 · 켜면 최대 해상도로 batch 계산</div></div>
                   </div>
                 </div>
               </section>
@@ -466,8 +567,8 @@ export function TrainPage({ datasetId }: { datasetId: number }) {
                 <h2 className="training-section-label training-parameter-title">운영 파라미터</h2>
                 <div className="training-parameter-panel">
                   <div className="two-field-grid">
-                    <div className="field"><label htmlFor="save-period">save period</label><input className="input" id="save-period" data-numeric required type="number" min="-1" value={savePeriod} onChange={(event) => setSavePeriod(event.target.value)} /><div className="hint">25 epoch마다 중간 저장</div></div>
-                    <div className="field"><label htmlFor="seed">seed</label><input className="input" id="seed" data-numeric type="number" value={seed} placeholder="비우면 서버 생성" onChange={(event) => setSeed(event.target.value)} /><div className="hint">비우면 서버가 자동 생성</div></div>
+                    <div className="field"><label htmlFor="save-period">save period</label><input {...numericInputProps("savePeriod")} id="save-period" data-numeric required type="number" min="-1" value={savePeriod} onChange={(event) => { setSavePeriod(event.target.value); clearFieldError("savePeriod"); }} />{numericFieldError("savePeriod")}<div className="hint">25 epoch마다 중간 저장</div></div>
+                    <div className="field"><label htmlFor="seed">seed</label><input {...numericInputProps("seed")} id="seed" data-numeric type="number" value={seed} placeholder="비우면 서버 생성" onChange={(event) => { setSeed(event.target.value); clearFieldError("seed"); }} />{numericFieldError("seed")}<div className="hint">비우면 서버가 자동 생성</div></div>
                   </div>
                 </div>
               </section>

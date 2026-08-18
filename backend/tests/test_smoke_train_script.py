@@ -37,20 +37,28 @@ def test_auth_base_url_requires_explicit_valid_port() -> None:
     )
 
 
-def test_smoke_auth_roundtrip_supplies_bearer_and_revokes_refresh() -> None:
-    observed: list[tuple[str, str]] = []
+def _auth_handler(
+    observed: list[tuple[str, str]], *, account_exists: bool
+) -> callable:
+    state = {"registered": account_exists}
 
     def handler(request: httpx.Request) -> httpx.Response:
         observed.append((request.method, request.url.path))
         if request.url.path == "/auth/signup":
             payload = json.loads(request.content)
-            assert payload["email"].endswith("@annodock.com")
+            assert payload["email"] == smoke_train.SMOKE_EMAIL
+            assert payload["username"] == smoke_train.SMOKE_USERNAME
             assert len(payload["password"]) >= 8
+            state["registered"] = True
             return httpx.Response(
                 201,
                 json={"id": 77, "email": payload["email"], "username": payload["username"]},
             )
         if request.url.path == "/auth/login":
+            payload = json.loads(request.content)
+            assert payload["identifier"] == smoke_train.SMOKE_EMAIL
+            if not state["registered"]:
+                return httpx.Response(401, json={"detail": "no such account"})
             return httpx.Response(
                 200,
                 json={"access_token": "access-token", "refresh_token": "refresh-token"},
@@ -59,30 +67,47 @@ def test_smoke_auth_roundtrip_supplies_bearer_and_revokes_refresh() -> None:
             assert request.headers["authorization"] == "Bearer access-token"
             return httpx.Response(
                 200,
-                json={"id": 77, "email": "smoke@annodock.com", "username": "smoke"},
+                json={
+                    "id": 77,
+                    "email": smoke_train.SMOKE_EMAIL,
+                    "username": smoke_train.SMOKE_USERNAME,
+                },
             )
         if request.url.path == "/auth/logout":
             assert json.loads(request.content) == {"refresh_token": "refresh-token"}
             return httpx.Response(204)
         raise AssertionError(f"unexpected auth request: {request.url.path}")
 
-    transport = httpx.MockTransport(handler)
-    auth = smoke_train._create_smoke_auth(
-        "http://auth.test",
-        transport=transport,
-    )
+    return handler
+
+
+def test_smoke_auth_reuses_the_dedicated_account() -> None:
+    # Normal run: the dedicated account already exists — login only, no signup.
+    observed: list[tuple[str, str]] = []
+    transport = httpx.MockTransport(_auth_handler(observed, account_exists=True))
+    auth = smoke_train._create_smoke_auth("http://auth.test", transport=transport)
     assert auth.access_token == "access-token"
     assert auth.user_id == 77
-    smoke_train._logout_smoke_auth(
-        "http://auth.test",
-        auth,
-        transport=transport,
-    )
+    smoke_train._logout_smoke_auth("http://auth.test", auth, transport=transport)
     assert observed == [
-        ("POST", "/auth/signup"),
         ("POST", "/auth/login"),
         ("GET", "/auth/me"),
         ("POST", "/auth/logout"),
+    ]
+
+
+def test_smoke_auth_registers_once_on_a_fresh_environment() -> None:
+    # First run ever: login fails, the dedicated account is registered once,
+    # then login proceeds normally.
+    observed: list[tuple[str, str]] = []
+    transport = httpx.MockTransport(_auth_handler(observed, account_exists=False))
+    auth = smoke_train._create_smoke_auth("http://auth.test", transport=transport)
+    assert auth.user_id == 77
+    assert observed == [
+        ("POST", "/auth/login"),
+        ("POST", "/auth/signup"),
+        ("POST", "/auth/login"),
+        ("GET", "/auth/me"),
     ]
 
 

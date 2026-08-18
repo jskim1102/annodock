@@ -121,10 +121,22 @@ export function RunsPage() {
   const [deleting, setDeleting] = useState(false);
   const [deleteTargets, setDeleteTargets] = useState<RunSummary[] | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
     let timer: number | undefined;
+    const scheduleRefresh = () => {
+      if (!active) return;
+      timer = window.setTimeout(() => void refresh(), 2500);
+    };
     const refresh = async () => {
       try {
         const response = await getRuns();
@@ -132,10 +144,12 @@ export function RunsPage() {
         setRuns(response.items);
         setError(null);
         if (response.items.some((run) => ACTIVE_STATES.has(run.state))) {
-          timer = window.setTimeout(() => void refresh(), 2500);
+          scheduleRefresh();
         }
       } catch (reason: unknown) {
-        if (active) setError(reason instanceof Error ? reason.message : "run 목록을 불러오지 못했습니다.");
+        if (!active) return;
+        setError(reason instanceof Error ? reason.message : "run 목록을 불러오지 못했습니다.");
+        scheduleRefresh();
       }
     };
     void refresh();
@@ -177,30 +191,40 @@ export function RunsPage() {
         completedIds.add(run.id);
         cleanedCount += 1;
       }
-      setNotice(`${cleanedCount}개 run의 산출물을 정리했습니다.`);
+      if (mountedRef.current) {
+        setNotice(`${cleanedCount}개 run의 산출물을 정리했습니다.`);
+      }
     } catch (reason: unknown) {
       const message = reason instanceof Error
         ? reason.message
         : "산출물을 정리하지 못했습니다.";
-      setError(cleanedCount > 0
-        ? `${cleanedCount}개 run의 산출물은 정리했지만 나머지는 처리하지 못했습니다. ${message}`
-        : message);
+      if (mountedRef.current) {
+        setError(cleanedCount > 0
+          ? `${cleanedCount}개 run의 산출물은 정리했지만 나머지는 처리하지 못했습니다. ${message}`
+          : message);
+      }
     } finally {
       try {
         const response = await getRuns();
-        setRuns(response.items);
+        if (mountedRef.current) {
+          setRuns(response.items);
+        }
       } catch (reason: unknown) {
-        setError((current) => current ?? (reason instanceof Error
-          ? reason.message
-          : "정리 결과를 다시 불러오지 못했습니다."));
+        if (mountedRef.current) {
+          setError((current) => current ?? (reason instanceof Error
+            ? reason.message
+            : "정리 결과를 다시 불러오지 못했습니다."));
+        }
       }
-      setSelected((current) => {
-        if (completedIds.size === targets.length) return new Set();
-        const next = new Set(current);
-        for (const id of completedIds) next.delete(id);
-        return next;
-      });
-      setCleaning(false);
+      if (mountedRef.current) {
+        setSelected((current) => {
+          if (completedIds.size === targets.length) return new Set();
+          const next = new Set(current);
+          for (const id of completedIds) next.delete(id);
+          return next;
+        });
+        setCleaning(false);
+      }
     }
   };
 
@@ -219,31 +243,41 @@ export function RunsPage() {
         completedIds.add(run.id);
         deletedCount += 1;
       }
-      setNotice(`${deletedCount}개 run을 삭제했습니다.`);
+      if (mountedRef.current) {
+        setNotice(`${deletedCount}개 run을 삭제했습니다.`);
+      }
     } catch (reason: unknown) {
       const message = reason instanceof Error
         ? reason.message
         : "run을 삭제하지 못했습니다.";
-      setDeleteError(deletedCount > 0
-        ? `${deletedCount}개 run은 삭제했지만 나머지는 처리하지 못했습니다. ${message}`
-        : message);
+      if (mountedRef.current) {
+        setDeleteError(deletedCount > 0
+          ? `${deletedCount}개 run은 삭제했지만 나머지는 처리하지 못했습니다. ${message}`
+          : message);
+      }
     } finally {
       try {
         const response = await getRuns();
-        setRuns(response.items);
+        if (mountedRef.current) {
+          setRuns(response.items);
+        }
       } catch (reason: unknown) {
-        setError(reason instanceof Error
-          ? reason.message
-          : "삭제 결과를 다시 불러오지 못했습니다.");
+        if (mountedRef.current) {
+          setError(reason instanceof Error
+            ? reason.message
+            : "삭제 결과를 다시 불러오지 못했습니다.");
+        }
       }
-      setSelected((current) => {
-        const next = new Set(current);
-        for (const id of completedIds) next.delete(id);
-        return next;
-      });
-      const remaining = targets.filter((run) => !completedIds.has(run.id));
-      setDeleteTargets(remaining.length > 0 ? remaining : null);
-      setDeleting(false);
+      if (mountedRef.current) {
+        setSelected((current) => {
+          const next = new Set(current);
+          for (const id of completedIds) next.delete(id);
+          return next;
+        });
+        const remaining = targets.filter((run) => !completedIds.has(run.id));
+        setDeleteTargets(remaining.length > 0 ? remaining : null);
+        setDeleting(false);
+      }
     }
   };
 

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="512" height="512">
+<defs>
+<linearGradient id="dL" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#11635c"></stop><stop offset="1" stop-color="#073d3a"></stop></linearGradient>
+<linearGradient id="lL" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4fd0b8"></stop><stop offset="1" stop-color="#26a08b"></stop></linearGradient>
+<filter id="sL" x="-30%" y="-30%" width="160%" height="160%"><feDropShadow dx="0" dy="5" stdDeviation="5" flood-color="#073d3a" flood-opacity=".28"></feDropShadow></filter>
+</defs>
+<g filter="url(#sL)">
+<path d="M26 12 H54 Q62 12 62 20 V44 Q62 48 58 48 H50 Q46 48 46 52 V62 Q46 68 40 68 H26 Q18 68 18 60 V20 Q18 12 26 12 Z" fill="#032723" transform="translate(3.2,3.2)"></path>
+<path d="M26 12 H54 Q62 12 62 20 V44 Q62 48 58 48 H50 Q46 48 46 52 V62 Q46 68 40 68 H26 Q18 68 18 60 V20 Q18 12 26 12 Z" fill="url(#dL)"></path>
+<path d="M62 32 H70 Q78 32 78 40 V76 Q78 84 70 84 H42 Q34 84 34 76 V56 Q34 52 38 52 H50 Q58 52 58 44 V36 Q58 32 62 32 Z" fill="#124b41" transform="translate(3.2,3.2)"></path>
+<path d="M62 32 H70 Q78 32 78 40 V76 Q78 84 70 84 H42 Q34 84 34 76 V56 Q34 52 38 52 H50 Q58 52 58 44 V36 Q58 32 62 32 Z" fill="url(#lL)"></path>
+</g>
+</svg>

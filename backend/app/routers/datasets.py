@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -12,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.class_colors import class_color
-from app.db import get_session
+from app.db import get_session, set_local_lock_timeout
 from app.deps import CurrentUserDep
 from app.models import (
     Dataset,
@@ -23,6 +24,13 @@ from app.models import (
     ProjectClass,
     TrainingRun,
     UploadJob,
+    UploadSession,
+)
+from app.services.dataset_extract import (
+    DatasetExtractConflict,
+    DatasetExtractNotFound,
+    DatasetExtractQuotaExceeded,
+    extract_dataset_snapshot,
 )
 from app.services.dataset_merge import (
     DatasetMergeConflict,
@@ -33,11 +41,12 @@ from app.services.dataset_merge import (
 from app.services.quota import dataset_accounted_bytes, decrease_bytes_used
 from app.services.storage import (
     create_dataset_storage,
-    finalize_staged_deletion,
-    restore_staged_deletion,
-    stage_dataset_deletion,
+    finalize_staged_deletions,
+    restore_staged_deletions,
+    stage_deletions_async,
     storage_relative_path,
 )
+from app.services.uploads import upload_directory
 
 
 router = APIRouter(prefix="/api/datasets", tags=["datasets"])
@@ -162,6 +171,31 @@ class DatasetMergeSourcesRequest(BaseModel):
             raise ValueError("dataset ids must be positive")
         if len(set(value)) != len(value):
             raise ValueError("dataset ids must be unique")
+        return value
+
+
+class DatasetExtractRequest(DatasetName):
+    model_config = ConfigDict(extra="forbid")
+
+    dataset_ids: list[int] = Field(min_length=1, max_length=200)
+    class_ids: list[int] = Field(min_length=1, max_length=200)
+
+    @field_validator("dataset_ids")
+    @classmethod
+    def validate_dataset_ids(cls, value: list[int]) -> list[int]:
+        if any(dataset_id <= 0 for dataset_id in value):
+            raise ValueError("dataset ids must be positive")
+        if len(set(value)) != len(value):
+            raise ValueError("dataset ids must be unique")
+        return value
+
+    @field_validator("class_ids")
+    @classmethod
+    def validate_class_ids(cls, value: list[int]) -> list[int]:
+        if any(class_id < 0 for class_id in value):
+            raise ValueError("class ids must be non-negative")
+        if len(set(value)) != len(value):
+            raise ValueError("class ids must be unique")
         return value
 
 
@@ -435,6 +469,33 @@ async def create_merged_dataset(
     )
 
 
+@router.post("/extract", status_code=201, response_model=DatasetRow)
+async def create_extracted_dataset(
+    body: DatasetExtractRequest,
+    request: Request,
+    session: Session,
+    current_user: CurrentUserDep,
+) -> Dataset:
+    try:
+        result = await extract_dataset_snapshot(
+            request.app.state.settings,
+            session,
+            name=body.name,
+            dataset_ids=body.dataset_ids,
+            class_ids=body.class_ids,
+            owner_id=current_user.id,
+        )
+    except DatasetExtractNotFound as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except DatasetExtractConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except DatasetExtractQuotaExceeded as error:
+        raise HTTPException(status_code=413, detail=str(error)) from error
+    except IntegrityError as error:
+        raise _duplicate_name() from error
+    return result.dataset
+
+
 @router.post(
     "/{dataset_id}/merge-sources",
     response_model=DatasetListRow,
@@ -672,21 +733,38 @@ async def delete_dataset(
         accounted_bytes += await dataset_accounted_bytes(session, item.id)
     owner_id = dataset.owner_id
     storage_dir = request.app.state.settings.storage_dir
-    staged_list = [
-        stage_dataset_deletion(storage_dir, item.storage_path)
-        for item in targets
-    ]
+    await set_local_lock_timeout(session)
+    upload_ids = list(
+        (
+            await session.scalars(
+                select(UploadSession.id)
+                .where(UploadSession.dataset_id.in_(target_ids))
+                .order_by(UploadSession.id)
+                .with_for_update()
+            )
+        ).all()
+    )
+    deletion_paths = [item.storage_path for item in targets]
+    deletion_paths.extend(
+        upload_directory(request.app.state.settings, upload_id)
+        for upload_id in upload_ids
+    )
+    staged_list = await stage_deletions_async(storage_dir, deletion_paths)
     try:
         for item in targets:
             await session.delete(item)
         await session.commit()
-    except Exception:
-        await session.rollback()
-        for staged in staged_list:
-            restore_staged_deletion(staged)
+    except BaseException as error:
+        restore_staged_deletions(reversed(staged_list))
+        try:
+            await session.rollback()
+        except BaseException as rollback_error:
+            error.add_note(
+                "dataset delete rollback also failed: "
+                f"{type(rollback_error).__name__}"
+            )
         raise
-    for staged in staged_list:
-        finalize_staged_deletion(staged)
+    await asyncio.to_thread(finalize_staged_deletions, staged_list)
     await decrease_bytes_used(session, owner_id, accounted_bytes)
     await session.commit()
     return Response(status_code=204)

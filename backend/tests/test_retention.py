@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -278,6 +279,13 @@ async def test_pending_deletion_finalizer_reclaims_only_quarantined_entries(
     orphan_two.mkdir()
     (orphan_one / "nested" / "best.pt").write_bytes(b"weights")
     (orphan_two / "image.jpg").write_bytes(b"image")
+    expired_at = (
+        datetime.now(timezone.utc).timestamp()
+        - cleanup.PENDING_DELETION_MIN_AGE_SECONDS
+        - 1
+    )
+    os.utime(orphan_one, (expired_at, expired_at))
+    os.utime(orphan_two, (expired_at, expired_at))
 
     result = await asyncio.to_thread(
         cleanup.finalize_pending_deletions,

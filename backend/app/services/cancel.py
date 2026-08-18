@@ -13,10 +13,16 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models import TrainingRun
+from app.services.cleanup import stage_run_workdir_async
 from app.services.proc_identity import process_identity_matches
-from app.services.quota import increase_bytes_used
+from app.services.quota import increase_bytes_used, path_tree_bytes
 from app.services.rundir import collect_run_artifacts
-from app.services.storage import StorageBoundaryError, contained_storage_path
+from app.services.storage import (
+    StorageBoundaryError,
+    contained_storage_path,
+    finalize_staged_deletion,
+    restore_staged_deletion,
+)
 
 
 CANCEL_TERM_GRACE_SECONDS = 5.0
@@ -112,21 +118,46 @@ async def _finish_canceled(
                 f"training run {run_id} left canceling before terminal write"
             )
         artifact_bytes = 0
+        staged = None
         if storage_dir is not None:
             try:
                 out_dir = contained_storage_path(storage_dir, run.out_dir)
-                artifact_bytes = await asyncio.to_thread(
-                    collect_run_artifacts,
-                    out_dir,
-                )
-            except (OSError, StorageBoundaryError, ValueError):
+            except (OSError, StorageBoundaryError):
                 artifact_bytes = 0
+            else:
+                try:
+                    artifact_bytes = await asyncio.to_thread(
+                        collect_run_artifacts,
+                        out_dir,
+                    )
+                except (OSError, ValueError):
+                    artifact_bytes = await asyncio.to_thread(
+                        path_tree_bytes,
+                        out_dir / "artifacts",
+                    )
+                else:
+                    staged = await stage_run_workdir_async(
+                        storage_dir,
+                        run.out_dir,
+                    )
         run.state = "canceled"
         if run.finished_at is None:
             run.finished_at = datetime.now(timezone.utc)
         run.artifact_bytes = artifact_bytes
         await increase_bytes_used(session, owner_id, artifact_bytes)
-        await session.commit()
+        try:
+            await session.commit()
+        except BaseException as error:
+            restore_staged_deletion(staged)
+            try:
+                await session.rollback()
+            except BaseException as rollback_error:
+                error.add_note(
+                    "training cancellation rollback also failed: "
+                    f"{type(rollback_error).__name__}"
+                )
+            raise
+    await asyncio.to_thread(finalize_staged_deletion, staged)
     return CancelResult(run_id=run_id, state="canceled")
 
 

@@ -24,7 +24,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_session
 from app.deps import CurrentUserDep
 from app.models import Dataset, Image, RunImage, RunMetric, TrainingRun
-from app.services.cleanup import stage_run_artifacts, stage_training_run_deletion
+from app.services.cleanup import (
+    stage_run_artifacts_async,
+    stage_training_run_deletion_async,
+)
 from app.services.inference import render_prediction_file
 from app.services.quota import decrease_bytes_used, path_tree_bytes
 from app.services.storage import (
@@ -443,8 +446,7 @@ async def delete_run_artifacts(
                 path_tree_bytes,
                 run_dir / "artifacts",
             )
-    staged = await asyncio.to_thread(
-        stage_run_artifacts,
+    staged = await stage_run_artifacts_async(
         request.app.state.settings.storage_dir,
         run.out_dir,
     )
@@ -452,9 +454,15 @@ async def delete_run_artifacts(
     run.artifact_bytes = 0
     try:
         await session.commit()
-    except Exception:
-        await session.rollback()
-        await asyncio.to_thread(restore_staged_deletion, staged)
+    except BaseException as error:
+        restore_staged_deletion(staged)
+        try:
+            await session.rollback()
+        except BaseException as rollback_error:
+            error.add_note(
+                "run artifact cleanup rollback also failed: "
+                f"{type(rollback_error).__name__}"
+            )
         raise
     await asyncio.to_thread(finalize_staged_deletion, staged)
     await decrease_bytes_used(session, run.owner_id, artifact_bytes)
@@ -523,17 +531,22 @@ async def delete_run(
                 )
 
     owner_id = run.owner_id
-    staged = await asyncio.to_thread(
-        stage_training_run_deletion,
+    staged = await stage_training_run_deletion_async(
         request.app.state.settings.storage_dir,
         run.out_dir,
     )
     try:
         await session.delete(run)
         await session.commit()
-    except Exception:
-        await session.rollback()
-        await asyncio.to_thread(restore_staged_deletion, staged)
+    except BaseException as error:
+        restore_staged_deletion(staged)
+        try:
+            await session.rollback()
+        except BaseException as rollback_error:
+            error.add_note(
+                "run delete rollback also failed: "
+                f"{type(rollback_error).__name__}"
+            )
         raise
 
     await asyncio.to_thread(finalize_staged_deletion, staged)

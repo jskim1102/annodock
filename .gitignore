@@ -36,3 +36,4 @@ deploy/*.credentials.json
 
 # --- 대시보드에서 제외 (harness) ---
 /url.txt
+/logo-assets/

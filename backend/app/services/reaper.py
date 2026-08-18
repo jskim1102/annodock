@@ -16,6 +16,7 @@ from app.services.cancel import is_cancel_in_progress
 from app.services.cleanup import (
     finalize_pending_deletions,
     retain_run_artifacts,
+    sweep_upload_storage,
 )
 from app.services.proc_identity import ProcessIdentity, read_process_identity
 from app.services.training import mark_training_failed
@@ -167,6 +168,8 @@ async def run_reaper_loop(
     spawn_grace_seconds: float = SPAWN_IDENTITY_GRACE_SECONDS,
     keep_count: int = 10,
     keep_days: int = 30,
+    upload_ttl_hours: int = 24,
+    resolution_ttl_days: int = 7,
 ) -> None:
     """Run reconciliation without blocking the FastAPI event loop."""
     while True:
@@ -181,6 +184,12 @@ async def run_reaper_loop(
                 storage_dir=storage_dir,
                 keep_count=keep_count,
                 keep_days=keep_days,
+            )
+            await sweep_upload_storage(
+                session_factory,
+                storage_dir=storage_dir,
+                ttl_hours=upload_ttl_hours,
+                resolution_ttl_days=resolution_ttl_days,
             )
             await asyncio.to_thread(
                 finalize_pending_deletions,

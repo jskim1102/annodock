@@ -20,14 +20,21 @@ from ultralytics.utils import is_online
 
 from app.config import Settings
 from app.models import Annotation, Dataset, DatasetClass, Image, TrainingRun
+from app.services.cleanup import stage_run_workdir_async
 from app.services.rundir import build_run_directory
 from app.services.quota import (
     estimate_training_artifact_bytes,
     increase_bytes_used,
+    path_tree_bytes,
     quota_status,
 )
 from app.services.rundir import collect_run_artifacts
-from app.services.storage import contained_storage_path, storage_relative_path
+from app.services.storage import (
+    contained_storage_path,
+    finalize_staged_deletion,
+    restore_staged_deletion,
+    storage_relative_path,
+)
 from app.services.proc_identity import read_process_identity
 from app.services.split import (
     allocate_splits,
@@ -212,12 +219,29 @@ async def mark_training_failed(
         await session.rollback()
         return False
     artifact_bytes = 0
-    if storage_dir is not None:
+    staged = None
+    pid_confirmed = (
+        run.pid is not None
+        and run.pid_started_at is not None
+        and run.boot_id is not None
+    )
+    if storage_dir is not None and pid_confirmed:
         out_dir = contained_storage_path(storage_dir, run.out_dir)
-        artifact_bytes = await asyncio.to_thread(
-            collect_run_artifacts,
-            out_dir,
-        )
+        try:
+            artifact_bytes = await asyncio.to_thread(
+                collect_run_artifacts,
+                out_dir,
+            )
+        except (OSError, ValueError):
+            artifact_bytes = await asyncio.to_thread(
+                path_tree_bytes,
+                out_dir / "artifacts",
+            )
+        else:
+            staged = await stage_run_workdir_async(
+                storage_dir,
+                run.out_dir,
+            )
     run.state = "failed"
     if run.finished_at is None:
         run.finished_at = datetime.now(timezone.utc)
@@ -225,7 +249,19 @@ async def mark_training_failed(
         run.error = reason
     run.artifact_bytes = artifact_bytes
     await increase_bytes_used(session, run.owner_id, artifact_bytes)
-    await session.commit()
+    try:
+        await session.commit()
+    except BaseException as error:
+        restore_staged_deletion(staged)
+        try:
+            await session.rollback()
+        except BaseException as rollback_error:
+            error.add_note(
+                "training failure rollback also failed: "
+                f"{type(rollback_error).__name__}"
+            )
+        raise
+    await asyncio.to_thread(finalize_staged_deletion, staged)
     return True
 
 
