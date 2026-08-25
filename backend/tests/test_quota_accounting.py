@@ -27,6 +27,7 @@ from app.services.storage import (
     storage_relative_path,
 )
 from app.worker import train_worker
+from tests.factories import image_with_media
 
 
 pytestmark = pytest.mark.asyncio
@@ -131,7 +132,8 @@ async def test_completed_run_counts_artifacts_but_not_original_hardlinks(
         original = dataset_root / "original" / "sample.jpg"
         original.parent.mkdir(parents=True, exist_ok=True)
         original.write_bytes(b"original-image-bytes")
-        image = Image(
+        image = image_with_media(
+            owner_id=dataset.owner_id,
             dataset_id=dataset_id,
             stem="sample",
             filename="sample.jpg",

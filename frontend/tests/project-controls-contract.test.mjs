@@ -54,3 +54,22 @@ test("non-empty project deletion requires a destructive confirmation dialog", ()
   assert.match(projectsPage, /deleteConfirmation\.datasets\.map/);
   assert.match(projectsPage, /aria-modal="true"/);
 });
+
+test("successful project and dataset deletions invalidate storage quota", () => {
+  const projectDeleteHandler = projectsPage.match(
+    /const requestProjectDelete = async \([^)]*\) => \{(?<body>[\s\S]*?)\n  \};/,
+  )?.groups?.body ?? "";
+  const datasetDeleteHandler = projectsPage.match(
+    /const requestDatasetDelete = async \([^)]*\) => \{(?<body>[\s\S]*?)\n  \};/,
+  )?.groups?.body ?? "";
+
+  assert.match(projectsPage, /invalidateStorageQuotaCache/);
+  assert.match(
+    projectDeleteHandler,
+    /await deleteProject\(project\.id, confirmed\);\s*invalidateStorageQuotaCache\(\);/,
+  );
+  assert.match(
+    datasetDeleteHandler,
+    /await deleteDataset\(dataset\.id\);\s*invalidateStorageQuotaCache\(\);/,
+  );
+});

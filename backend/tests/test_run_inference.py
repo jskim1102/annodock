@@ -11,6 +11,7 @@ from PIL import Image as PillowImage
 from app.models import Dataset, Image, Project, RunImage, TrainingRun
 from app.services import inference as inference_service
 from app.services.storage import storage_relative_path
+from tests.factories import image_with_media
 
 
 pytestmark = pytest.mark.asyncio
@@ -68,7 +69,8 @@ async def _persist_run_with_images(
             contents = _png_bytes()
             source.write_bytes(contents)
             thumb.write_bytes(contents)
-            image = Image(
+            image = image_with_media(
+                owner_id=dataset.owner_id,
                 dataset_id=dataset.id,
                 stem=Path(filename).stem,
                 filename=filename,

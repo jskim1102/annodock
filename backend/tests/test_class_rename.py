@@ -10,6 +10,7 @@ from sqlalchemy import select
 from app.models import Annotation, Dataset, DatasetClass, Image, TrainingRun
 from app.services import training
 from app.services.storage import contained_storage_path
+from tests.factories import image_with_media
 
 
 pytestmark = pytest.mark.asyncio
@@ -58,7 +59,8 @@ async def _dataset_with_labels(client, app) -> int:
         for index in range(10):
             source = storage / f"image-{index}.jpg"
             source.write_bytes(f"image-{index}".encode())
-            image = Image(
+            image = image_with_media(
+                owner_id=dataset.owner_id,
                 dataset_id=dataset_id,
                 stem=f"image-{index}",
                 filename=source.name,

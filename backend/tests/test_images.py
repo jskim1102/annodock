@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from app.models import Dataset, Image
 from app.services.storage import contained_storage_path
+from tests.factories import image_with_media
 
 
 pytestmark = pytest.mark.asyncio
@@ -58,7 +59,10 @@ async def add_image(
         display_path.write_bytes(display)
 
     async with app.state.session_factory() as session:
-        image = Image(
+        dataset = await session.get(Dataset, dataset_id)
+        assert dataset is not None
+        image = image_with_media(
+            owner_id=dataset.owner_id,
             dataset_id=dataset_id,
             stem=stem,
             filename=filename,

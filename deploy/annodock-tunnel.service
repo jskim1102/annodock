@@ -6,10 +6,10 @@ After=network-online.target annodock-proxy.service
 
 [Service]
 Type=simple
-WorkingDirectory=/home/kim_3090/dev/harness-claude/claude-project/deeplabel
-EnvironmentFile=/home/kim_3090/dev/harness-claude/claude-project/deeplabel/.env
-ExecStartPre=/home/kim_3090/dev/harness-claude/claude-project/deeplabel/deploy/render-cloudflared-config.sh
-ExecStart=/home/kim_3090/.local/bin/cloudflared tunnel --config /home/kim_3090/dev/harness-claude/claude-project/deeplabel/.prod-runtime/cloudflared-config.yml --no-autoupdate run
+WorkingDirectory=/home/kim_3090/dev/harness-claude/claude-project/annodock
+EnvironmentFile=/home/kim_3090/dev/harness-claude/claude-project/annodock/.env
+ExecStartPre=/home/kim_3090/dev/harness-claude/claude-project/annodock/deploy/render-cloudflared-config.sh
+ExecStart=/home/kim_3090/.local/bin/cloudflared tunnel --config /home/kim_3090/dev/harness-claude/claude-project/annodock/.prod-runtime/cloudflared-config.yml --no-autoupdate run
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true

@@ -27,6 +27,10 @@ const uploadGrouping = await readFile(
   new URL("../src/utils/uploadGrouping.ts", import.meta.url),
   "utf8",
 );
+const dropCollection = await readFile(
+  new URL("../src/utils/dropCollection.ts", import.meta.url),
+  "utf8",
+);
 const uploadApi = await readFile(
   new URL("../src/api/upload.ts", import.meta.url),
   "utf8",
@@ -109,6 +113,158 @@ test("folder roots and zip files remain separate upload sources", async () => {
   );
 });
 
+test("sibling images and labels folders become one YOLO upload source", async () => {
+  const { coalesceDroppedSources, createUploadPlan } = await loadUploadGrouping();
+  const sources = coalesceDroppedSources([
+    {
+      name: "images",
+      kind: "folder",
+      files: [
+        item("images/train/a.jpg"),
+        item("images/val/b.jpg"),
+      ],
+    },
+    {
+      name: "labels",
+      kind: "folder",
+      files: [
+        item("labels/train/a.txt", "label"),
+        item("labels/val/b.txt", "label"),
+      ],
+    },
+  ]);
+
+  assert.equal(sources.length, 1);
+  assert.equal(sources[0].name, "dataset");
+  assert.equal(sources[0].kind, "folder");
+  assert.deepEqual(
+    sources[0].files.map((file) => file.relPath),
+    [
+      "images/train/a.jpg",
+      "images/val/b.jpg",
+      "labels/train/a.txt",
+      "labels/val/b.txt",
+    ],
+  );
+
+  const plan = createUploadPlan(
+    [{ ...sources[0], key: "folder:1" }],
+    "release",
+    [],
+  );
+  assert.equal(plan.length, 1);
+  assert.deepEqual(
+    plan[0].batches[0].map((file) => file.relPath),
+    sources[0].files.map((file) => file.relPath),
+  );
+});
+
+test("oversized YOLO sources split into pair-safe batches with metadata in each batch", async () => {
+  const { batchUploadFiles } = await loadUploadGrouping();
+  const files = [
+    item("images/train/a.jpg"),
+    item("images/train/b.jpg"),
+    item("images/val/c.jpg"),
+    item("labels/train/a.txt", "label"),
+    item("labels/train/b.txt", "label"),
+    item("labels/val/c.txt", "label"),
+    item("data.yaml", "classfile"),
+  ];
+
+  const batches = batchUploadFiles(files, 5);
+
+  assert.deepEqual(
+    batches.map((batch) => batch.map((file) => file.relPath)),
+    [
+      [
+        "data.yaml",
+        "images/train/a.jpg",
+        "labels/train/a.txt",
+        "images/train/b.jpg",
+        "labels/train/b.txt",
+      ],
+      ["data.yaml", "images/val/c.jpg", "labels/val/c.txt"],
+    ],
+  );
+  assert.ok(batches.every((batch) => batch.length <= 5));
+});
+
+test("the browser entry name identifies a selected folder inside a virtual root", async () => {
+  const { droppedDirectoryName } = await loadUploadGrouping();
+
+  assert.equal(droppedDirectoryName("images", "/selected/images"), "images");
+  assert.equal(droppedDirectoryName("labels", "/selected/labels"), "labels");
+  assert.equal(droppedDirectoryName(undefined, "/selected/images"), "images");
+  assert.match(
+    dropCollection,
+    /sourceName: droppedDirectoryName\(entry\.name, entry\.fullPath\)/,
+  );
+});
+
+test("all folder acquisition paths coalesce at the addSources boundary", () => {
+  const addSourcesStart = uploadPage.indexOf("const addSources =");
+  const collectInputStart = uploadPage.indexOf("const collectInput =", addSourcesStart);
+  assert.notEqual(addSourcesStart, -1);
+  assert.notEqual(collectInputStart, -1);
+
+  const addSources = uploadPage.slice(addSourcesStart, collectInputStart);
+  assert.match(
+    addSources,
+    /coalesceDroppedSources\(drafts\)\.filter/,
+  );
+});
+
+test("YOLO metadata joins the complementary folder pair without absorbing other sources", async () => {
+  const { coalesceDroppedSources } = await loadUploadGrouping();
+  const sources = coalesceDroppedSources([
+    {
+      name: "Images",
+      kind: "folder",
+      files: [item("Images/train/a.jpg")],
+    },
+    {
+      name: "Labels",
+      kind: "folder",
+      files: [item("Labels/train/a.txt", "label")],
+    },
+    {
+      name: "data",
+      kind: "files",
+      files: [
+        item("data.yaml", "classfile"),
+        item("README.md", "other"),
+      ],
+    },
+    {
+      name: "release",
+      kind: "zip",
+      files: [item("release.zip", "zip")],
+    },
+  ]);
+
+  assert.deepEqual(sources.map((source) => source.name), ["dataset", "release"]);
+  assert.deepEqual(
+    sources[0].files.map((file) => file.relPath),
+    ["Images/train/a.jpg", "Labels/train/a.txt", "data.yaml", "README.md"],
+  );
+});
+
+test("ambiguous or unrelated folder selections remain separate upload sources", async () => {
+  const { coalesceDroppedSources } = await loadUploadGrouping();
+  const ambiguous = [
+    { name: "images", kind: "folder", files: [item("images/a.jpg")] },
+    { name: "images", kind: "folder", files: [item("images/b.jpg")] },
+    { name: "labels", kind: "folder", files: [item("labels/a.txt", "label")] },
+  ];
+  const unrelated = [
+    { name: "train", kind: "folder", files: [item("train/a.jpg")] },
+    { name: "valid", kind: "folder", files: [item("valid/b.jpg")] },
+  ];
+
+  assert.deepEqual(coalesceDroppedSources(ambiguous), ambiguous);
+  assert.deepEqual(coalesceDroppedSources(unrelated), unrelated);
+});
+
 test("dataset name is suggested only when exactly one upload source is selected", async () => {
   const { suggestedDatasetName } = await loadUploadGrouping();
   const folder = {
@@ -135,6 +291,62 @@ test("dataset name is suggested only when exactly one upload source is selected"
   assert.equal(suggestedDatasetName([folder, zip]), "");
   assert.equal(suggestedDatasetName([folder, ignored]), "train");
   assert.equal(suggestedDatasetName([ignored]), "");
+});
+
+test("source changes preserve a dataset name entered by the user", async () => {
+  const { datasetNameAfterSourceChange } = await loadUploadGrouping();
+  const folder = {
+    key: "folder:1",
+    name: "train",
+    kind: "folder",
+    files: [item("train/a.jpg")],
+  };
+  const zip = {
+    key: "zip:2",
+    name: "release",
+    kind: "zip",
+    files: [item("release.zip", "zip")],
+  };
+  const thirteenSources = Array.from({ length: 13 }, (_, index) => ({
+    key: `folder:${index + 1}`,
+    name: `set-${index + 1}`,
+    kind: "folder",
+    files: [item(`set-${index + 1}/image.jpg`)],
+  }));
+
+  assert.equal(
+    datasetNameAfterSourceChange("job_776 병합본", thirteenSources, true),
+    "job_776 병합본",
+  );
+  assert.equal(datasetNameAfterSourceChange("", [folder], false), "train");
+  assert.equal(datasetNameAfterSourceChange("train", [folder, zip], false), "");
+  assert.equal(datasetNameAfterSourceChange("", [folder], true), "");
+});
+
+test("upload start validates missing prerequisites on click instead of disabling the action", () => {
+  const actionsStart = uploadPage.indexOf('className="drop-actions"');
+  const buttonStart = uploadPage.indexOf('className="btn btn-primary"', actionsStart);
+  const buttonEnd = uploadPage.indexOf("</button>", buttonStart);
+  assert.notEqual(actionsStart, -1);
+  assert.notEqual(buttonStart, -1);
+  assert.notEqual(buttonEnd, -1);
+
+  const uploadStartButton = uploadPage.slice(buttonStart, buttonEnd);
+  assert.match(uploadStartButton, /onClick=\{\(\) => void startUpload\(\)\}/);
+  assert.match(uploadStartButton, /project === null[\s\S]*?\|\| busy[\s\S]*?\|\| pendingClassResolution !== null[\s\S]*?\|\| uploadPlan\.length > 200/);
+  assert.doesNotMatch(uploadStartButton, /!datasetName\.trim\(\)|uploadPlan\.length === 0/);
+
+  const missingFilesGuard = uploadPage.indexOf("if (uploadPlan.length === 0)");
+  const missingNameGuard = uploadPage.indexOf("if (!datasetName.trim())");
+  assert.ok(missingFilesGuard >= 0 && missingFilesGuard < missingNameGuard);
+  assert.match(uploadPage, /업로드할 파일이나 폴더를 먼저 선택하세요\./);
+});
+
+test("empty upload plans distinguish no selection from unsupported selections", () => {
+  assert.match(
+    uploadPage,
+    /if \(uploadPlan\.length === 0\) \{[\s\S]*?sources\.length > 0[\s\S]*?업로드할 수 있는 파일이 없습니다\.[\s\S]*?업로드할 파일이나 폴더를 먼저 선택하세요\./,
+  );
 });
 
 test("generated dataset names stay within the backend limit when suffixes are added", async () => {
@@ -170,7 +382,9 @@ test("the upload page chooses grouping automatically and uploads each source seq
   assert.doesNotMatch(uploadPage, /하나의 데이터셋으로 업로드/);
   assert.doesNotMatch(uploadPage, /각각 다른 데이터셋으로 업로드/);
   assert.doesNotMatch(uploadPage, /uploadMode/);
-  assert.match(uploadPage, /setDatasetName\(suggestedDatasetName\(sources\)\)/);
+  assert.match(uploadPage, /const datasetNameEditedRef = useRef\(false\)/);
+  assert.match(uploadPage, /datasetNameAfterSourceChange\([\s\S]*?current,[\s\S]*?sources,[\s\S]*?datasetNameEditedRef\.current/);
+  assert.match(uploadPage, /datasetNameEditedRef\.current = true;[\s\S]*?setDatasetName\(event\.target\.value\)/);
   assert.match(uploadPage, /value=\{datasetName\}/);
   assert.match(uploadPage, /maxLength=\{255\}/);
   assert.match(uploadPage, /const datasetNameMissing = uploadableSourceCount > 0 && !datasetName\.trim\(\)/);
@@ -199,8 +413,12 @@ test("the upload page chooses grouping automatically and uploads each source seq
   assert.match(uploadApi, /removeStoredValue\(upload\.resumeKey\)/);
   assert.match(uploadPage, /selectionLockedRef\.current = true/);
   assert.match(uploadPage, /if \(selectionLockedRef\.current\) return/);
-  assert.match(uploadPage, /!busy && !hasUploadTargets && project !== null/);
-  assert.match(uploadPage, /disabled=\{busy \|\| hasUploadTargets\}/);
+  assert.match(uploadPage, /if \(busy \|\| collecting \|\| hasUploadTargets\) return/);
+  assert.match(
+    uploadPage,
+    /collectDroppedSources\(event\.dataTransfer, setCollectionProgress\)/,
+  );
+  assert.match(uploadPage, /disabled=\{busy \|\| collecting \|\| hasUploadTargets/);
   assert.match(uploadPage, /개 데이터셋은 완료되었습니다\./);
   assert.match(uploadPage, /개 항목은 이미 반영되었습니다\./);
   assert.match(uploadPage, /summaryScope: String\(targetId\)/);

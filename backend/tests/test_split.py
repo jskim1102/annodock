@@ -17,6 +17,7 @@ from app.services.split import (
     validate_split_size,
 )
 from app.services.storage import storage_relative_path
+from tests.factories import image_with_media
 
 
 def _snapshot(image_id: int, classes: tuple[int, ...]) -> ImageSnapshot:
@@ -148,7 +149,8 @@ async def test_split_persists_run_images_without_modifying_image_split(app) -> N
             source = dataset_root / f"persist-{index}.jpg"
             source.write_bytes(b"image")
             session.add(
-                Image(
+                image_with_media(
+                    owner_id=dataset.owner_id,
                     dataset_id=dataset.id,
                     stem=f"persist-{index}",
                     filename=f"persist-{index}.jpg",

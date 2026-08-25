@@ -41,5 +41,9 @@ test("bulk run deletion refreshes canonical state and preserves failed selection
   assert.match(handler, /await deleteRun\(run\.id\)/);
   assert.match(handler, /completedIds\.add\(run\.id\)/);
   assert.match(handler, /finally \{[\s\S]*?await getRuns\(\)/);
+  assert.match(
+    handler,
+    /finally \{[\s\S]*?if \(completedIds\.size > 0\) invalidateStorageQuotaCache\(\)/,
+  );
   assert.match(handler, /for \(const id of completedIds\) next\.delete\(id\)/);
 });

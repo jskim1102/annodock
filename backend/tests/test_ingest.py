@@ -18,9 +18,11 @@ from app.models import (
     DatasetClass,
     Image,
     ImportIssue,
+    MediaObject,
     ProjectClass,
     UploadJob,
     UploadSession,
+    UserStorage,
 )
 from app.services.collect import CollectedFile
 from app.services.ingest import ingest_collected, run_upload_batch_job
@@ -146,7 +148,33 @@ async def test_ingest_matches_stems_reports_issues_and_updates_progress(
             6,
             1,
         )
-        assert len((await session.scalars(select(Image).where(Image.dataset_id == dataset_id))).all()) == 2
+        assert (job.image_processed, job.image_total) == (3, 3)
+        stored_images = list(
+            (
+                await session.scalars(
+                    select(Image).where(Image.dataset_id == dataset_id)
+                )
+            ).all()
+        )
+        assert len(stored_images) == 2
+        assert all(image.media_object_id is not None for image in stored_images)
+        assert len({image.media_object_id for image in stored_images}) == 2
+        media_objects = list(
+            (
+                await session.scalars(
+                    select(MediaObject).where(
+                        MediaObject.created_by_dataset_id == dataset_id
+                    )
+                )
+            ).all()
+        )
+        assert len(media_objects) == 2
+        usage = await session.get(UserStorage, dataset.owner_id)
+        assert usage is not None
+        assert usage.bytes_used == sum(
+            item.original_bytes + item.display_bytes + item.thumb_bytes
+            for item in media_objects
+        )
         assert len((await session.scalars(select(Annotation))).all()) == 1
         assert len((await session.scalars(select(DatasetClass).where(DatasetClass.dataset_id == dataset_id))).all()) == 1
         project_class = await session.get(
@@ -203,6 +231,8 @@ async def test_ingest_matches_stems_reports_issues_and_updates_progress(
     job_response = await client.get(f"/api/jobs/{job_id}")
     assert job_response.status_code == 200
     assert job_response.json()["state"] == "done"
+    assert job_response.json()["image_processed"] == 3
+    assert job_response.json()["image_total"] == 3
     issue_response = await client.get(
         f"/api/datasets/{dataset_id}/issues?offset=0&limit=100"
     )
@@ -917,9 +947,14 @@ async def test_job_processed_advances_monotonically_before_completion(
     from app.services import ingest as ingest_service
 
     original_prepare = ingest_service.prepare_image
+    prepare_order = 0
 
     async def slow_prepare(*args, **kwargs):
-        await asyncio.sleep(0.03)
+        nonlocal prepare_order
+        prepare_order += 1
+        # Four workers start together now. Stagger their finishes so the poller
+        # deterministically observes at least one committed progress update.
+        await asyncio.sleep(0.03 * prepare_order)
         return await original_prepare(*args, **kwargs)
 
     monkeypatch.setattr(ingest_service, "prepare_image", slow_prepare)
@@ -936,14 +971,199 @@ async def test_job_processed_advances_monotonically_before_completion(
         async with app.state.session_factory() as session:
             job = await session.get(UploadJob, job_id)
             assert job is not None
-            observed.append(job.processed)
+            observed.append(job.image_processed)
         await asyncio.sleep(0.01)
     await task
     async with app.state.session_factory() as session:
         job = await session.get(UploadJob, job_id)
         assert job is not None
-        observed.append(job.processed)
+        observed.append(job.image_processed)
 
     assert observed == sorted(observed)
     assert any(0 < value < len(images) for value in observed)
     assert observed[-1] == len(images)
+    assert job.image_total == len(images)
+
+
+async def test_image_derivation_runs_four_at_a_time(
+    client: httpx.AsyncClient,
+    app,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _dataset_id, job_id = await create_dataset_and_job(client, app)
+    images: list[CollectedFile] = []
+    for index in range(8):
+        path = tmp_path / f"parallel-{index}.jpg"
+        make_jpeg(path, (index * 20, 40, 80))
+        images.append(collected(path, f"images/{path.name}", "image"))
+
+    from app.services import ingest as ingest_service
+
+    original_prepare = ingest_service.prepare_image
+    active = 0
+    max_active = 0
+
+    async def observed_prepare(*args, **kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(0.02)
+            return await original_prepare(*args, **kwargs)
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(ingest_service, "prepare_image", observed_prepare)
+    await ingest_collected(
+        app.state.settings,
+        app.state.session_factory,
+        job_id,
+        images,
+    )
+
+    assert max_active == 4
+
+
+async def test_ingest_commits_checkpoints_and_resumes_without_duplicates(
+    client: httpx.AsyncClient,
+    app,
+    tmp_path: Path,
+) -> None:
+    dataset_id, job_id = await create_dataset_and_job(client, app)
+    images: list[CollectedFile] = []
+    for index in range(5):
+        path = tmp_path / f"checkpoint-{index}.jpg"
+        make_jpeg(path, (index * 20, 60, 100))
+        images.append(collected(path, f"images/{path.name}", "image"))
+    settings = app.state.settings.model_copy(
+        update={"ingest_batch_size": 2},
+    )
+    commit_attempt = 0
+
+    def cancel_during_second_checkpoint() -> None:
+        nonlocal commit_attempt
+        commit_attempt += 1
+        if commit_attempt == 2:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await ingest_collected(
+            settings,
+            app.state.session_factory,
+            job_id,
+            images,
+            before_commit=cancel_during_second_checkpoint,
+        )
+
+    async with app.state.session_factory() as session:
+        partial_job = await session.get(UploadJob, job_id)
+        partial_images = (
+            await session.scalars(
+                select(Image)
+                .where(Image.dataset_id == dataset_id)
+                .order_by(Image.id)
+            )
+        ).all()
+        assert partial_job is not None
+        assert partial_job.ingest_cursor == 2
+        assert partial_job.image_total == len(images)
+        assert partial_job.image_processed >= partial_job.ingest_cursor
+        assert len(partial_images) == 2
+
+    await ingest_collected(
+        settings,
+        app.state.session_factory,
+        job_id,
+        images,
+    )
+
+    async with app.state.session_factory() as session:
+        finished_job = await session.get(UploadJob, job_id)
+        stored_images = (
+            await session.scalars(
+                select(Image)
+                .where(Image.dataset_id == dataset_id)
+                .order_by(Image.id)
+            )
+        ).all()
+        assert finished_job is not None
+        assert finished_job.ingest_cursor == len(images)
+        assert finished_job.image_processed == len(images)
+        assert finished_job.image_total == len(images)
+        assert finished_job.state == "done"
+        assert len(stored_images) == len(images)
+        assert len({image.rel_path for image in stored_images}) == len(images)
+
+
+async def test_checkpoint_resume_keeps_collision_suffixes_stable(
+    client: httpx.AsyncClient,
+    app,
+    tmp_path: Path,
+) -> None:
+    dataset_id, first_job_id = await create_dataset_and_job(client, app)
+    original = tmp_path / "original-same.jpg"
+    make_jpeg(original, (10, 20, 30))
+    await ingest_collected(
+        app.state.settings,
+        app.state.session_factory,
+        first_job_id,
+        [collected(original, "images/same.jpg", "image")],
+    )
+    async with app.state.session_factory() as session:
+        second_job = UploadJob(
+            dataset_id=dataset_id,
+            kind="folder",
+            state="queued",
+            phase="uploading",
+            total=0,
+            processed=0,
+            failed=0,
+        )
+        session.add(second_job)
+        await session.commit()
+        second_job_id = second_job.id
+
+    replacement = tmp_path / "replacement-same.jpg"
+    later = tmp_path / "z-later.jpg"
+    make_jpeg(replacement, (40, 50, 60))
+    make_jpeg(later, (70, 80, 90))
+    incoming = [
+        collected(replacement, "images/same.jpg", "image"),
+        collected(later, "images/z-later.jpg", "image"),
+    ]
+    settings = app.state.settings.model_copy(update={"ingest_batch_size": 1})
+    commit_attempt = 0
+
+    def cancel_second_checkpoint() -> None:
+        nonlocal commit_attempt
+        commit_attempt += 1
+        if commit_attempt == 2:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await ingest_collected(
+            settings,
+            app.state.session_factory,
+            second_job_id,
+            incoming,
+            before_commit=cancel_second_checkpoint,
+        )
+    await ingest_collected(
+        settings,
+        app.state.session_factory,
+        second_job_id,
+        incoming,
+    )
+
+    async with app.state.session_factory() as session:
+        stems = list(
+            (
+                await session.scalars(
+                    select(Image.stem)
+                    .where(Image.dataset_id == dataset_id)
+                    .order_by(Image.stem)
+                )
+            ).all()
+        )
+    assert stems == ["same", "same (1)", "z-later"]

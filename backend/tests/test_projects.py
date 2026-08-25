@@ -6,7 +6,8 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from app.models import Annotation, Dataset, Image
+from app.models import Annotation, Dataset, ExportArtifact, Image, UploadJob
+from tests.factories import image_with_media
 
 
 pytestmark = pytest.mark.asyncio
@@ -91,6 +92,77 @@ async def test_dataset_is_created_inside_a_project_and_inherits_project_classes(
     assert project["datasets"][0]["project_id"] == project_id
 
 
+async def test_project_dataset_rows_report_actual_accounted_storage_bytes(
+    client: httpx.AsyncClient,
+    app,
+) -> None:
+    project_response = await client.post(
+        "/api/projects",
+        json={"name": unique_name("dataset-storage"), "classes": []},
+    )
+    project_id = project_response.json()["id"]
+    dataset_response = await client.post(
+        "/api/datasets",
+        json={
+            "name": unique_name("dataset-storage-child"),
+            "project_id": project_id,
+        },
+    )
+    dataset_id = dataset_response.json()["id"]
+
+    async with app.state.session_factory() as session:
+        dataset = await session.get(Dataset, dataset_id)
+        assert dataset is not None
+        dataset.status = "ready"
+        dataset.image_count = 1
+        session.add(
+            image_with_media(
+                owner_id=dataset.owner_id,
+                dataset_id=dataset_id,
+                stem="storage-sample",
+                filename="storage-sample.jpg",
+                rel_path="images/storage-sample.jpg",
+                split="train",
+                width=32,
+                height=24,
+                file_path="datasets/storage-sample.jpg",
+                display_path="datasets/storage-sample.display.jpg",
+                thumb_path="datasets/storage-sample.thumb.jpg",
+                original_bytes=1_024,
+                display_bytes=512,
+                thumb_bytes=256,
+            )
+        )
+        export_job = UploadJob(
+            dataset_id=dataset_id,
+            kind="export",
+            state="done",
+            phase="done",
+            total=1,
+            processed=1,
+            failed=0,
+        )
+        session.add(export_job)
+        await session.flush()
+        session.add(
+            ExportArtifact(
+                job_id=export_job.id,
+                dataset_id=dataset_id,
+                archive_path="datasets/storage-sample.zip",
+                archive_bytes=128,
+            )
+        )
+        await session.commit()
+
+    listing = await client.get(f"/api/projects/{project_id}")
+
+    assert listing.status_code == 200, listing.text
+    dataset_row = listing.json()["datasets"][0]
+    assert dataset_row["id"] == dataset_id
+    assert dataset_row["storage_bytes"] == 1_920
+    assert dataset_row["physical_storage_bytes"] == 1_920
+
+
 async def test_selected_dataset_class_image_counts_count_each_image_once(
     client: httpx.AsyncClient,
     app,
@@ -128,7 +200,8 @@ async def test_selected_dataset_class_image_counts_count_each_image_once(
         first.image_count = 2
         second.image_count = 1
         images = [
-            Image(
+            image_with_media(
+                owner_id=first.owner_id,
                 dataset_id=first_id,
                 stem="first-a",
                 filename="first-a.jpg",
@@ -141,7 +214,8 @@ async def test_selected_dataset_class_image_counts_count_each_image_once(
                 thumb_path="first-a-thumb.jpg",
                 box_count=3,
             ),
-            Image(
+            image_with_media(
+                owner_id=first.owner_id,
                 dataset_id=first_id,
                 stem="first-b",
                 filename="first-b.jpg",
@@ -154,7 +228,8 @@ async def test_selected_dataset_class_image_counts_count_each_image_once(
                 thumb_path="first-b-thumb.jpg",
                 box_count=1,
             ),
-            Image(
+            image_with_media(
+                owner_id=second.owner_id,
                 dataset_id=second_id,
                 stem="second-a",
                 filename="second-a.jpg",
@@ -344,7 +419,8 @@ async def test_class_image_counts_accept_hidden_merged_source_datasets(
         thumb_path = storage_root / "hidden-source-image-thumb.jpg"
         original_path.write_bytes(b"hidden-source-original")
         thumb_path.write_bytes(b"hidden-source-thumb")
-        source_image = Image(
+        source_image = image_with_media(
+            owner_id=first_source.owner_id,
             dataset_id=source_ids[0],
             stem="hidden-source-image",
             filename="hidden-source-image.jpg",

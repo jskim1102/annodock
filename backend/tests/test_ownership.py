@@ -17,6 +17,7 @@ from app.models import (
     UploadSession,
 )
 from app.services.storage import storage_relative_path
+from tests.factories import image_with_media
 
 
 pytestmark = pytest.mark.asyncio
@@ -100,7 +101,8 @@ async def _seed_owned_resource_graph(app, tmp_path: Path) -> dict[str, int]:
         session.add(dataset)
         await session.flush()
         session.add(DatasetClass(dataset_id=dataset.id, class_id=0, name="box"))
-        image = Image(
+        image = image_with_media(
+            owner_id=dataset.owner_id,
             dataset_id=dataset.id,
             stem="original",
             filename="original.jpg",

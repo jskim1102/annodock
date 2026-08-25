@@ -12,7 +12,7 @@ resolves the email there and writes the grant row into this project's
 Note: the .env DATABASE_URL uses the docker network hostname; when running
 this script on the host, override it the way dev.sh does:
 
-    DATABASE_URL="postgresql+asyncpg://postgres:<pw>@localhost:5435/deeplabel" \
+    DATABASE_URL="postgresql+asyncpg://postgres:<pw>@localhost:5435/annodock" \
         .venv/bin/python scripts/grant_admin.py you@example.com
 """
 

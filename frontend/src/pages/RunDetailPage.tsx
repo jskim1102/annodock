@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { imageResourceUrl } from "../api/client";
+import { imageResourceUrl, invalidateStorageQuotaCache } from "../api/client";
 import {
   cancelRun,
   deleteRunArtifacts,
@@ -248,6 +248,7 @@ export function RunDetailPage({ runId }: { runId: number }) {
   const [downloading, setDownloading] = useState(false);
   const [cleaning, setCleaning] = useState(false);
   const consoleRef = useRef<HTMLDivElement>(null);
+  const observedRunStateRef = useRef<RunState | null>(null);
 
   const [inferencePage, setInferencePage] = useState<InferenceImagePage | null>(null);
   const [inferenceTotal, setInferenceTotal] = useState<number | null>(null);
@@ -268,6 +269,7 @@ export function RunDetailPage({ runId }: { runId: number }) {
     setLoadError(null);
     setActionError(null);
     setNotice(null);
+    observedRunStateRef.current = null;
   }, [runId]);
 
   useEffect(() => {
@@ -285,8 +287,18 @@ export function RunDetailPage({ runId }: { runId: number }) {
 
       const errors: string[] = [];
       if (runResult.status === "fulfilled") {
+        const previousState = observedRunStateRef.current;
+        const nextState = runResult.value.state;
+        if (
+          previousState !== null
+          && ACTIVE_STATES.has(previousState)
+          && !ACTIVE_STATES.has(nextState)
+        ) {
+          invalidateStorageQuotaCache();
+        }
+        observedRunStateRef.current = nextState;
         setRun(runResult.value);
-        lastKnownActive = ACTIVE_STATES.has(runResult.value.state);
+        lastKnownActive = ACTIVE_STATES.has(nextState);
       } else {
         errors.push(errorMessage(runResult.reason, "run 정보를 불러오지 못했습니다."));
       }
@@ -459,6 +471,7 @@ export function RunDetailPage({ runId }: { runId: number }) {
     setNotice(null);
     try {
       await deleteRunArtifacts(runId);
+      invalidateStorageQuotaCache();
       setRun((current) => current === null ? null : {
         ...current,
         artifacts_deleted_at: new Date().toISOString(),

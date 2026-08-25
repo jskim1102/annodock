@@ -23,10 +23,12 @@ from app.routers.jobs import router as jobs_router
 from app.routers.models import router as models_router
 from app.routers.projects import router as projects_router
 from app.routers.runs import router as runs_router
+from app.routers.storage import router as storage_router
 from app.routers.training import router as training_router
 from app.routers.training import runs_router as training_runs_router
 from app.routers.uploads import router as uploads_router
 from app.services.reaper import run_reaper_loop
+from app.services.jobs import recover_upload_jobs
 
 
 def create_app(
@@ -43,6 +45,7 @@ def create_app(
     async def lifespan(application: FastAPI):
         reaper_task = None
         if application.state.auto_start_jobs:
+            await recover_upload_jobs(application)
             reaper_task = asyncio.create_task(
                 run_reaper_loop(
                     application.state.session_factory,
@@ -60,6 +63,11 @@ def create_app(
         try:
             yield
         finally:
+            job_tasks = list(application.state.job_tasks)
+            for task in job_tasks:
+                task.cancel()
+            if job_tasks:
+                await asyncio.gather(*job_tasks, return_exceptions=True)
             if reaper_task is not None:
                 reaper_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -116,6 +124,7 @@ def create_app(
         return {"status": "ok"}
 
     application.include_router(admin_router)
+    application.include_router(storage_router)
     application.include_router(datasets_router)
     application.include_router(projects_router)
     application.include_router(images_router)

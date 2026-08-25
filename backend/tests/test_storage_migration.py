@@ -17,7 +17,7 @@ MIGRATION_PATH = (
 
 def _migration() -> ModuleType:
     spec = importlib.util.spec_from_file_location(
-        "deeplabel_storage_relpath_migration",
+        "annodock_storage_relpath_migration",
         MIGRATION_PATH,
     )
     assert spec is not None and spec.loader is not None

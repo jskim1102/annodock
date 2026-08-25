@@ -10,6 +10,7 @@ from app.models import (
     Image,
     ImportIssue,
     Membership,
+    MediaObject,
     Organization,
     Project,
     ProjectClass,
@@ -30,6 +31,7 @@ EXPECTED_TABLES = {
     "dataset_classes",
     "dataset_merge_sources",
     "images",
+    "media_objects",
     "annotations",
     "upload_sessions",
     "upload_jobs",
@@ -60,7 +62,11 @@ EXPECTED_COLUMNS = {
         "annotation_count",
         "class_count",
         "is_merged",
+        "is_extracted",
         "is_placeholder",
+        "upload_group_id",
+        "upload_part_index",
+        "upload_part_count",
         "created_at",
     },
     Project: {
@@ -81,6 +87,7 @@ EXPECTED_COLUMNS = {
     Image: {
         "id",
         "dataset_id",
+        "media_object_id",
         "stem",
         "filename",
         "rel_path",
@@ -96,6 +103,15 @@ EXPECTED_COLUMNS = {
         "box_count",
         "has_label_source",
         "is_modified",
+        "created_at",
+    },
+    MediaObject: {
+        "id",
+        "owner_id",
+        "created_by_dataset_id",
+        "original_bytes",
+        "display_bytes",
+        "thumb_bytes",
         "created_at",
     },
     Annotation: {
@@ -130,6 +146,9 @@ EXPECTED_COLUMNS = {
         "total",
         "processed",
         "failed",
+        "ingest_cursor",
+        "image_total",
+        "image_processed",
         "upload_ids",
         "class_resolution_plan",
         "class_resolutions",
@@ -144,7 +163,12 @@ EXPECTED_COLUMNS = {
         "archive_bytes",
         "created_at",
     },
-    UserStorage: {"owner_id", "bytes_used", "updated_at"},
+    UserStorage: {
+        "owner_id",
+        "bytes_used",
+        "quota_limit_bytes",
+        "updated_at",
+    },
     Organization: {"id", "owner_id", "name", "created_at"},
     Team: {"id", "org_id", "name", "created_at"},
     Membership: {
@@ -248,6 +272,7 @@ def test_image_supports_display_derivatives_and_split_navigation() -> None:
     table = Image.__table__
     assert table.c.display_path.nullable is True
     assert table.c.split.nullable is True
+    assert table.c.media_object_id.nullable is False
 
     unique_constraints = {
         tuple(column.name for column in constraint.columns): constraint

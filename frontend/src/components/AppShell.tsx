@@ -7,10 +7,17 @@ import {
 } from "react";
 
 import { logoutCurrentSession } from "../api/auth";
+import {
+  getStorageQuota,
+  resetStorageQuotaCache,
+  STORAGE_QUOTA_INVALIDATED_EVENT,
+  type StorageQuota,
+} from "../api/client";
 import { appHref } from "../navigation";
 import { useAuthSession } from "../store/auth";
 import { getAccountPresentation } from "../utils/accountPresentation";
 import { probeAdminOverview, resetAdminProbe } from "../utils/adminAccess";
+import { formatBytes } from "../utils/formatBytes";
 import { Icon } from "./Icon";
 import { ThemeToggle } from "./ThemeToggle";
 
@@ -19,6 +26,8 @@ interface AppShellProps extends PropsWithChildren {
   breadcrumb?: ReactNode;
   mainClassName?: string;
 }
+
+const STORAGE_QUOTA_RETRY_MS = 3_000;
 
 export function Brand({ inverse = false }: { inverse?: boolean }) {
   return (
@@ -32,12 +41,27 @@ export function Brand({ inverse = false }: { inverse?: boolean }) {
   );
 }
 
-export function StorageMeter({ compact = false }: { compact?: boolean }) {
+export function StorageMeter({
+  compact = false,
+  quota = null,
+}: {
+  compact?: boolean;
+  quota?: StorageQuota | null;
+}) {
+  const usageLabel = quota === null
+    ? null
+    : `${formatBytes(quota.used_bytes)} / ${formatBytes(quota.limit_bytes)}`;
+  const ariaLabel = usageLabel === null
+    ? "스토리지 사용량 정보 없음"
+    : `스토리지 사용 중 ${usageLabel}`;
+
   if (compact) {
     return (
-      <span className="storage-pill" aria-label="스토리지 사용량 정보 없음">
+      <span className="storage-pill" aria-label={ariaLabel}>
         <span>스토리지</span>
-        <span className="mono">—</span>
+        <span className="storage-pill-values">
+          <span className="mono">{usageLabel ?? "—"}</span>
+        </span>
       </span>
     );
   }
@@ -45,8 +69,8 @@ export function StorageMeter({ compact = false }: { compact?: boolean }) {
   return (
     <div className="sidebar-storage">
       <div className="sidebar-storage-label">
-        <span>스토리지</span>
-        <span className="mono">—</span>
+        <strong>스토리지</strong>
+        <span className="mono">{usageLabel ?? "—"}</span>
       </div>
     </div>
   );
@@ -64,6 +88,46 @@ export function AppShell({
   // persisted client-side, so the link simply stays hidden until the probe
   // confirms the grant for this page load.
   const [adminVisible, setAdminVisible] = useState(false);
+  const [storageQuota, setStorageQuota] = useState<StorageQuota | null>(null);
+  const storageTokenKey = session.accessToken && session.refreshToken
+    ? session.accessToken
+    : null;
+
+  useEffect(() => {
+    setStorageQuota(null);
+    let alive = true;
+    let requestVersion = 0;
+    let retryTimer: number | null = null;
+    const clearStorageQuotaRetry = () => {
+      if (retryTimer === null) return;
+      window.clearTimeout(retryTimer);
+      retryTimer = null;
+    };
+    const scheduleStorageQuotaRetry = () => {
+      clearStorageQuotaRetry();
+      if (!alive || storageTokenKey === null) return;
+      retryTimer = window.setTimeout(loadStorageQuota, STORAGE_QUOTA_RETRY_MS);
+    };
+    const loadStorageQuota = () => {
+      clearStorageQuotaRetry();
+      const version = requestVersion += 1;
+      if (storageTokenKey === null) return;
+      getStorageQuota(storageTokenKey)
+        .then((quota) => {
+          if (alive && version === requestVersion) setStorageQuota(quota);
+        })
+        .catch(() => {
+          if (alive && version === requestVersion) scheduleStorageQuotaRetry();
+        });
+    };
+    loadStorageQuota();
+    window.addEventListener(STORAGE_QUOTA_INVALIDATED_EVENT, loadStorageQuota);
+    return () => {
+      alive = false;
+      clearStorageQuotaRetry();
+      window.removeEventListener(STORAGE_QUOTA_INVALIDATED_EVENT, loadStorageQuota);
+    };
+  }, [storageTokenKey]);
 
   useEffect(() => {
     let alive = true;
@@ -110,6 +174,7 @@ export function AppShell({
 
   const handleLogout = async () => {
     resetAdminProbe();
+    resetStorageQuotaCache();
     if (loggingOut) return;
     setAccountMenuOpen(false);
     setLoggingOut(true);
@@ -155,7 +220,7 @@ export function AppShell({
             </a>
           )}
         </nav>
-        <StorageMeter />
+        <StorageMeter quota={storageQuota} />
       </aside>
 
       <div className="shell-content">
@@ -163,7 +228,7 @@ export function AppShell({
           <div className="breadcrumbs">{breadcrumb ?? "워크스페이스"}</div>
           <div className="header-actions">
             <ThemeToggle />
-            <StorageMeter compact />
+            <StorageMeter compact quota={storageQuota} />
             <div className="account-menu" ref={accountMenuRef}>
               <button
                 className="user-chip"

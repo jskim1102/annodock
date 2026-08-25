@@ -45,8 +45,22 @@ export interface Job {
   total: number;
   processed: number;
   failed: number;
+  image_total: number;
+  image_processed: number;
   phase: string;
   class_resolution?: ClassResolutionPlan | null;
+  datasets: JobDataset[];
+}
+
+export interface JobDataset {
+  id: number;
+  name: string;
+  status: DatasetStatus;
+  image_count: number;
+  annotation_count: number;
+  class_count: number;
+  part_index?: number;
+  part_count?: number;
 }
 
 export interface DatasetRow {
@@ -106,12 +120,12 @@ export interface ProjectClassImageCount extends ProjectClassRow {
 
 export interface ProjectDatasetSourceRow extends DatasetRow {
   labeled_image_count: number;
+  storage_bytes: number;
+  physical_storage_bytes: number;
   active_job: Job | null;
 }
 
-export interface ProjectDatasetRow extends DatasetRow {
-  labeled_image_count: number;
-  active_job: Job | null;
+export interface ProjectDatasetRow extends ProjectDatasetSourceRow {
   source_datasets: ProjectDatasetSourceRow[];
 }
 
@@ -509,11 +523,51 @@ export interface AdminUserRow {
   created_at: string;
   login_methods: string[];
   bytes_used: number;
+  limit_bytes: number;
+}
+
+export interface AdminQuotaUpdateResponse {
+  user_id: number;
+  limit_bytes: number;
 }
 
 export interface AdminOverview {
   user_count: number;
   storage_total_bytes: number;
+}
+
+export interface StorageQuota {
+  used_bytes: number;
+  referenced_bytes: number;
+  limit_bytes: number;
+}
+
+let storageQuotaCache: {
+  tokenKey: string;
+  request: Promise<StorageQuota>;
+} | null = null;
+
+export const STORAGE_QUOTA_INVALIDATED_EVENT = "annodock:storage-quota-invalidated";
+
+export function getStorageQuota(tokenKey: string): Promise<StorageQuota> {
+  if (storageQuotaCache?.tokenKey === tokenKey) {
+    return storageQuotaCache.request;
+  }
+  const request = requestJson<StorageQuota>("/api/storage");
+  storageQuotaCache = { tokenKey, request };
+  void request.catch(() => {
+    if (storageQuotaCache?.request === request) storageQuotaCache = null;
+  });
+  return request;
+}
+
+export function resetStorageQuotaCache(): void {
+  storageQuotaCache = null;
+}
+
+export function invalidateStorageQuotaCache(): void {
+  resetStorageQuotaCache();
+  window.dispatchEvent(new Event(STORAGE_QUOTA_INVALIDATED_EVENT));
 }
 
 export function getAdminOverview(): Promise<AdminOverview> {
@@ -522,4 +576,19 @@ export function getAdminOverview(): Promise<AdminOverview> {
 
 export function getAdminUsers(): Promise<{ users: AdminUserRow[] }> {
   return requestJson("/api/admin/users");
+}
+
+export function updateAdminUserQuota(
+  userId: number,
+  limitBytes: number,
+): Promise<AdminQuotaUpdateResponse> {
+  return requestJson(
+    `/api/admin/users/${userId}/quota`,
+    jsonInit("PATCH", { limit_bytes: limitBytes }),
+  );
+}
+
+export function deleteAdminUser(userId: number, confirm = false): Promise<void> {
+  const suffix = confirm ? "?confirm=true" : "";
+  return requestJson(`/api/admin/users/${userId}${suffix}`, jsonInit("DELETE"));
 }

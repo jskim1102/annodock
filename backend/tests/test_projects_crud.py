@@ -24,6 +24,7 @@ from app.services.storage import (
     create_dataset_storage,
     storage_relative_path,
 )
+from tests.factories import image_with_media
 
 
 pytestmark = pytest.mark.asyncio
@@ -292,7 +293,8 @@ async def test_confirmed_delete_reclaims_files_runs_and_exact_accounting(
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
 
-        image = Image(
+        image = image_with_media(
+            owner_id=target.owner_id,
             dataset_id=target_dataset_id,
             stem="sample",
             filename="sample.jpg",
@@ -345,7 +347,8 @@ async def test_confirmed_delete_reclaims_files_runs_and_exact_accounting(
         survivor_thumb.parent.mkdir(parents=True, exist_ok=True)
         survivor_original.write_bytes(b"survivor-original")
         survivor_thumb.write_bytes(b"survivor-thumb")
-        survivor_image = Image(
+        survivor_image = image_with_media(
+            owner_id=survivor.owner_id,
             dataset_id=survivor_dataset_id,
             stem="keep",
             filename="keep.jpg",

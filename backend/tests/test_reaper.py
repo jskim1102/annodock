@@ -205,6 +205,12 @@ async def test_reaper_lifespan_starts_and_stops_periodic_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     started = asyncio.Event()
+    recovery_called = False
+
+    async def fake_recovery(_application) -> list[int]:
+        nonlocal recovery_called
+        recovery_called = True
+        return []
 
     async def fake_loop(
         _session_factory,
@@ -227,9 +233,11 @@ async def test_reaper_lifespan_starts_and_stops_periodic_task(
         await asyncio.Event().wait()
 
     monkeypatch.setattr(main, "run_reaper_loop", fake_loop)
+    monkeypatch.setattr(main, "recover_upload_jobs", fake_recovery)
     application = main.create_app(test_settings, auto_start_jobs=True)
     async with application.router.lifespan_context(application):
         await asyncio.wait_for(started.wait(), timeout=1)
+        assert recovery_called is True
         task = application.state.reaper_task
         assert task.done() is False
     assert task.done() is True

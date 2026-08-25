@@ -56,9 +56,12 @@ test("expanded project cards contain chips and a nested dataset table", () => {
   assert.match(projectsPage, /<table className="project-dataset-table">/);
   assert.match(projectsPage, /<thead>[\s\S]*?<tbody>/);
   assert.match(projectsPage, /aria-label=\{`\$\{project\.name\} 데이터셋 전체 선택`\}/);
-  for (const label of ["데이터셋", "검수 상태", "진행률"]) {
+  for (const label of ["데이터셋", "용량", "진행률"]) {
     assert.match(projectsPage, new RegExp(`>${label}<`));
   }
+  assert.doesNotMatch(projectsPage, />검수 상태</);
+  assert.match(projectsPage, /formatBytes\(dataset\.storage_bytes\)/);
+  assert.match(projectsPage, /formatBytes\(source\.storage_bytes\)/);
   assert.match(projectsPage, /<span className="sr-only">작업<\/span>/);
   assert.match(projectsPage, /<tr className=\{`dataset-row/);
   assert.doesNotMatch(projectsPage, /<td colSpan=\{6\}>\s*<div className="dataset-row-content">/);

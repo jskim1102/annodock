@@ -1,16 +1,19 @@
-import { type DragEvent, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   ApiError,
   getAllIssues,
   getDataset,
   getProject,
+  invalidateStorageQuotaCache,
   extendMergedDataset,
   mergeDatasets,
   resolveJobClassConflicts,
   type ClassResolutionChoice,
   type ClassResolutionPlan,
   type IssueKind,
+  type Job,
+  type JobDataset,
   type ProjectRow,
 } from "../api/client";
 import {
@@ -37,18 +40,24 @@ import {
   type ScopedIssueRow,
 } from "../utils/importIssueSummary";
 import {
+  collectDroppedSources,
+  toCollectedFile,
+} from "../utils/dropCollection";
+import {
+  formatRemainingTime,
+  updateProgressEstimate,
+  type ProgressEstimateState,
+} from "../utils/uploadProgress";
+import {
+  coalesceDroppedSources,
   createUploadPlan,
+  datasetNameAfterSourceChange,
   datasetNameWithSuffix,
   groupInputFiles,
-  suggestedDatasetName,
+  uploadPartitionPreview,
   type UploadSource,
   type UploadSourceDraft,
 } from "../utils/uploadGrouping";
-
-const IMAGE_EXTENSIONS = new Set([
-  "avif", "bmp", "dng", "heic", "heif", "jp2", "jpeg", "jpeg2000",
-  "jpg", "mpo", "png", "tif", "tiff", "webp",
-]);
 
 const ISSUE_LABELS: Record<IssueKind, string> = {
   image_without_label: "라벨 없는 이미지 파일",
@@ -64,34 +73,6 @@ const ISSUE_LABELS: Record<IssueKind, string> = {
 
 const ISSUE_ORDER = Object.keys(ISSUE_LABELS) as IssueKind[];
 
-interface FileEntry {
-  isFile: boolean;
-  isDirectory: boolean;
-  fullPath: string;
-  file?: (callback: (file: File) => void) => void;
-  createReader?: () => {
-    readEntries: (callback: (entries: FileEntry[]) => void) => void;
-  };
-}
-
-function classify(file: File): CollectedFile["kind"] {
-  const lower = file.name.toLowerCase();
-  const extension = lower.includes(".") ? lower.slice(lower.lastIndexOf(".") + 1) : "";
-  if (IMAGE_EXTENSIONS.has(extension) || file.type.startsWith("image/")) return "image";
-  if (lower === "classes.txt" || extension === "yaml" || extension === "yml") return "classfile";
-  if (extension === "txt") return "label";
-  if (extension === "zip") return "zip";
-  return "other";
-}
-
-function collected(file: File, relPath = file.name): CollectedFile {
-  return {
-    file,
-    relPath: relPath.replace(/^\/+/, "") || file.name,
-    kind: classify(file),
-  };
-}
-
 function uploadableBytes(files: readonly CollectedFile[]) {
   return files.reduce(
     (total, file) => total + (file.kind === "other" ? 0 : file.file.size),
@@ -99,64 +80,38 @@ function uploadableBytes(files: readonly CollectedFile[]) {
   );
 }
 
-function fileFromEntry(entry: FileEntry): Promise<CollectedFile> {
-  return new Promise((resolve, reject) => {
-    if (!entry.file) {
-      reject(new Error(`파일을 읽을 수 없습니다: ${entry.fullPath}`));
-      return;
-    }
-    entry.file((file) => resolve(collected(file, entry.fullPath)));
-  });
-}
-
-async function walkEntry(entry: FileEntry): Promise<CollectedFile[]> {
-  if (entry.isFile) return [await fileFromEntry(entry)];
-  if (!entry.isDirectory || !entry.createReader) return [];
-  const reader = entry.createReader();
-  const entries: FileEntry[] = [];
-  while (true) {
-    const batch = await new Promise<FileEntry[]>((resolve) => reader.readEntries(resolve));
-    if (batch.length === 0) break;
-    entries.push(...batch);
-  }
-  return (await Promise.all(entries.map(walkEntry))).flat();
-}
-
-function entryName(entry: FileEntry) {
-  return entry.fullPath.replaceAll("\\", "/").split("/").filter(Boolean)[0] || "dataset";
-}
-
-async function collectDrop(event: DragEvent<HTMLDivElement>): Promise<UploadSourceDraft[]> {
-  const groups = await Promise.all(Array.from(event.dataTransfer.items).map(async (item) => {
-    const entry = (item as DataTransferItem & {
-      webkitGetAsEntry?: () => FileEntry | null;
-    }).webkitGetAsEntry?.();
-    if (entry?.isDirectory) {
-      return {
-        source: {
-          name: entryName(entry),
-          kind: "folder" as const,
-          files: await walkEntry(entry),
-        },
-        files: [] as CollectedFile[],
-      };
-    }
-    if (entry?.isFile) {
-      return { source: null, files: [await fileFromEntry(entry)] };
-    }
-    const file = item.getAsFile();
-    return { source: null, files: file ? [collected(file)] : [] };
-  }));
-  return [
-    ...groups.flatMap((group) => group.source ? [group.source] : []),
-    ...groupInputFiles(groups.flatMap((group) => group.files), "files"),
-  ];
-}
-
 interface CompletedDataset {
   id: number;
   name: string;
 }
+
+type LiveProgressStage = "idle" | "transferring" | "processing" | "finishing" | "done";
+
+interface LiveProgress {
+  stage: LiveProgressStage;
+  imageProcessed: number;
+  imageTotal: number;
+  etaSeconds: number | null;
+}
+
+const EMPTY_LIVE_PROGRESS: LiveProgress = {
+  stage: "idle",
+  imageProcessed: 0,
+  imageTotal: 0,
+  etaSeconds: null,
+};
+
+const JOB_PHASE_LABELS: Record<string, string> = {
+  queued: "서버 접수 대기",
+  assembling: "업로드 파일 결합",
+  uploading: "업로드 확인",
+  collecting: "파일 목록 정리",
+  parsing: "라벨 분석",
+  storing: "이미지 처리 준비",
+  deriving: "이미지 처리",
+  thumbnailing: "마무리",
+  done: "처리 완료",
+};
 
 export function UploadPage() {
   const requestedProjectId = useMemo(() => {
@@ -167,7 +122,9 @@ export function UploadPage() {
   const fileRef = useRef<HTMLInputElement>(null);
   const folderRef = useRef<HTMLInputElement>(null);
   const sourceSequence = useRef(0);
+  const progressEstimateRef = useRef<ProgressEstimateState | null>(null);
   const selectionLockedRef = useRef(false);
+  const datasetNameEditedRef = useRef(false);
   const classResolutionPreferencesRef = useRef<ClassResolutionPreferences>({});
   const [dragging, setDragging] = useState(false);
   const [trayOpen, setTrayOpen] = useState(false);
@@ -175,6 +132,7 @@ export function UploadPage() {
   const [mergeIntoDatasetId, setMergeIntoDatasetId] = useState<number | null>(null);
   const [sources, setSources] = useState<UploadSource[]>([]);
   const [uploadTargets, setUploadTargets] = useState<Record<string, number>>({});
+  const [uploadDatasetResults, setUploadDatasetResults] = useState<Record<string, JobDataset[]>>({});
   const [completedBatchCounts, setCompletedBatchCounts] = useState<Record<string, number>>({});
   const [completedDatasets, setCompletedDatasets] = useState<CompletedDataset[]>([]);
   const [finalDataset, setFinalDataset] = useState<CompletedDataset | null>(null);
@@ -182,6 +140,15 @@ export function UploadPage() {
   const [expandedIssueKind, setExpandedIssueKind] = useState<IssueKind | null>(null);
   const [stats, setStats] = useState({ images: 0, annotations: 0, classes: 0 });
   const [progress, setProgress] = useState({ processed: 0, total: 0, current: "" });
+  const [liveProgress, setLiveProgress] = useState<LiveProgress>(EMPTY_LIVE_PROGRESS);
+  const [collectionProgress, setCollectionProgress] = useState({
+    treePercentage: 0,
+    filePercentage: 0,
+    filesProcessed: 0,
+    filesTotal: 0,
+    current: "폴더 트리 검색 시작",
+  });
+  const [collecting, setCollecting] = useState(false);
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -240,29 +207,43 @@ export function UploadPage() {
     ),
     [datasetName, project, sources],
   );
-  const completedUploadItemCount = uploadPlan.reduce(
-    (count, unit) => count + (
-      (completedBatchCounts[unit.key] ?? 0) >= unit.batches.length ? 1 : 0
-    ),
-    0,
-  );
   const uploadableSourceCount = useMemo(
     () => sources.filter((source) =>
       source.files.some((file) => file.kind !== "other"),
     ).length,
     [sources],
   );
+  const selectedImageCount = useMemo(
+    () => files.filter((file) => file.kind === "image").length,
+    [files],
+  );
+  const partitionPreview = useMemo(
+    () => uploadableSourceCount === 1
+      ? uploadPartitionPreview(datasetName, selectedImageCount)
+      : null,
+    [datasetName, selectedImageCount, uploadableSourceCount],
+  );
+  const completedUploadItemCount = uploadPlan.reduce(
+    (count, unit) => count + (
+      (completedBatchCounts[unit.key] ?? 0) >= unit.batches.length ? 1 : 0
+    ),
+    0,
+  );
   const datasetNameMissing = uploadableSourceCount > 0 && !datasetName.trim();
   const hasUploadTargets = Object.keys(uploadTargets).length > 0;
 
   useEffect(() => {
     if (selectionLockedRef.current) return;
-    setDatasetName(suggestedDatasetName(sources));
+    setDatasetName((current) => datasetNameAfterSourceChange(
+      current,
+      sources,
+      datasetNameEditedRef.current,
+    ));
   }, [sources]);
 
   const addSources = (drafts: UploadSourceDraft[]) => {
     if (selectionLockedRef.current) return;
-    const nonempty = drafts.filter((draft) => draft.files.length > 0);
+    const nonempty = coalesceDroppedSources(drafts).filter((draft) => draft.files.length > 0);
     if (nonempty.length === 0) return;
     const nextSources = nonempty.map((draft) => ({
       ...draft,
@@ -288,15 +269,18 @@ export function UploadPage() {
       });
       return merged;
     });
+    setUploadDatasetResults({});
     setTrayOpen(true);
     setDone(false);
     setFinalDataset(null);
+    progressEstimateRef.current = null;
+    setLiveProgress(EMPTY_LIVE_PROGRESS);
     setError(null);
   };
 
   const collectInput = (list: FileList | null, folder: boolean) => {
     if (!list) return;
-    const collectedFiles = Array.from(list).map((file) => collected(
+    const collectedFiles = Array.from(list).map((file) => toCollectedFile(
       file,
       folder && file.webkitRelativePath ? file.webkitRelativePath : file.name,
     ));
@@ -314,12 +298,14 @@ export function UploadPage() {
       setError("데이터셋을 추가할 프로젝트가 필요합니다.");
       return;
     }
-    if (!datasetName.trim()) {
-      setError("데이터셋 이름을 입력하세요.");
+    if (uploadPlan.length === 0) {
+      setError(sources.length > 0
+        ? "업로드할 수 있는 파일이 없습니다."
+        : "업로드할 파일이나 폴더를 먼저 선택하세요.");
       return;
     }
-    if (uploadPlan.length === 0) {
-      setError("업로드할 수 있는 파일이 없습니다.");
+    if (!datasetName.trim()) {
+      setError("데이터셋 이름을 입력하세요.");
       return;
     }
     if (uploadPlan.length > 200) {
@@ -340,8 +326,11 @@ export function UploadPage() {
     setStats({ images: 0, annotations: 0, classes: 0 });
     setCompletedDatasets([]);
     setFinalDataset(null);
+    progressEstimateRef.current = null;
+    setLiveProgress(EMPTY_LIVE_PROGRESS);
 
     const targetIds = { ...uploadTargets };
+    const datasetResultsByUnit = { ...uploadDatasetResults };
     const batchCounts = { ...completedBatchCounts };
     const reservedNames = new Set([
       ...project.datasets.map((dataset) => dataset.name),
@@ -379,6 +368,7 @@ export function UploadPage() {
 
     try {
       for (const unit of uploadPlan) {
+        let unitDatasetResults = datasetResultsByUnit[unit.key] ?? null;
         let targetId = targetIds[unit.key];
         if (targetId === undefined) {
           let candidateName = unit.name;
@@ -410,22 +400,63 @@ export function UploadPage() {
         for (const batchFiles of unit.batches.slice(batchStartIndex)) {
           const batch = await prepareUploadBatch(targetId, batchFiles);
           const batchStart = completedWork;
-          const jobId = await transferUploadBatch(batch, ({ uploadedBytes, currentPath }) => {
+          const transferProgressKey = `transfer:${unit.key}:${batchCounts[unit.key] ?? 0}`;
+          const jobId = await transferUploadBatch(batch, ({
+            uploadedBytes,
+            uploadedImages,
+            totalImages,
+            currentPath,
+          }) => {
+            const estimate = updateProgressEstimate(progressEstimateRef.current, {
+              key: transferProgressKey,
+              completed: uploadedBytes,
+              total: batch.totalBytes,
+              atMs: performance.now(),
+            });
+            progressEstimateRef.current = estimate.state;
             setProgress({
               processed: batchStart + uploadedBytes,
               total: totalWork,
               current: `${unit.name} · ${currentPath}`,
             });
+            setLiveProgress({
+              stage: "transferring",
+              imageProcessed: uploadedImages,
+              imageTotal: totalImages,
+              etaSeconds: estimate.remainingSeconds,
+            });
           });
           if (jobId !== null) {
-            const updateJobProgress = (job: { total: number; processed: number; phase: string }) => {
-              const ratio = job.total > 0
-                ? Math.min(1, job.processed / job.total)
-                : 0;
+            const updateJobProgress = (job: Job) => {
+              const ratio = job.image_total > 0
+                ? Math.min(1, job.image_processed / job.image_total)
+                : job.total > 0
+                  ? Math.min(1, job.processed / job.total)
+                  : 0;
+              const processingImages = job.phase === "storing" || job.phase === "deriving";
+              let etaSeconds: number | null = null;
+              if (processingImages && job.image_total > 0) {
+                const estimate = updateProgressEstimate(progressEstimateRef.current, {
+                  key: `processing:${jobId}`,
+                  completed: job.image_processed,
+                  total: job.image_total,
+                  atMs: performance.now(),
+                });
+                progressEstimateRef.current = estimate.state;
+                etaSeconds = estimate.remainingSeconds;
+              } else {
+                progressEstimateRef.current = null;
+              }
+              setLiveProgress({
+                stage: processingImages ? "processing" : "finishing",
+                imageProcessed: job.image_processed,
+                imageTotal: job.image_total,
+                etaSeconds,
+              });
               setProgress({
                 processed: batchStart + batch.totalBytes + batch.totalBytes * ratio,
                 total: totalWork,
-                current: `${unit.name} · ${job.phase}`,
+                current: `${unit.name} · ${JOB_PHASE_LABELS[job.phase] ?? job.phase}`,
               });
             };
             let terminal = await pollUploadJob(jobId, updateJobProgress);
@@ -449,6 +480,12 @@ export function UploadPage() {
                   ...current,
                   current: `${unit.name} · 클래스 명칭 확인 필요`,
                 }));
+                progressEstimateRef.current = null;
+                setLiveProgress((current) => ({
+                  ...current,
+                  stage: "finishing",
+                  etaSeconds: null,
+                }));
                 return;
               }
               if (autoResolvedRevisions.has(terminal.class_resolution.revision)) {
@@ -469,6 +506,9 @@ export function UploadPage() {
               clearUploadBatchResume(batch);
               throw new Error(`${unit.name}: 서버 처리 중 오류가 발생했습니다.`);
             }
+            unitDatasetResults = terminal.datasets;
+            datasetResultsByUnit[unit.key] = terminal.datasets;
+            setUploadDatasetResults({ ...datasetResultsByUnit });
           }
           completedWork += batch.totalBytes * 2;
           completedBatches += 1;
@@ -481,27 +521,53 @@ export function UploadPage() {
           });
         }
 
-        const [detail, issueRows] = await Promise.all([
-          getDataset(targetId),
+        const datasetResults = unitDatasetResults ?? [{
+          id: targetId,
+          name: unit.name,
+          status: "pending" as const,
+          image_count: 0,
+          annotation_count: 0,
+          class_count: 0,
+        }];
+        const [details, issueRows] = await Promise.all([
+          Promise.all(datasetResults.map((result) => getDataset(result.id))),
           getAllIssues(targetId),
         ]);
-        if (detail.status !== "ready") {
+        if (details.some((detail) => detail.status !== "ready")) {
           throw new Error(`${unit.name}: 사용할 수 있는 데이터셋으로 처리되지 않았습니다.`);
         }
-        collectedStats.images += detail.image_count;
-        collectedStats.annotations += detail.annotation_count;
-        collectedStats.classes += detail.class_count;
+        collectedStats.images += details.reduce(
+          (total, detail) => total + detail.image_count,
+          0,
+        );
+        collectedStats.annotations += details.reduce(
+          (total, detail) => total + detail.annotation_count,
+          0,
+        );
+        collectedStats.classes += details.reduce(
+          (total, detail) => total + detail.class_count,
+          0,
+        );
         collectedIssues.push(...issueRows.map((issue) => ({
           ...issue,
           summaryScope: String(targetId),
         })));
-        completed.push({ id: targetId, name: detail.name });
+        completed.push(...details.map((detail) => ({
+          id: detail.id,
+          name: detail.name,
+        })));
         setStats({ ...collectedStats });
         setIssues([...collectedIssues]);
         setCompletedDatasets([...completed]);
       }
 
       if (selectedMergedDataset !== null) {
+        progressEstimateRef.current = null;
+        setLiveProgress((current) => ({
+          ...current,
+          stage: "finishing",
+          etaSeconds: null,
+        }));
         setProgress({
           processed: totalWork,
           total: totalWork,
@@ -522,6 +588,12 @@ export function UploadPage() {
           current: "기존 병합 데이터셋에 포함 완료",
         });
       } else if (uploadPlan.length > 1) {
+        progressEstimateRef.current = null;
+        setLiveProgress((current) => ({
+          ...current,
+          stage: "finishing",
+          etaSeconds: null,
+        }));
         setProgress({
           processed: totalWork,
           total: totalWork,
@@ -542,6 +614,11 @@ export function UploadPage() {
         setFinalDataset(completed[0] ?? null);
         setProgress({ processed: totalWork, total: totalWork, current: "처리 완료" });
       }
+      setLiveProgress((current) => ({
+        ...current,
+        stage: "done",
+        etaSeconds: 0,
+      }));
       setDone(true);
     } catch (reason: unknown) {
       const message = reason instanceof Error ? reason.message : "업로드에 실패했습니다.";
@@ -552,6 +629,7 @@ export function UploadPage() {
           : "";
       setError(`${partial}${message}`);
     } finally {
+      invalidateStorageQuotaCache();
       if (Object.keys(targetIds).length === 0) selectionLockedRef.current = false;
       setBusy(false);
     }
@@ -579,6 +657,7 @@ export function UploadPage() {
         ...current,
         current: "클래스 명칭 적용 완료 · 처리 재개",
       }));
+      progressEstimateRef.current = null;
       void startUpload();
     } catch (reason: unknown) {
       setClassResolutionError(
@@ -591,11 +670,26 @@ export function UploadPage() {
     }
   };
 
-  const percentage = progress.total > 0
-    ? Math.min(100, Math.round(progress.processed / progress.total * 100))
-    : done ? 100 : 0;
+  const measuredPercentage = progress.total > 0
+    ? Math.min(100, progress.processed / progress.total * 100)
+    : 0;
+  const percentage = done
+    ? 100
+    : Math.min(99.9, measuredPercentage);
+  const percentageLabel = Math.floor(percentage * 10) / 10;
+  const activeProgressLabel = progress.current || (done ? "처리 완료" : "업로드 준비 중…");
+  const imageProgressLabel = liveProgress.imageTotal > 0 && liveProgress.stage !== "done"
+    ? `이미지 ${liveProgress.imageTotal.toLocaleString()}장 중 ${liveProgress.imageProcessed.toLocaleString()}장 ${liveProgress.stage === "transferring" ? "전송" : "처리"}`
+    : liveProgress.stage === "processing"
+      ? "서버에서 이미지 수 확인 중…"
+      : null;
+  const etaLabel = (
+    liveProgress.stage === "transferring" || liveProgress.stage === "processing"
+  )
+    ? `예상 남은 시간 ${formatRemainingTime(liveProgress.etaSeconds)}`
+    : null;
   const labelingDataset = finalDataset;
-  const canNavigateAfterUpload = done && labelingDataset !== null;
+  const canNavigateAfterUpload = done && percentage === 100 && labelingDataset !== null;
 
   return (
     <>
@@ -645,7 +739,13 @@ export function UploadPage() {
                       ? "병합 데이터셋 이름 입력"
                       : "데이터셋 이름 입력"
                 }
-                onChange={(event) => setDatasetName(event.target.value)}
+                onChange={(event) => {
+                  datasetNameEditedRef.current = true;
+                  setDatasetName(event.target.value);
+                  setError((current) => (
+                    current === "데이터셋 이름을 입력하세요." ? null : current
+                  ));
+                }}
               />
               <span
                 className={datasetNameMissing ? "error-text" : "hint"}
@@ -664,6 +764,12 @@ export function UploadPage() {
                   : uploadableSourceCount > 1
                     ? `${uploadableSourceCount.toLocaleString()}개 항목을 각각 업로드한 뒤 이 이름으로 자동 병합합니다.`
                     : "선택한 항목을 이 데이터셋으로 업로드합니다."}
+              </span>
+              <span className="hint upload-partition-hint">
+                데이터셋당 최대 5,000장 · 5,000장 초과 시 자동 분할
+                {partitionPreview
+                  ? ` · ${partitionPreview.imageCount.toLocaleString()}장을 ${partitionPreview.partCount.toLocaleString()}개 데이터셋으로 자동 분할 (${partitionPreview.sizes.map((size, index) => `${partitionPreview.names[index]} ${size.toLocaleString()}장`).join(" · ")})`
+                  : " · ZIP은 서버에서 이미지 수를 확인한 뒤 분할합니다."}
               </span>
             </div>
           </div>
@@ -714,7 +820,7 @@ export function UploadPage() {
             </fieldset>
           ) : null}
           <div
-            className={`drop-zone${dragging ? " is-dragging" : ""}`}
+            className={`drop-zone${dragging ? " is-dragging" : ""}${collecting ? " is-collecting" : ""}${busy || done ? " is-progressing" : ""}`}
             onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
             onDragOver={(event) => event.preventDefault()}
             onDragLeave={(event) => {
@@ -723,21 +829,108 @@ export function UploadPage() {
             onDrop={(event) => {
               event.preventDefault();
               setDragging(false);
-              if (!busy && !hasUploadTargets && project !== null) void collectDrop(event).then(addSources).catch((reason: unknown) => {
-                setError(reason instanceof Error ? reason.message : "파일을 읽지 못했습니다.");
+              if (busy || collecting || hasUploadTargets) return;
+              if (project === null) {
+                setError(projectLoading
+                  ? "프로젝트를 불러오는 중입니다. 잠시 후 다시 놓아 주세요."
+                  : "데이터셋을 추가할 프로젝트가 필요합니다.");
+                return;
+              }
+              setCollecting(true);
+              setDone(false);
+              setFinalDataset(null);
+              setCollectionProgress({
+                treePercentage: 0,
+                filePercentage: 0,
+                filesProcessed: 0,
+                filesTotal: 0,
+                current: "폴더 트리 검색 시작",
               });
+              setError(null);
+              void collectDroppedSources(event.dataTransfer, setCollectionProgress)
+                .then(addSources)
+                .catch((reason: unknown) => {
+                  setError(reason instanceof Error ? reason.message : "파일을 읽지 못했습니다.");
+                })
+                .finally(() => setCollecting(false));
             }}
           >
             <Icon name="upload" size={28} />
             <strong>파일 · 폴더 · zip 을 끌어다 놓으세요</strong>
-            <span>
-              YOLO / COCO / VOC 자동 감지 · {uploadableSourceCount.toLocaleString()}개 항목 · {files.length.toLocaleString()}개 파일 선택됨
-            </span>
+            {collecting ? (
+              <div className="drop-live-progress">
+                <div className="drop-progress-stage">
+                  <div className="drop-live-progress-copy">
+                    <span>폴더 트리 검색</span>
+                    <strong className="mono">{collectionProgress.treePercentage}%</strong>
+                  </div>
+                  <span
+                    className="bar"
+                    role="progressbar"
+                    aria-label="폴더 트리 검색 진행률"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={collectionProgress.treePercentage}
+                  >
+                    <i style={{ width: `${collectionProgress.treePercentage}%` }} />
+                  </span>
+                </div>
+                <div className="drop-progress-stage">
+                  <div className="drop-live-progress-copy">
+                    <span>실제 파일 읽기</span>
+                    <strong className="mono">{collectionProgress.filePercentage}%</strong>
+                  </div>
+                  <span
+                    className="bar"
+                    role="progressbar"
+                    aria-label="실제 파일 읽기 진행률"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={collectionProgress.filePercentage}
+                  >
+                    <i style={{ width: `${collectionProgress.filePercentage}%` }} />
+                  </span>
+                </div>
+                <span className="drop-live-progress-current">
+                  {collectionProgress.current}
+                  {collectionProgress.filesTotal > 0
+                    ? ` · ${collectionProgress.filesProcessed.toLocaleString()}/${collectionProgress.filesTotal.toLocaleString()}개`
+                    : ""}
+                </span>
+              </div>
+            ) : busy || done ? (
+              <div className="drop-live-progress">
+                <div className="drop-live-progress-copy">
+                  <span>{activeProgressLabel}</span>
+                  <strong className="mono">{percentageLabel}%</strong>
+                </div>
+                <span
+                  className="bar"
+                  role="progressbar"
+                  aria-label="업로드 진행률"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={percentage}
+                >
+                  <i style={{ width: `${percentage}%` }} />
+                </span>
+                {imageProgressLabel || etaLabel ? (
+                  <div className="upload-progress-detail" aria-live="polite">
+                    <span>{imageProgressLabel}</span>
+                    <strong>{etaLabel}</strong>
+                  </div>
+                ) : null}
+              </div>
+            ) : (
+              <span>
+                YOLO / COCO / VOC 자동 감지 · {uploadableSourceCount.toLocaleString()}개 항목 · {files.length.toLocaleString()}개 파일 선택됨
+              </span>
+            )}
             <div className="drop-actions">
-              <button className="btn btn-secondary" type="button" disabled={busy || hasUploadTargets || project === null} onClick={() => fileRef.current?.click()}>
+              <button className="btn btn-secondary" type="button" disabled={busy || collecting || hasUploadTargets || project === null} onClick={() => fileRef.current?.click()}>
                 <Icon name="upload" size={14} /> 파일 선택
               </button>
-              <button className="btn btn-secondary" type="button" disabled={busy || hasUploadTargets || project === null} onClick={() => folderRef.current?.click()}>
+              <button className="btn btn-secondary" type="button" disabled={busy || collecting || hasUploadTargets || project === null} onClick={() => folderRef.current?.click()}>
                 <Icon name="folder-up" size={14} /> 폴더 선택
               </button>
               <button
@@ -746,9 +939,8 @@ export function UploadPage() {
                 disabled={
                   project === null
                   || busy
+                  || collecting
                   || pendingClassResolution !== null
-                  || !datasetName.trim()
-                  || uploadPlan.length === 0
                   || uploadPlan.length > 200
                 }
                 onClick={() => void startUpload()}
@@ -762,8 +954,8 @@ export function UploadPage() {
                       : "업로드 시작"}
               </button>
             </div>
-            <input ref={fileRef} className="sr-only" type="file" multiple disabled={busy || hasUploadTargets} accept="image/*,.zip,.txt,.json,.xml,.yaml,.yml" onChange={(event) => { collectInput(event.target.files, false); event.target.value = ""; }} />
-            <input ref={folderRef} className="sr-only" type="file" multiple disabled={busy || hasUploadTargets} onChange={(event) => { collectInput(event.target.files, true); event.target.value = ""; }} />
+            <input ref={fileRef} className="sr-only" type="file" multiple disabled={busy || collecting || hasUploadTargets} accept="image/*,.zip,.txt,.json,.xml,.yaml,.yml" onChange={(event) => { collectInput(event.target.files, false); event.target.value = ""; }} />
+            <input ref={folderRef} className="sr-only" type="file" multiple disabled={busy || collecting || hasUploadTargets} onChange={(event) => { collectInput(event.target.files, true); event.target.value = ""; }} />
           </div>
           {error ? <p className="class-rename-error" role="alert">{error}</p> : null}
         </section>
@@ -864,12 +1056,18 @@ export function UploadPage() {
           </button>
           {trayOpen ? (
             <>
-              <div className="tray-total"><span className="bar"><i style={{ width: `${percentage}%` }} /></span><span className="mono">{percentage}%</span></div>
+              <div className="tray-total"><span className="bar"><i style={{ width: `${percentage}%` }} /></span><span className="mono">{percentageLabel}%</span></div>
+              {imageProgressLabel || etaLabel ? (
+                <div className="tray-progress-detail" aria-live="polite">
+                  <span>{imageProgressLabel}</span>
+                  <strong>{etaLabel}</strong>
+                </div>
+              ) : null}
               <div className="tray-files">
                 <div>
                   <span>{progress.current || files[0]?.relPath || "파일을 선택하세요"}</span>
                   <span className={pendingClassResolution ? "tag tag-warn" : done ? "tag tag-ok" : "tray-file-progress"}>
-                    {pendingClassResolution ? "확인 필요" : done ? "완료" : `${percentage}%`}
+                    {pendingClassResolution ? "확인 필요" : done ? "완료" : `${percentageLabel}%`}
                   </span>
                 </div>
               </div>

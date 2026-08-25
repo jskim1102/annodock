@@ -21,11 +21,13 @@ from app.models import (
 )
 from app.services import dataset_merge as dataset_merge_service
 from app.services import training
+from app.services.quota import increase_bytes_used
 from app.services.storage import (
     contained_storage_path,
     stage_deletions_async as real_stage_deletions_async,
     storage_relative_path,
 )
+from tests.factories import image_with_media
 
 
 pytestmark = pytest.mark.asyncio
@@ -63,13 +65,18 @@ async def create_ready_dataset(
         await session.execute(
             delete(DatasetClass).where(DatasetClass.dataset_id == dataset_id)
         )
+        physical_bytes = 0
         for index in range(count):
             stem = "same" if count == 1 else f"same-{index}"
             original = root / f"{stem}.jpg"
             thumbnail = root / f"{stem}-thumb.jpg"
             original.write_bytes(content + f"-{index}".encode())
             thumbnail.write_bytes(b"thumb-" + content + f"-{index}".encode())
-            image = Image(
+            original_bytes = original.stat().st_size
+            thumb_bytes = thumbnail.stat().st_size
+            physical_bytes += original_bytes + thumb_bytes
+            image = image_with_media(
+                owner_id=dataset.owner_id,
                 dataset_id=dataset_id,
                 stem=stem,
                 filename=f"{stem}.jpg",
@@ -86,6 +93,9 @@ async def create_ready_dataset(
                     app.state.settings.storage_dir,
                     thumbnail,
                 ),
+                original_bytes=original_bytes,
+                display_bytes=0,
+                thumb_bytes=thumb_bytes,
                 box_count=1,
                 is_modified=True,
             )
@@ -113,6 +123,7 @@ async def create_ready_dataset(
                 for class_id, name in classes.items()
             ]
         )
+        await increase_bytes_used(session, dataset.owner_id, physical_bytes)
         await session.commit()
     return dataset_id
 
@@ -319,13 +330,17 @@ async def test_merge_creates_trainable_copy_and_groups_originals(
     assert deleted.status_code == 204
     async with app.state.session_factory() as session:
         usage = await session.get(UserStorage, 1)
-        assert usage is not None and usage.bytes_used == 0
+        assert usage is not None and usage.bytes_used == merged_bytes
         remaining_ids = (await session.scalars(select(Dataset.id))).all()
-        assert remaining_ids == []
-    # 병합 데이터셋 삭제는 숨겨진 원본까지 함께 지운다 — 복원되지 않는다.
+        assert set(remaining_ids) == {first_id, second_id}
+    # The selected reference is removed; its source datasets remain intact and
+    # become visible when merge membership cascades away.
     after_listing = await client.get("/api/datasets?offset=0&limit=200")
-    assert after_listing.json()["total"] == 0
-    assert after_listing.json()["items"] == []
+    assert after_listing.json()["total"] == 2
+    assert {item["id"] for item in after_listing.json()["items"]} == {
+        first_id,
+        second_id,
+    }
 
 
 async def test_merge_uses_complete_project_catalog_and_name_based_annotation_ids(
@@ -912,12 +927,10 @@ async def test_extend_merged_dataset_appends_sources_without_mutating_existing_s
             .order_by(Image.id.desc())
         )
         assert appended is not None
-        appended_bytes = (
-            appended.original_bytes + appended.display_bytes + appended.thumb_bytes
-        )
+        assert appended.original_bytes + appended.thumb_bytes > 0
         usage_after = await session.get(UserStorage, 1)
         assert usage_after is not None
-        assert usage_after.bytes_used == bytes_before + appended_bytes
+        assert usage_after.bytes_used == bytes_before
 
     listing = await client.get("/api/datasets?offset=0&limit=200")
     assert [item["id"] for item in listing.json()["items"]] == [target_id]

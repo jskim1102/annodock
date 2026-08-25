@@ -38,7 +38,11 @@ from app.services.dataset_merge import (
     extend_merged_dataset,
     merge_datasets,
 )
-from app.services.quota import dataset_accounted_bytes, decrease_bytes_used
+from app.services.quota import (
+    apply_dataset_storage_release,
+    decrease_bytes_used,
+    plan_dataset_storage_release,
+)
 from app.services.storage import (
     create_dataset_storage,
     finalize_staged_deletions,
@@ -379,7 +383,12 @@ async def list_datasets(
                 Dataset.is_placeholder.is_(False),
                 ~Dataset.id.in_(source_dataset_ids),
             )
-            .order_by(Dataset.created_at.desc(), Dataset.id.desc())
+            .order_by(
+                Dataset.created_at.desc(),
+                Dataset.upload_group_id.desc().nulls_last(),
+                Dataset.upload_part_index.asc().nulls_last(),
+                Dataset.id.desc(),
+            )
             .offset(offset)
             .limit(limit)
         )
@@ -690,26 +699,9 @@ async def delete_dataset(
         current_user.id,
         for_update=True,
     )
-    # 병합 데이터셋 삭제는 숨겨진 원본 데이터셋까지 함께 지운다 — 원본을
-    # 최상위로 복원시키면 사용자 입장에서는 삭제가 절반만 된 것처럼 보인다.
+    # Delete only the selected dataset reference.  Merge membership cascades
+    # away and any surviving source datasets become visible again.
     targets = [dataset]
-    if dataset.is_merged:
-        source_datasets = (
-            await session.scalars(
-                select(Dataset)
-                .join(
-                    DatasetMergeSource,
-                    DatasetMergeSource.source_dataset_id == Dataset.id,
-                )
-                .where(
-                    DatasetMergeSource.merged_dataset_id == dataset.id,
-                    Dataset.owner_id == current_user.id,
-                )
-                .order_by(Dataset.id)
-                .with_for_update()
-            )
-        ).all()
-        targets.extend(source_datasets)
     target_ids = [item.id for item in targets]
     active_run_id = await session.scalar(
         select(TrainingRun.id)
@@ -728,12 +720,10 @@ async def delete_dataset(
                 "학습이 끝나거나 취소된 뒤 다시 시도하세요."
             ),
         )
-    accounted_bytes = 0
-    for item in targets:
-        accounted_bytes += await dataset_accounted_bytes(session, item.id)
     owner_id = dataset.owner_id
     storage_dir = request.app.state.settings.storage_dir
     await set_local_lock_timeout(session)
+    release_plan = await plan_dataset_storage_release(session, target_ids)
     upload_ids = list(
         (
             await session.scalars(
@@ -753,6 +743,13 @@ async def delete_dataset(
     try:
         for item in targets:
             await session.delete(item)
+        await session.flush()
+        await apply_dataset_storage_release(session, release_plan)
+        await decrease_bytes_used(
+            session,
+            owner_id,
+            release_plan.released_bytes,
+        )
         await session.commit()
     except BaseException as error:
         restore_staged_deletions(reversed(staged_list))
@@ -765,6 +762,4 @@ async def delete_dataset(
             )
         raise
     await asyncio.to_thread(finalize_staged_deletions, staged_list)
-    await decrease_bytes_used(session, owner_id, accounted_bytes)
-    await session.commit()
     return Response(status_code=204)

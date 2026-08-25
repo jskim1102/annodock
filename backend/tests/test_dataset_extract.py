@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import errno
 from pathlib import Path
 from uuid import uuid4
 
 import httpx
 import pytest
+import yaml
 from sqlalchemy import func, select
 
 from app.models import (
@@ -17,8 +19,11 @@ from app.models import (
     TrainingRun,
     UserStorage,
 )
+from app.services import dataset_merge as dataset_merge_service
 from app.services import training
+from app.services.quota import increase_bytes_used
 from app.services.storage import contained_storage_path, storage_relative_path
+from tests.factories import image_with_media
 
 
 pytestmark = pytest.mark.asyncio
@@ -96,12 +101,15 @@ async def _create_dataset(
         ) / "fixture"
         root.mkdir(parents=True, exist_ok=True)
         annotation_count = 0
+        physical_bytes = 0
         for stem, class_ids, content in images:
             original = root / f"{stem}.jpg"
             thumbnail = root / f"{stem}-thumb.jpg"
             original.write_bytes(content)
             thumbnail.write_bytes(b"thumb-" + content)
-            image = Image(
+            physical_bytes += original.stat().st_size + thumbnail.stat().st_size
+            image = image_with_media(
+                owner_id=dataset.owner_id,
                 dataset_id=dataset_id,
                 stem=stem,
                 filename=original.name,
@@ -141,6 +149,7 @@ async def _create_dataset(
         dataset.image_count = len(images)
         dataset.annotation_count = annotation_count
         dataset.class_count = 3
+        await increase_bytes_used(session, dataset.owner_id, physical_bytes)
         await session.commit()
     return dataset_id
 
@@ -165,6 +174,10 @@ async def test_extract_creates_visible_independent_filtered_snapshot(
         project_id=project_id,
         images=[("same", [1, 2, 2], b"second-selected")],
     )
+    async with app.state.session_factory() as session:
+        source_usage = await session.get(UserStorage, 1)
+        assert source_usage is not None
+        source_physical_bytes = source_usage.bytes_used
     result_name = f"test-extract-result-{uuid4().hex}"
 
     response = await client.post(
@@ -185,7 +198,7 @@ async def test_extract_creates_visible_independent_filtered_snapshot(
         "name": result_name,
         "image_count": 2,
         "annotation_count": 3,
-        "class_count": 3,
+        "class_count": 1,
         "created_at": extracted["created_at"],
         "status": "ready",
         "is_merged": False,
@@ -195,8 +208,6 @@ async def test_extract_creates_visible_independent_filtered_snapshot(
     assert classes.status_code == 200
     assert classes.json() == {
         "classes": [
-            {"class_id": 0, "name": "person"},
-            {"class_id": 1, "name": "vehicle"},
             {"class_id": 2, "name": "helmet"},
         ]
     }
@@ -227,11 +238,13 @@ async def test_extract_creates_visible_independent_filtered_snapshot(
             .where(DatasetMergeSource.merged_dataset_id == extracted_id)
         )
         usage = await session.get(UserStorage, 1)
+        extracted_row = await session.get(Dataset, extracted_id)
 
     assert [image.stem for image in images] == ["same", "same (1)"]
     assert [image.box_count for image in images] == [1, 2]
     assert annotations == [("same", 2), ("same (1)", 2), ("same (1)", 2)]
     assert memberships == 0
+    assert extracted_row is not None and extracted_row.is_extracted is True
     assert all(not Path(image.file_path).is_absolute() for image in images)
     assert all(
         contained_storage_path(
@@ -244,7 +257,8 @@ async def test_extract_creates_visible_independent_filtered_snapshot(
         image.original_bytes + image.display_bytes + image.thumb_bytes
         for image in images
     )
-    assert usage is not None and usage.bytes_used == extracted_bytes
+    assert extracted_bytes > 0
+    assert usage is not None and usage.bytes_used == source_physical_bytes
 
     listing = await client.get("/api/datasets?offset=0&limit=200")
     assert listing.status_code == 200
@@ -277,9 +291,20 @@ async def test_extract_creates_visible_independent_filtered_snapshot(
     renamed_classes = await client.get(
         f"/api/datasets/{extracted_id}/classes"
     )
-    assert renamed_classes.json()["classes"][1] == {
-        "class_id": 1,
-        "name": "truck",
+    assert renamed_classes.json() == {
+        "classes": [{"class_id": 2, "name": "helmet"}]
+    }
+
+    selected_rename = await client.patch(
+        f"/api/projects/{project_id}/classes/2",
+        json={"name": "hardhat"},
+    )
+    assert selected_rename.status_code == 200, selected_rename.text
+    renamed_classes = await client.get(
+        f"/api/datasets/{extracted_id}/classes"
+    )
+    assert renamed_classes.json() == {
+        "classes": [{"class_id": 2, "name": "hardhat"}]
     }
 
     source_paths = []
@@ -301,7 +326,7 @@ async def test_extract_creates_visible_independent_filtered_snapshot(
         assert await session.get(Dataset, second_id) is not None
         usage = await session.get(UserStorage, 1)
     assert all(path.is_dir() for path in source_paths)
-    assert usage is not None and usage.bytes_used == 0
+    assert usage is not None and usage.bytes_used == source_physical_bytes
 
 
 async def test_extract_rejects_invalid_sources_classes_and_empty_result(
@@ -370,7 +395,7 @@ async def test_extract_rejects_invalid_sources_classes_and_empty_result(
         assert response.status_code == 422, response.text
 
 
-async def test_extract_keeps_dense_project_catalog_for_training(
+async def test_extract_keeps_only_selected_catalog_for_training(
     client: httpx.AsyncClient,
     app,
     monkeypatch: pytest.MonkeyPatch,
@@ -411,6 +436,10 @@ async def test_extract_keeps_dense_project_catalog_for_training(
     async with app.state.session_factory() as session:
         run = await session.get(TrainingRun, submitted.json()["run_id"])
         assert run is not None and run.dataset_id == extracted_id
+        run_root = contained_storage_path(
+            app.state.settings.storage_dir,
+            run.out_dir,
+        )
         run_image_count = await session.scalar(
             select(func.count(RunImage.id)).where(RunImage.run_id == run.id)
         )
@@ -424,7 +453,18 @@ async def test_extract_keeps_dense_project_catalog_for_training(
             ).all()
         )
     assert run_image_count == 10
-    assert class_ids == [0, 1, 2]
+    assert class_ids == [2]
+    data = yaml.safe_load(
+        (run_root / "workdir" / "data.yaml").read_text(encoding="utf-8")
+    )
+    assert data["names"] == {0: "helmet"}
+    labels = sorted((run_root / "workdir" / "labels").rglob("*.txt"))
+    assert len(labels) == 10
+    assert all(
+        line.startswith("0 ")
+        for label in labels
+        for line in label.read_text(encoding="utf-8").splitlines()
+    )
 
 
 async def test_extract_hides_foreign_dataset_existence(
@@ -457,6 +497,7 @@ async def test_extract_hides_foreign_dataset_existence(
 async def test_extract_rejects_quota_without_persisting_partial_output(
     client: httpx.AsyncClient,
     app,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app.state.settings = app.state.settings.model_copy(
         update={"quota_bytes_per_user": 1}
@@ -468,6 +509,15 @@ async def test_extract_rejects_quota_without_persisting_partial_output(
         project_id=project_id,
         images=[("large", [2], b"larger-than-one-byte")],
     )
+    async with app.state.session_factory() as session:
+        source_usage = await session.get(UserStorage, 1)
+        assert source_usage is not None
+        source_physical_bytes = source_usage.bytes_used
+
+    def fail_link(_source: Path, _target: Path) -> None:
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    monkeypatch.setattr(dataset_merge_service.os, "link", fail_link)
     result_name = f"test-extract-quota-{uuid4().hex}"
     datasets_root = app.state.settings.storage_dir / "datasets"
     storage_entries_before = set(datasets_root.iterdir())
@@ -490,5 +540,5 @@ async def test_extract_rejects_quota_without_persisting_partial_output(
         )
         usage = await session.get(UserStorage, 1)
     assert output is None
-    assert usage is None or usage.bytes_used == 0
+    assert usage is not None and usage.bytes_used == source_physical_bytes
     assert set(datasets_root.iterdir()) == storage_entries_before

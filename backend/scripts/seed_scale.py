@@ -19,7 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker  # noqa: E40
 
 from app.config import Settings  # noqa: E402
 from app.db import create_engine, create_session_factory  # noqa: E402
-from app.models import Dataset, DatasetClass, Image  # noqa: E402
+from app.models import Dataset, DatasetClass, Image, MediaObject  # noqa: E402
+from app.services.quota import increase_bytes_used  # noqa: E402
 from app.services.storage import (  # noqa: E402
     contained_storage_path,
     create_dataset_storage,
@@ -70,6 +71,17 @@ async def seed_scale_dataset(
             thumb_path = scale_dir / "shared-thumb.jpg"
             original_path.write_bytes(b"scale-image")
             thumb_path.write_bytes(b"scale-thumbnail")
+            original_bytes = original_path.stat().st_size
+            thumb_bytes = thumb_path.stat().st_size
+            media_object = MediaObject(
+                owner_id=dataset.owner_id,
+                created_by_dataset_id=dataset_id,
+                original_bytes=original_bytes,
+                display_bytes=0,
+                thumb_bytes=thumb_bytes,
+            )
+            session.add(media_object)
+            await session.flush()
 
             session.add_all(
                 [
@@ -88,6 +100,7 @@ async def seed_scale_dataset(
                     """
                     INSERT INTO images (
                         dataset_id,
+                        media_object_id,
                         stem,
                         filename,
                         rel_path,
@@ -97,11 +110,14 @@ async def seed_scale_dataset(
                         file_path,
                         display_path,
                         thumb_path,
+                        original_bytes,
+                        thumb_bytes,
                         box_count,
                         is_modified
                     )
                     SELECT
                         :dataset_id,
+                        :media_object_id,
                         'image-' || lpad(series_no::text, 6, '0'),
                         'image-' || lpad(series_no::text, 6, '0') || '.jpg',
                         'images/' ||
@@ -122,6 +138,8 @@ async def seed_scale_dataset(
                         :file_path,
                         NULL,
                         :thumb_path,
+                        :original_bytes,
+                        :thumb_bytes,
                         :boxes_per_image,
                         false
                     FROM generate_series(1, :image_count) AS series_no
@@ -129,8 +147,11 @@ async def seed_scale_dataset(
                 ),
                 {
                     "dataset_id": dataset_id,
+                    "media_object_id": media_object.id,
                     "file_path": str(original_path),
                     "thumb_path": str(thumb_path),
+                    "original_bytes": original_bytes,
+                    "thumb_bytes": thumb_bytes,
                     "boxes_per_image": boxes_per_image,
                     "image_count": image_count,
                 },
@@ -170,6 +191,11 @@ async def seed_scale_dataset(
             dataset.image_count = image_count
             dataset.annotation_count = image_count * boxes_per_image
             dataset.class_count = 3
+            await increase_bytes_used(
+                session,
+                dataset.owner_id,
+                original_bytes + thumb_bytes,
+            )
             await session.commit()
             committed = True
 

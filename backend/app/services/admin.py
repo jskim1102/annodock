@@ -1,10 +1,11 @@
-"""Read-only admin dashboard queries (F26).
+"""Admin dashboard queries and account administration (F26).
 
-Account identity (email, signup time) lives in the auth-service database,
-which this project treats as read-only. This module therefore keeps two
-concerns apart: admin membership is a row in this project's ``admin_users``
-table, while directory rows are fetched from the auth database over a
-dedicated engine that only ever runs SELECTs.
+Account identity (email, signup time) lives in the auth-service database.
+This module keeps two concerns apart: admin membership is a row in this
+project's ``admin_users`` table, while directory rows are fetched from the
+auth database over a dedicated engine. That engine runs SELECTs, with one
+deliberate exception: ``delete_auth_account`` removes an account (and its
+dependent auth rows) when an admin deletes a user.
 """
 
 from __future__ import annotations
@@ -101,6 +102,42 @@ async def load_auth_directory(
         # A real outage (host down, bad credentials) must surface as the
         # documented 503, not an opaque 500 via the DBAPIError handler.
         raise RuntimeError(f"auth directory unavailable: {error}") from error
+
+
+async def delete_auth_account(
+    auth_database_url: str | None,
+    user_id: int,
+) -> None:
+    """Delete one auth-service account and its dependent rows.
+
+    The auth schema has no ON DELETE CASCADE, so child tables go first.
+    Raises RuntimeError on outage/misconfiguration, mirroring
+    ``load_auth_directory``.
+    """
+
+    if not auth_database_url:
+        raise RuntimeError("AUTH_DATABASE_URL is not configured")
+    engine = _engine_for(auth_database_url)
+    try:
+        async with engine.begin() as connection:
+            for child in (
+                "refresh_tokens",
+                "password_resets",
+                "oauth_codes",
+                "auth_identities",
+            ):
+                await connection.execute(
+                    text(f"DELETE FROM {child} WHERE user_id = :user_id"),
+                    {"user_id": user_id},
+                )
+            await connection.execute(
+                text("DELETE FROM users WHERE id = :user_id"),
+                {"user_id": user_id},
+            )
+    except (SQLAlchemyError, OSError) as error:
+        raise RuntimeError(
+            f"auth account deletion failed: {error}"
+        ) from error
 
 
 async def _query_directory(engine: AsyncEngine) -> list[AuthDirectoryUser]:

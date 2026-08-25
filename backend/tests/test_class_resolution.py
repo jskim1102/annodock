@@ -473,6 +473,7 @@ async def test_zip_pause_preserves_input_and_resume_reextracts(
     plan = waiting.json()["class_resolution"]
     upload_root = upload_directory(app.state.settings, upload_id)
     assert (upload_root / "source").is_file()
+    assert not (upload_root / "chunks").exists()
     assert (upload_root / "extracted").is_dir()
     async with app.state.session_factory() as session:
         job = await session.get(UploadJob, job_id)

@@ -319,10 +319,15 @@ async def start_training(
         )
     ).all()
     configured_class_ids = [row.class_id for row in classes]
-    effective_class_ids = sorted(set(configured_class_ids) | set(used_class_ids))
-    if (
-        configured_class_ids != list(range(len(configured_class_ids)))
-        or effective_class_ids != list(range(len(effective_class_ids)))
+    configured_class_id_set = set(configured_class_ids)
+    has_unknown_class_ids = not set(used_class_ids).issubset(
+        configured_class_id_set
+    )
+    has_gapped_catalog = configured_class_ids != list(
+        range(len(configured_class_ids))
+    )
+    if has_unknown_class_ids or (
+        has_gapped_catalog and not dataset.is_extracted
     ):
         raise TrainingRequestError(400, GAPPED_CLASS_DETAIL)
 

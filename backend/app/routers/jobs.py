@@ -37,6 +37,17 @@ class ClassResolutionPlanResponse(BaseModel):
     conflicts: list[ClassNameConflictResponse]
 
 
+class JobDatasetResponse(BaseModel):
+    id: int
+    name: str
+    status: Literal["pending", "processing", "ready", "failed"]
+    image_count: int
+    annotation_count: int
+    class_count: int
+    part_index: int | None
+    part_count: int | None
+
+
 class JobResponse(BaseModel):
     job_id: int
     state: Literal[
@@ -49,8 +60,11 @@ class JobResponse(BaseModel):
     total: int
     processed: int
     failed: int
+    image_total: int
+    image_processed: int
     phase: str
     class_resolution: ClassResolutionPlanResponse | None
+    datasets: list[JobDatasetResponse]
 
 
 class ClassResolutionChoice(BaseModel):
@@ -98,28 +112,60 @@ async def get_job(
     session: Session,
     current_user: CurrentUserDep,
 ) -> JobResponse:
-    job = await session.scalar(
-        select(UploadJob)
+    result = await session.execute(
+        select(UploadJob, Dataset)
         .join(Dataset, Dataset.id == UploadJob.dataset_id)
         .where(
             UploadJob.id == job_id,
             Dataset.owner_id == current_user.id,
         )
     )
-    if job is None:
+    row = result.one_or_none()
+    if row is None:
         raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+    job, dataset = row
+    if dataset.upload_group_id is None:
+        datasets = [dataset]
+    else:
+        datasets = list(
+            (
+                await session.scalars(
+                    select(Dataset)
+                    .where(
+                        Dataset.owner_id == current_user.id,
+                        Dataset.upload_group_id == dataset.upload_group_id,
+                    )
+                    .order_by(Dataset.upload_part_index)
+                )
+            ).all()
+        )
     return JobResponse(
         job_id=job.id,
         state=job.state,
         total=job.total,
         processed=job.processed,
         failed=job.failed,
+        image_total=job.image_total,
+        image_processed=job.image_processed,
         phase=job.phase,
         class_resolution=(
             job.class_resolution_plan
             if job.state == "awaiting_class_resolution"
             else None
         ),
+        datasets=[
+            JobDatasetResponse(
+                id=item.id,
+                name=item.name,
+                status=item.status,
+                image_count=item.image_count,
+                annotation_count=item.annotation_count,
+                class_count=item.class_count,
+                part_index=item.upload_part_index,
+                part_count=item.upload_part_count,
+            )
+            for item in datasets
+        ],
     )
 
 

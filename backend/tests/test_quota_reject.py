@@ -19,6 +19,7 @@ from app.models import (
 )
 from app.services import training
 from app.services.storage import contained_storage_path, storage_relative_path
+from tests.factories import image_with_media
 
 
 pytestmark = pytest.mark.asyncio
@@ -34,13 +35,26 @@ def _quota_settings(app, *, limit: int = QUOTA_BYTES) -> None:
     )
 
 
-async def _set_usage(app, owner_id: int, bytes_used: int) -> None:
+async def _set_usage(
+    app,
+    owner_id: int,
+    bytes_used: int,
+    *,
+    quota_limit_bytes: int | None = None,
+) -> None:
     async with app.state.session_factory() as session:
         storage = await session.get(UserStorage, owner_id)
         if storage is None:
-            session.add(UserStorage(owner_id=owner_id, bytes_used=bytes_used))
+            session.add(
+                UserStorage(
+                    owner_id=owner_id,
+                    bytes_used=bytes_used,
+                    quota_limit_bytes=quota_limit_bytes,
+                )
+            )
         else:
             storage.bytes_used = bytes_used
+            storage.quota_limit_bytes = quota_limit_bytes
         await session.commit()
 
 
@@ -76,7 +90,8 @@ async def _create_dataset(
         for index in range(ready_images):
             source = dataset_root / f"quota-{index}.jpg"
             source.write_bytes(f"quota-image-{index}".encode())
-            image = Image(
+            image = image_with_media(
+                owner_id=dataset.owner_id,
                 dataset_id=dataset_id,
                 stem=f"quota-{index}",
                 filename=source.name,
@@ -174,6 +189,38 @@ async def test_upload_preflight_rejects_exhausted_user_quota(
     _quota_settings(app)
     _ample_disk(monkeypatch)
     await _set_usage(app, EXHAUSTED_OWNER, QUOTA_BYTES)
+    dataset_id = await _create_dataset(
+        client, app, auth_headers, EXHAUSTED_OWNER
+    )
+
+    response = await client.post(
+        f"/api/datasets/{dataset_id}/upload-batches/preflight",
+        headers=auth_headers(EXHAUSTED_OWNER),
+        json={
+            "total_size": 200,
+            "largest_file_size": 100,
+            "file_count": 2,
+            "expected_extracted_size": 250,
+        },
+    )
+
+    _assert_quota_rejection(response)
+
+
+async def test_upload_preflight_uses_the_users_quota_override(
+    client: httpx.AsyncClient,
+    app,
+    auth_headers,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _quota_settings(app, limit=10 * QUOTA_BYTES)
+    _ample_disk(monkeypatch)
+    await _set_usage(
+        app,
+        EXHAUSTED_OWNER,
+        QUOTA_BYTES,
+        quota_limit_bytes=QUOTA_BYTES,
+    )
     dataset_id = await _create_dataset(
         client, app, auth_headers, EXHAUSTED_OWNER
     )

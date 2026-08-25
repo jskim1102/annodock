@@ -44,7 +44,7 @@ def _database_url() -> str:
     if not database_url:
         raise RuntimeError("DATABASE_URL or TEST_DATABASE_URL must be set")
 
-    if os.getenv("DEEPLABEL_RUNTIME") != "docker":
+    if os.getenv("ANNODOCK_RUNTIME") != "docker":
         database_url = database_url.replace(
             "harness-shared-postgres:5432", "localhost:5435"
         )

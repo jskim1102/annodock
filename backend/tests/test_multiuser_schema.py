@@ -15,6 +15,7 @@ from app.models import (
     ExportArtifact,
     Image,
     Membership,
+    MediaObject,
     Organization,
     Project,
     Team,
@@ -33,7 +34,7 @@ MIGRATION_PATH = (
 
 def _migration() -> ModuleType:
     spec = importlib.util.spec_from_file_location(
-        "deeplabel_multiuser_ownership_migration",
+        "annodock_multiuser_ownership_migration",
         MIGRATION_PATH,
     )
     assert spec is not None and spec.loader is not None
@@ -51,7 +52,7 @@ def _check_names(model: type[object]) -> set[str]:
 
 
 def test_owner_ids_match_auth_integer_subject_without_cross_database_fks() -> None:
-    for model in (Dataset, TrainingRun, Organization):
+    for model in (Dataset, MediaObject, TrainingRun, Organization):
         owner = model.__table__.c.owner_id
         assert isinstance(owner.type, Integer)
         assert owner.nullable is False
@@ -69,6 +70,9 @@ def test_accounting_columns_are_non_nullable_bigints() -> None:
         Image.__table__.c.original_bytes,
         Image.__table__.c.display_bytes,
         Image.__table__.c.thumb_bytes,
+        MediaObject.__table__.c.original_bytes,
+        MediaObject.__table__.c.display_bytes,
+        MediaObject.__table__.c.thumb_bytes,
         Annotation.__table__.c.serialized_bytes,
         ExportArtifact.__table__.c.archive_bytes,
         UserStorage.__table__.c.bytes_used,
@@ -80,9 +84,15 @@ def test_accounting_columns_are_non_nullable_bigints() -> None:
         assert str(column.server_default.arg) == "0"
 
     assert "ck_images_bytes_nonnegative" in _check_names(Image)
+    assert "ck_media_objects_bytes_nonnegative" in _check_names(MediaObject)
     assert "ck_annotations_serialized_bytes_nonnegative" in _check_names(Annotation)
     assert "ck_exports_archive_bytes_nonnegative" in _check_names(ExportArtifact)
     assert "ck_user_storage_bytes_used_nonnegative" in _check_names(UserStorage)
+    quota_limit = UserStorage.__table__.c.quota_limit_bytes
+    assert isinstance(quota_limit.type, BigInteger)
+    assert quota_limit.nullable is True
+    assert quota_limit.server_default is None
+    assert "ck_user_storage_quota_limit_positive" in _check_names(UserStorage)
     assert "ck_training_runs_artifact_bytes_nonnegative" in _check_names(
         TrainingRun
     )
@@ -156,21 +166,29 @@ async def test_migrated_database_contains_accounting_and_collaboration_schema(
     app,
 ) -> None:
     async with app.state.engine.connect() as connection:
-        tables, dataset_constraints, run_indexes = await connection.run_sync(
-            lambda sync_connection: (
-                set(inspect(sync_connection).get_table_names()),
-                {
-                    constraint["name"]
-                    for constraint in inspect(sync_connection).get_unique_constraints(
-                        "datasets"
-                    )
-                },
-                {
-                    index["name"]
-                    for index in inspect(sync_connection).get_indexes(
-                        "training_runs"
-                    )
-                },
+        tables, dataset_constraints, run_indexes, image_columns = (
+            await connection.run_sync(
+                lambda sync_connection: (
+                    set(inspect(sync_connection).get_table_names()),
+                    {
+                        constraint["name"]
+                        for constraint in inspect(
+                            sync_connection
+                        ).get_unique_constraints("datasets")
+                    },
+                    {
+                        index["name"]
+                        for index in inspect(sync_connection).get_indexes(
+                            "training_runs"
+                        )
+                    },
+                    {
+                        column["name"]: column
+                        for column in inspect(sync_connection).get_columns(
+                            "images"
+                        )
+                    },
+                )
             )
         )
 
@@ -178,6 +196,7 @@ async def test_migrated_database_contains_accounting_and_collaboration_schema(
     assert "uq_datasets_owner_name" in dataset_constraints
     assert "uq_datasets_name" not in dataset_constraints
     assert "ix_training_runs_owner_id" in run_indexes
+    assert image_columns["media_object_id"]["nullable"] is False
 
 
 class _RecordingOp:

@@ -6,6 +6,7 @@ import asyncio
 import filecmp
 import math
 import os
+import shutil
 from collections.abc import AsyncIterable
 from pathlib import Path
 from uuid import uuid4
@@ -226,17 +227,50 @@ def _assemble_chunks(
 ) -> Path:
     directory = upload_directory(settings, upload.id)
     target = directory / "source"
+    chunk_directory = directory / "chunks"
+    if target.exists():
+        if target.stat().st_size != upload.size:
+            raise HTTPException(status_code=409, detail="조립된 파일 크기가 다릅니다.")
+        # A worker can stop after publishing the source but before reclaiming
+        # its chunks. The immutable source is the checkpoint in that case.
+        if chunk_directory.exists():
+            shutil.rmtree(chunk_directory)
+        return target
+
+    chunk_count = expected_chunk_count(upload)
+    if chunk_count == 1:
+        chunk_path = chunk_directory / "0.part"
+        if chunk_path.stat().st_size != upload.size:
+            raise HTTPException(status_code=409, detail="조립된 파일 크기가 다릅니다.")
+        os.replace(chunk_path, target)
+        chunk_directory.rmdir()
+        return target
+
     temporary = directory / f".source.{uuid4().hex}.tmp"
-    with temporary.open("wb") as output:
-        for chunk_number in range(expected_chunk_count(upload)):
-            chunk_path = directory / "chunks" / f"{chunk_number}.part"
-            with chunk_path.open("rb") as source:
-                shutil_copyfileobj(source, output)
-    if temporary.stat().st_size != upload.size:
+    try:
+        with temporary.open("wb") as output:
+            for chunk_number in range(chunk_count):
+                chunk_path = chunk_directory / f"{chunk_number}.part"
+                with chunk_path.open("rb") as source:
+                    shutil_copyfileobj(source, output)
+        if temporary.stat().st_size != upload.size:
+            raise HTTPException(status_code=409, detail="조립된 파일 크기가 다릅니다.")
+        os.replace(temporary, target)
+    finally:
         temporary.unlink(missing_ok=True)
-        raise HTTPException(status_code=409, detail="조립된 파일 크기가 다릅니다.")
-    os.replace(temporary, target)
+    if chunk_directory.exists():
+        shutil.rmtree(chunk_directory)
     return target
+
+
+async def assemble_uploads(
+    settings: Settings,
+    uploads: list[UploadSession],
+) -> None:
+    """Publish immutable upload sources outside the completion request."""
+
+    for upload in uploads:
+        await asyncio.to_thread(_assemble_chunks, settings, upload)
 
 
 def shutil_copyfileobj(source, destination, length: int = 1024 * 1024) -> None:
@@ -291,8 +325,6 @@ async def complete_upload_batch(
                 },
             )
 
-    for upload in uploads:
-        await asyncio.to_thread(_assemble_chunks, settings, upload)
     dataset = await session.get(Dataset, dataset_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="데이터셋을 찾을 수 없습니다.")

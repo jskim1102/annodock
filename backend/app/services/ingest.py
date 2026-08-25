@@ -1,4 +1,4 @@
-"""Dataset-level atomic ingestion from normalized collected files."""
+"""Checkpointed dataset ingestion from normalized collected files."""
 
 from __future__ import annotations
 
@@ -6,12 +6,14 @@ import asyncio
 import os
 import shutil
 import tempfile
+import time
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
+from uuid import uuid4
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.class_colors import class_color
@@ -23,6 +25,7 @@ from app.models import (
     DatasetClass,
     Image,
     ImportIssue,
+    MediaObject,
     Project,
     ProjectClass,
     UploadJob,
@@ -42,12 +45,16 @@ from app.services.class_resolution import (
     project_renames_for_resolutions,
     validate_class_resolutions,
 )
-from app.services.derive import ImageDecodeError, prepare_image
+from app.services.derive import ImageDecodeError, PreparedImage, prepare_image
+from app.services.dataset_partition import (
+    balanced_image_partition_sizes,
+    dataset_partition_name,
+)
 from app.services.format_detect import (
     detect_formats,
     find_voc_annotation_documents,
 )
-from app.services.jobs import fail_job, transition_job
+from app.services.jobs import claim_upload_job, fail_job, transition_job
 from app.services.image_names import (
     PairKey,
     available_pair_key,
@@ -61,14 +68,25 @@ from app.services.labels import (
     parse_yolo_label,
 )
 from app.services.quota import increase_bytes_used
-from app.services.storage import contained_storage_path, storage_relative_path
-from app.services.uploads import assembled_upload_path, upload_directory
+from app.services.storage import (
+    contained_storage_path,
+    create_dataset_storage,
+    storage_relative_path,
+    storage_root,
+)
+from app.services.uploads import (
+    assemble_uploads,
+    assembled_upload_path,
+    upload_directory,
+)
 from app.services.validate import RejectedFile, validate_image_file
 from app.services.zipsafe import ZipIssue, ZipLimits, ZipSafetyError
 
 
 BeforeCommit = Callable[[], None]
 FORMAT_PRIORITY = ("yolo", "coco", "voc")
+IMAGE_PREPARE_CONCURRENCY = 4
+PROGRESS_PUBLISH_INTERVAL_SECONDS = 0.5
 
 
 class ClassResolutionRequired(RuntimeError):
@@ -77,6 +95,24 @@ class ClassResolutionRequired(RuntimeError):
     def __init__(self, job_id: int) -> None:
         super().__init__(f"upload job {job_id} requires class resolution")
         self.job_id = job_id
+
+
+@dataclass(frozen=True)
+class IngestImageWork:
+    key: PairKey
+    source: CollectedFile
+    storage_item: CollectedFile
+    storage_stem: str
+    boxes: tuple[ParsedBox, ...]
+    issues: tuple[IssueData, ...]
+    has_label_source: bool
+
+
+@dataclass(frozen=True)
+class PreparedIngestImage:
+    work: IngestImageWork
+    prepared: PreparedImage | None
+    issues: tuple[IssueData, ...]
 
 
 def _stem(item: CollectedFile) -> str:
@@ -265,6 +301,12 @@ async def ingest_collected(
     before_commit: BeforeCommit | None = None,
     require_class_resolution: bool = False,
 ) -> None:
+    async with session_factory() as checkpoint_session:
+        durable_cursor = await checkpoint_session.scalar(
+            select(UploadJob.ingest_cursor).where(UploadJob.id == job_id)
+        )
+    if durable_cursor is None:
+        raise LookupError(f"upload job {job_id} does not exist")
     for index, phase in enumerate(initial_phases):
         await transition_job(
             session_factory,
@@ -272,8 +314,8 @@ async def ingest_collected(
             phase,
             state="running" if index == 0 else None,
             total=len(items) if index == 0 else None,
-            processed=0 if index == 0 else None,
-            failed=0 if index == 0 else None,
+            processed=(0 if index == 0 and durable_cursor == 0 else None),
+            failed=(0 if index == 0 and durable_cursor == 0 else None),
             observer=phase_observer,
         )
     await transition_job(
@@ -335,13 +377,10 @@ async def ingest_collected(
     parsed_labels: dict[PairKey, list] = {}
     empty_yolo_label_keys: set[PairKey] = set()
     seen_class_ids: set[int] = set()
-    rejected_count = sum(
-        issue.kind in {"broken_image", "rejected_file"}
-        for issue in issues
-    )
-    staging: Path | None = None
-    final_batch: Path | None = None
-    commit_attempted = False
+    active_staging: Path | None = None
+    active_final_chunk: Path | None = None
+    active_chunk_end = 0
+    uncommitted_partition_paths: list[Path] = []
 
     try:
         async with session_factory() as session:
@@ -367,17 +406,85 @@ async def ingest_collected(
                     f"project {dataset.project_id} does not exist"
                 )
 
-            existing_keys = set(
+            if dataset.upload_group_id is None:
+                upload_parts = [dataset]
+            else:
+                upload_parts = list(
+                    (
+                        await session.scalars(
+                            select(Dataset)
+                            .where(
+                                Dataset.owner_id == dataset.owner_id,
+                                Dataset.upload_group_id
+                                == dataset.upload_group_id,
+                            )
+                            .order_by(Dataset.upload_part_index)
+                            .with_for_update()
+                        )
+                    ).all()
+                )
+                expected_indexes = list(range(1, len(upload_parts) + 1))
+                if (
+                    not upload_parts
+                    or dataset.upload_part_index != 1
+                    or [part.upload_part_index for part in upload_parts]
+                    != expected_indexes
+                    or any(
+                        part.upload_part_count != len(upload_parts)
+                        for part in upload_parts
+                    )
+                ):
+                    raise RuntimeError("upload dataset partition metadata is invalid")
+
+            def ensure_batch_paths(
+                parts: list[Dataset],
+            ) -> tuple[dict[int, Path], dict[int, Path], dict[int, str]]:
+                parents: dict[int, Path] = {}
+                final_batches: dict[int, Path] = {}
+                prefixes: dict[int, str] = {}
+                for part in parts:
+                    part_path = contained_storage_path(
+                        settings.storage_dir,
+                        part.storage_path,
+                    )
+                    parent = part_path / "batches"
+                    parent.mkdir(parents=True, exist_ok=True)
+                    final = parent / str(job_id)
+                    final.mkdir(parents=True, exist_ok=True)
+                    parents[part.id] = parent
+                    final_batches[part.id] = final
+                    prefixes[part.id] = (
+                        storage_relative_path(settings.storage_dir, final)
+                        + "/%"
+                    )
+                return parents, final_batches, prefixes
+
+            batch_parents, final_batches, final_batch_prefixes = (
+                ensure_batch_paths(upload_parts)
+            )
+            existing_rows = (
                 (
                     await session.execute(
                         select(Image.split, Image.stem).where(
-                            Image.dataset_id == dataset.id
+                            or_(
+                                *(
+                                    and_(
+                                        Image.dataset_id == part.id,
+                                        ~Image.file_path.like(
+                                            final_batch_prefixes[part.id]
+                                        ),
+                                    )
+                                    for part in upload_parts
+                                )
+                            )
                         )
                     )
                 )
                 .tuples()
                 .all()
             )
+            existing_image_count = len(existing_rows)
+            existing_keys = set(existing_rows)
             reserved_incoming_keys = set(image_by_key)
             occupied_keys = existing_keys | reserved_incoming_keys
             dataset_class_rows = (
@@ -557,6 +664,7 @@ async def ingest_collected(
             }
             resolution_actions: dict[str, str] = {}
             resolved_conflict_ids: set[int] = set()
+            project_renames: dict[int, str] = {}
             if require_class_resolution:
                 resolution_plan = build_class_resolution_plan(
                     dataset_id=dataset.id,
@@ -607,30 +715,13 @@ async def ingest_collected(
                         row.class_id: row for row in project_class_rows
                     }
                     for class_id, name in project_renames.items():
-                        project_class = project_class_by_id[class_id]
-                        project_class.name = name
+                        if class_id not in project_class_by_id:
+                            raise RuntimeError(
+                                f"project class {class_id} disappeared"
+                            )
                         project_classes[class_id] = name
                         if class_id in dataset_classes:
                             dataset_classes[class_id] = name
-                        await session.execute(
-                            update(DatasetClass)
-                            .where(
-                                DatasetClass.class_id == class_id,
-                                DatasetClass.dataset_id.in_(
-                                select(Dataset.id).where(
-                                    Dataset.project_id == project.id,
-                                    Dataset.owner_id == dataset.owner_id,
-                                    or_(
-                                        Dataset.is_placeholder.is_(False),
-                                        Dataset.id == dataset.id,
-                                    ),
-                                )
-                                ),
-                            )
-                            .values(name=name)
-                        )
-                    if project_renames:
-                        project.updated_at = func.now()
                     resolved_conflict_ids = {
                         conflict["class_id"]
                         for conflict in resolution_plan["conflicts"]
@@ -711,67 +802,8 @@ async def ingest_collected(
                 and name not in existing_project_names
             }
 
-            dataset_path = contained_storage_path(
-                settings.storage_dir,
-                dataset.storage_path,
-            )
-            batch_parent = dataset_path / "batches"
-            batch_parent.mkdir(parents=True, exist_ok=True)
-            staging = Path(
-                tempfile.mkdtemp(
-                    prefix=f".job-{job_id}-",
-                    dir=batch_parent,
-                )
-            )
-            final_batch = batch_parent / str(job_id)
-            if final_batch.exists():
-                raise RuntimeError(f"batch {job_id} already exists")
-
-            await transition_job(
-                session_factory,
-                job_id,
-                "storing",
-                total=len(items),
-                processed=len(items) - len(image_by_key),
-                failed=rejected_count,
-                observer=phase_observer,
-            )
-            await transition_job(
-                session_factory,
-                job_id,
-                "deriving",
-                observer=phase_observer,
-            )
-
-            new_image_count = 0
-            new_annotation_count = 0
-            ingested_bytes = 0
-            rejected_keys: set[PairKey] = set()
-            base_processed = len(items) - len(image_by_key)
-            progress_interval = max(
-                1,
-                (len(image_by_key) + 99) // 100,
-            )
-
-            async def publish_progress(image_index: int) -> None:
-                if (
-                    image_index % progress_interval != 0
-                    and image_index != len(image_by_key)
-                ):
-                    return
-                await transition_job(
-                    session_factory,
-                    job_id,
-                    "deriving",
-                    total=len(items),
-                    processed=base_processed + image_index,
-                    failed=rejected_count,
-                )
-
-            for image_index, (key, image_item) in enumerate(
-                image_by_key.items(),
-                start=1,
-            ):
+            work_items: list[IngestImageWork] = []
+            for key, image_item in image_by_key.items():
                 split, _assigned_stem = key
                 original_stem = _stem(image_item)
                 storage_key = key
@@ -788,32 +820,9 @@ async def ingest_collected(
                     if storage_stem == original_stem
                     else _replace_item_stem(image_item, storage_stem)
                 )
-                try:
-                    validate_image_file(
-                        storage_item.abs_path,
-                        storage_item.rel_path,
-                        settings.allowed_image_exts,
-                    )
-                    prepared = await prepare_image(
-                        storage_item.abs_path,
-                        staging,
-                        storage_item.rel_path,
-                    )
-                except (RejectedFile, ImageDecodeError) as error:
-                    rejected_count += 1
-                    rejected_keys.add(key)
-                    issues.append(
-                        _issue(
-                            "broken_image",
-                            image_item.rel_path,
-                            str(error),
-                        )
-                    )
-                    await publish_progress(image_index)
-                    continue
-
+                image_issues: list[IssueData] = []
                 if storage_stem != original_stem:
-                    issues.append(
+                    image_issues.append(
                         _issue(
                             "duplicate_skipped",
                             image_item.rel_path,
@@ -825,9 +834,8 @@ async def ingest_collected(
                             ),
                         )
                     )
-
                 if key not in selected_sources:
-                    issues.append(
+                    image_issues.append(
                         _issue(
                             "image_without_label",
                             image_item.rel_path,
@@ -838,106 +846,588 @@ async def ingest_collected(
                     selected_sources[key] == "yolo"
                     and key in empty_yolo_label_keys
                 ):
-                    issues.append(
+                    image_issues.append(
                         _issue(
                             "empty_label",
                             label_by_key[key].rel_path,
                             "matching label file contained no annotations",
                         )
                     )
-                file_path = final_batch / prepared.file_relative
-                display_path = (
-                    final_batch / prepared.display_relative
-                    if prepared.display_relative is not None
-                    else None
+                work_items.append(
+                    IngestImageWork(
+                        key=key,
+                        source=image_item,
+                        storage_item=storage_item,
+                        storage_stem=storage_stem,
+                        boxes=tuple(selected_boxes.get(key, [])),
+                        issues=tuple(image_issues),
+                        has_label_source=key in selected_sources,
+                    )
                 )
-                thumb_path = final_batch / prepared.thumb_relative
-                boxes = selected_boxes.get(key, [])
-                image = Image(
-                    dataset_id=dataset.id,
-                    stem=storage_stem,
-                    filename=Path(storage_item.rel_path).name,
-                    rel_path=storage_item.rel_path,
-                    split=storage_item.split,
-                    width=prepared.width,
-                    height=prepared.height,
-                    file_path=storage_relative_path(
-                        settings.storage_dir,
-                        file_path,
-                    ),
-                    display_path=(
-                        storage_relative_path(settings.storage_dir, display_path)
-                        if display_path
-                        else None
-                    ),
-                    thumb_path=storage_relative_path(
-                        settings.storage_dir,
-                        thumb_path,
-                    ),
-                    original_bytes=prepared.original_bytes,
-                    display_bytes=prepared.display_bytes,
-                    thumb_bytes=prepared.thumb_bytes,
-                    box_count=len(boxes),
-                    has_label_source=key in selected_sources,
-                    is_modified=False,
-                )
-                session.add(image)
-                await session.flush()
-                session.add_all(
-                    [
-                        Annotation(
-                            image_id=image.id,
-                            class_id=box.class_id,
-                            cx=box.cx,
-                            cy=box.cy,
-                            w=box.w,
-                            h=box.h,
-                        )
-                        for box in boxes
-                    ]
-                )
-                new_image_count += 1
-                new_annotation_count += len(boxes)
-                ingested_bytes += (
-                    prepared.original_bytes
-                    + prepared.display_bytes
-                    + prepared.thumb_bytes
-                )
-                await publish_progress(image_index)
 
-            for key in rejected_keys:
-                label = label_by_key.get(key)
+            resume_cursor = int(job.ingest_cursor)
+            if resume_cursor > len(work_items):
+                raise RuntimeError(
+                    f"upload job {job_id} checkpoint exceeds its image count"
+                )
+
+            if dataset.upload_group_id is not None:
+                if resume_cursor == 0 and any(
+                    part.image_count > 0 for part in upload_parts
+                ):
+                    raise RuntimeError(
+                        "automatically partitioned datasets cannot receive "
+                        "additional uploads"
+                    )
+                part_count = len(upload_parts)
+                if len(work_items) < part_count:
+                    raise RuntimeError(
+                        "upload image count no longer matches its dataset parts"
+                    )
+                base_size, larger_part_count = divmod(
+                    len(work_items),
+                    part_count,
+                )
+                partition_sizes = tuple(
+                    base_size + (index < larger_part_count)
+                    for index in range(part_count)
+                )
+                if max(partition_sizes) > settings.dataset_max_images:
+                    raise RuntimeError(
+                        "configured dataset image limit is lower than the "
+                        "existing upload partition plan"
+                    )
+            else:
+                partition_sizes = balanced_image_partition_sizes(
+                    len(work_items),
+                    settings.dataset_max_images,
+                )
+                if len(partition_sizes) > 1:
+                    if (
+                        resume_cursor != 0
+                        or dataset.image_count != 0
+                        or existing_image_count != 0
+                    ):
+                        raise RuntimeError(
+                            "an existing dataset cannot be repartitioned during "
+                            "an upload"
+                        )
+
+                    base_name = dataset.name
+                    part_names = [
+                        dataset_partition_name(base_name, index)
+                        for index in range(1, len(partition_sizes) + 1)
+                    ]
+                    conflicting_name = await session.scalar(
+                        select(Dataset.name)
+                        .where(
+                            Dataset.owner_id == dataset.owner_id,
+                            Dataset.id != dataset.id,
+                            Dataset.name.in_(part_names),
+                        )
+                        .limit(1)
+                    )
+                    if conflicting_name is not None:
+                        raise RuntimeError(
+                            "automatic dataset partition name already exists: "
+                            f"{conflicting_name}"
+                        )
+
+                    upload_group_id = uuid4()
+                    part_count = len(partition_sizes)
+                    dataset.name = part_names[0]
+                    dataset.upload_group_id = upload_group_id
+                    dataset.upload_part_index = 1
+                    dataset.upload_part_count = part_count
+                    sibling_parts = [
+                        Dataset(
+                            owner_id=dataset.owner_id,
+                            project_id=dataset.project_id,
+                            name=part_names[index - 1],
+                            status="pending",
+                            storage_path="",
+                            image_count=0,
+                            annotation_count=0,
+                            class_count=len(classes_to_register),
+                            is_placeholder=True,
+                            upload_group_id=upload_group_id,
+                            upload_part_index=index,
+                            upload_part_count=part_count,
+                            created_at=dataset.created_at,
+                        )
+                        for index in range(2, part_count + 1)
+                    ]
+                    session.add_all(sibling_parts)
+                    await session.flush()
+                    for part in sibling_parts:
+                        path = create_dataset_storage(
+                            settings.storage_dir,
+                            part.id,
+                        )
+                        uncommitted_partition_paths.append(path)
+                        part.storage_path = storage_relative_path(
+                            settings.storage_dir,
+                            path,
+                        )
+                        session.add_all(
+                            DatasetClass(
+                                dataset_id=part.id,
+                                class_id=class_id,
+                                name=name,
+                            )
+                            for class_id, name in classes_to_register.items()
+                        )
+                    upload_parts = [dataset, *sibling_parts]
+                    (
+                        batch_parents,
+                        final_batches,
+                        final_batch_prefixes,
+                    ) = ensure_batch_paths(upload_parts)
+                elif existing_image_count + len(work_items) > (
+                    settings.dataset_max_images
+                ):
+                    raise RuntimeError(
+                        "upload would exceed the maximum of "
+                        f"{settings.dataset_max_images} images per dataset"
+                    )
+
+            partition_boundaries: list[int] = []
+            boundary = 0
+            for partition_size in partition_sizes:
+                boundary += partition_size
+                partition_boundaries.append(boundary)
+
+            persisted_issues = list(
+                (
+                    await session.scalars(
+                        select(ImportIssue).where(ImportIssue.job_id == job_id)
+                    )
+                ).all()
+            )
+            persisted_issue_keys = {
+                (issue.kind, issue.path, issue.detail)
+                for issue in persisted_issues
+            }
+            rejected_count = sum(
+                issue.kind in {"broken_image", "rejected_file"}
+                for issue in persisted_issues
+            )
+            pending_global_issues = list(issues)
+            base_processed = len(items) - len(work_items)
+            managed_upload_root = storage_root(settings.storage_dir) / "uploads"
+
+            # Release planning locks before CPU work. Class-resolution renames
+            # are applied with the first durable image checkpoint below.
+            await session.commit()
+            uncommitted_partition_paths.clear()
+
+            await transition_job(
+                session_factory,
+                job_id,
+                "storing",
+                total=len(items),
+                processed=base_processed + resume_cursor,
+                failed=rejected_count,
+                image_total=len(work_items),
+                image_processed=resume_cursor,
+                observer=phase_observer,
+            )
+            await transition_job(
+                session_factory,
+                job_id,
+                "deriving",
+                observer=phase_observer,
+            )
+
+            def rejection_issues(
+                work: IngestImageWork,
+                error: RejectedFile | ImageDecodeError,
+            ) -> tuple[IssueData, ...]:
+                rejected = [
+                    _issue(
+                        "broken_image",
+                        work.source.rel_path,
+                        str(error),
+                    )
+                ]
+                label = label_by_key.get(work.key)
                 if label is not None:
-                    issues.append(
+                    rejected.append(
                         _issue(
                             "label_without_image",
                             label.rel_path,
                             "matching image was rejected",
                         )
                     )
-                    continue
-                selected_format = selected_sources.get(key)
-                image_item = image_by_key[key]
+                    return tuple(rejected)
+                selected_format = selected_sources.get(work.key)
+                source_path: str | None = None
                 if selected_format == "coco" and coco_result is not None:
                     source_path = coco_result.source_by_image[
-                        image_item.rel_path
+                        work.source.rel_path
                     ]
                 elif selected_format == "voc" and voc_result is not None:
                     source_path = voc_result.source_by_image[
-                        image_item.rel_path
+                        work.source.rel_path
                     ]
-                else:
-                    continue
-                issues.append(
-                    _issue(
-                        "label_without_image",
-                        source_path,
-                        (
-                            f"{selected_format.upper()} annotation image "
-                            f"{image_item.rel_path} was rejected"
-                        ),
+                if source_path is not None and selected_format is not None:
+                    rejected.append(
+                        _issue(
+                            "label_without_image",
+                            source_path,
+                            (
+                                f"{selected_format.upper()} annotation image "
+                                f"{work.source.rel_path} was rejected"
+                            ),
+                        )
+                    )
+                return tuple(rejected)
+
+            async def prepare_chunk(
+                chunk_items: list[IngestImageWork],
+                staging_root: Path,
+                chunk_start: int,
+            ) -> list[PreparedIngestImage]:
+                queue: asyncio.Queue[tuple[int, IngestImageWork]] = (
+                    asyncio.Queue()
+                )
+                for index, work in enumerate(chunk_items):
+                    queue.put_nowait((index, work))
+                results: list[PreparedIngestImage | None] = [
+                    None
+                ] * len(chunk_items)
+                progress_lock = asyncio.Lock()
+                completed = 0
+                chunk_rejections = 0
+                last_progress_publish = 0.0
+
+                async def worker() -> None:
+                    nonlocal completed, chunk_rejections, last_progress_publish
+                    while True:
+                        try:
+                            index, work = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            return
+                        try:
+                            await asyncio.to_thread(
+                                validate_image_file,
+                                work.storage_item.abs_path,
+                                work.storage_item.rel_path,
+                                settings.allowed_image_exts,
+                            )
+                            prepared = await prepare_image(
+                                work.storage_item.abs_path,
+                                staging_root,
+                                work.storage_item.rel_path,
+                                link_original=(
+                                    managed_upload_root
+                                    in work.storage_item.abs_path.resolve().parents
+                                ),
+                            )
+                            result = PreparedIngestImage(
+                                work=work,
+                                prepared=prepared,
+                                issues=work.issues,
+                            )
+                        except (RejectedFile, ImageDecodeError) as error:
+                            result = PreparedIngestImage(
+                                work=work,
+                                prepared=None,
+                                issues=rejection_issues(work, error),
+                            )
+                        results[index] = result
+                        async with progress_lock:
+                            completed += 1
+                            if result.prepared is None:
+                                chunk_rejections += 1
+                            image_index = chunk_start + completed
+                            now = time.monotonic()
+                            if (
+                                last_progress_publish == 0.0
+                                or now - last_progress_publish
+                                >= PROGRESS_PUBLISH_INTERVAL_SECONDS
+                                or image_index == len(work_items)
+                            ):
+                                last_progress_publish = now
+                                await transition_job(
+                                    session_factory,
+                                    job_id,
+                                    "deriving",
+                                    total=len(items),
+                                    processed=base_processed + image_index,
+                                    failed=(
+                                        rejected_count + chunk_rejections
+                                    ),
+                                    image_total=len(work_items),
+                                    image_processed=image_index,
+                                )
+
+                await asyncio.gather(
+                    *(
+                        worker()
+                        for _ in range(
+                            min(IMAGE_PREPARE_CONCURRENCY, len(chunk_items))
+                        )
                     )
                 )
+                if any(result is None for result in results):
+                    raise RuntimeError("image preparation worker stopped early")
+                return [result for result in results if result is not None]
+
+            def unseen_issues(
+                candidates: list[IssueData],
+            ) -> list[IssueData]:
+                unseen: list[IssueData] = []
+                candidate_keys = set(persisted_issue_keys)
+                for issue in candidates:
+                    key = (issue.kind, issue.path, issue.detail)
+                    if key in candidate_keys:
+                        continue
+                    candidate_keys.add(key)
+                    unseen.append(issue)
+                return unseen
+
+            chunk_start = resume_cursor
+            while chunk_start < len(work_items):
+                part_position = next(
+                    index
+                    for index, part_boundary in enumerate(partition_boundaries)
+                    if chunk_start < part_boundary
+                )
+                target_part = upload_parts[part_position]
+                chunk_end = min(
+                    chunk_start + settings.ingest_batch_size,
+                    partition_boundaries[part_position],
+                    len(work_items),
+                )
+                active_chunk_end = chunk_end
+                active_staging = Path(
+                    tempfile.mkdtemp(
+                        prefix=f".job-{job_id}-{chunk_start:09d}-",
+                        dir=batch_parents[target_part.id],
+                    )
+                )
+                active_final_chunk = final_batches[target_part.id] / (
+                    f"{chunk_start:09d}-{chunk_end:09d}"
+                )
+                prepared_results = await prepare_chunk(
+                    work_items[chunk_start:chunk_end],
+                    active_staging,
+                    chunk_start,
+                )
+                if active_final_chunk.exists():
+                    shutil.rmtree(active_final_chunk)
+
+                current_dataset = await session.scalar(
+                    select(Dataset)
+                    .where(Dataset.id == target_part.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+                current_project = await session.scalar(
+                    select(Project)
+                    .where(Project.id == project.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+                current_job = await session.scalar(
+                    select(UploadJob)
+                    .where(UploadJob.id == job_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+                if (
+                    current_dataset is None
+                    or current_project is None
+                    or current_job is None
+                ):
+                    raise LookupError("upload checkpoint owner disappeared")
+                if current_job.ingest_cursor != chunk_start:
+                    raise RuntimeError("upload checkpoint changed concurrently")
+
+                chunk_image_count = 0
+                chunk_annotation_count = 0
+                chunk_bytes = 0
+                chunk_issues = unseen_issues(
+                    [
+                        *pending_global_issues,
+                        *(
+                            issue
+                            for result in prepared_results
+                            for issue in result.issues
+                        ),
+                    ]
+                )
+                for result in prepared_results:
+                    prepared = result.prepared
+                    if prepared is None:
+                        continue
+                    file_path = active_final_chunk / prepared.file_relative
+                    display_path = (
+                        active_final_chunk / prepared.display_relative
+                        if prepared.display_relative is not None
+                        else None
+                    )
+                    thumb_path = active_final_chunk / prepared.thumb_relative
+                    work = result.work
+                    image = Image(
+                        dataset_id=current_dataset.id,
+                        media_object=MediaObject(
+                            owner_id=current_dataset.owner_id,
+                            created_by_dataset_id=current_dataset.id,
+                            original_bytes=prepared.original_bytes,
+                            display_bytes=prepared.display_bytes,
+                            thumb_bytes=prepared.thumb_bytes,
+                        ),
+                        stem=work.storage_stem,
+                        filename=Path(work.storage_item.rel_path).name,
+                        rel_path=work.storage_item.rel_path,
+                        split=work.storage_item.split,
+                        width=prepared.width,
+                        height=prepared.height,
+                        file_path=storage_relative_path(
+                            settings.storage_dir,
+                            file_path,
+                        ),
+                        display_path=(
+                            storage_relative_path(
+                                settings.storage_dir,
+                                display_path,
+                            )
+                            if display_path is not None
+                            else None
+                        ),
+                        thumb_path=storage_relative_path(
+                            settings.storage_dir,
+                            thumb_path,
+                        ),
+                        original_bytes=prepared.original_bytes,
+                        display_bytes=prepared.display_bytes,
+                        thumb_bytes=prepared.thumb_bytes,
+                        box_count=len(work.boxes),
+                        has_label_source=work.has_label_source,
+                        is_modified=False,
+                    )
+                    image.annotations = [
+                        Annotation(
+                            class_id=box.class_id,
+                            cx=box.cx,
+                            cy=box.cy,
+                            w=box.w,
+                            h=box.h,
+                        )
+                        for box in work.boxes
+                    ]
+                    session.add(image)
+                    chunk_image_count += 1
+                    chunk_annotation_count += len(work.boxes)
+                    chunk_bytes += (
+                        prepared.original_bytes
+                        + prepared.display_bytes
+                        + prepared.thumb_bytes
+                    )
+
+                session.add_all(
+                    [
+                        DatasetClass(
+                            dataset_id=current_dataset.id,
+                            class_id=class_id,
+                            name=name,
+                        )
+                        for class_id, name in new_dataset_classes.items()
+                    ]
+                )
+                session.add_all(
+                    [
+                        ProjectClass(
+                            project_id=current_project.id,
+                            class_id=class_id,
+                            name=name,
+                            color=class_color(class_id),
+                        )
+                        for class_id, name in new_project_classes.items()
+                    ]
+                )
+                for class_id, name in project_renames.items():
+                    await session.execute(
+                        update(ProjectClass)
+                        .where(
+                            ProjectClass.project_id == current_project.id,
+                            ProjectClass.class_id == class_id,
+                        )
+                        .values(name=name)
+                    )
+                    await session.execute(
+                        update(DatasetClass)
+                        .where(
+                            DatasetClass.class_id == class_id,
+                            DatasetClass.dataset_id.in_(
+                                select(Dataset.id).where(
+                                    Dataset.project_id == current_project.id,
+                                    Dataset.owner_id == current_dataset.owner_id,
+                                    or_(
+                                        Dataset.is_placeholder.is_(False),
+                                        Dataset.id == current_dataset.id,
+                                    ),
+                                )
+                            ),
+                        )
+                        .values(name=name)
+                    )
+                session.add_all(
+                    [
+                        ImportIssue(
+                            job_id=job_id,
+                            kind=issue.kind,
+                            path=issue.path,
+                            detail=issue.detail,
+                        )
+                        for issue in chunk_issues
+                    ]
+                )
+                current_dataset.image_count += chunk_image_count
+                current_dataset.annotation_count += chunk_annotation_count
+                current_dataset.class_count += len(new_dataset_classes)
+                if current_dataset.image_count > settings.dataset_max_images:
+                    raise RuntimeError(
+                        "dataset image limit was exceeded while storing an "
+                        "upload checkpoint"
+                    )
+                if current_dataset.status != "ready":
+                    current_dataset.status = "processing"
+                if new_project_classes or project_renames:
+                    current_project.updated_at = func.now()
+                current_job.ingest_cursor = chunk_end
+                current_job.image_total = len(work_items)
+                current_job.image_processed = chunk_end
+                current_job.total = len(items)
+                current_job.processed = base_processed + chunk_end
+                current_job.failed = rejected_count + sum(
+                    issue.kind in {"broken_image", "rejected_file"}
+                    for issue in chunk_issues
+                )
+                await increase_bytes_used(
+                    session,
+                    current_dataset.owner_id,
+                    chunk_bytes,
+                )
+
+                os.replace(active_staging, active_final_chunk)
+                active_staging = None
+                if before_commit is not None:
+                    before_commit()
+                await session.commit()
+                active_final_chunk = None
+                persisted_issue_keys.update(
+                    (issue.kind, issue.path, issue.detail)
+                    for issue in chunk_issues
+                )
+                rejected_count = current_job.failed
+                pending_global_issues.clear()
+                new_dataset_classes.clear()
+                new_project_classes.clear()
+                project_renames.clear()
+                chunk_start = chunk_end
 
             await transition_job(
                 session_factory,
@@ -945,10 +1435,47 @@ async def ingest_collected(
                 "thumbnailing",
                 observer=phase_observer,
             )
+            upload_part_ids = [part.id for part in upload_parts]
+            current_parts = list(
+                (
+                    await session.scalars(
+                        select(Dataset)
+                        .where(Dataset.id.in_(upload_part_ids))
+                        .order_by(Dataset.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).all()
+            )
+            current_dataset = next(
+                (part for part in current_parts if part.id == dataset.id),
+                None,
+            )
+            current_project = await session.scalar(
+                select(Project)
+                .where(Project.id == project.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            current_job = await session.scalar(
+                select(UploadJob)
+                .where(UploadJob.id == job_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if (
+                current_dataset is None
+                or current_project is None
+                or current_job is None
+                or len(current_parts) != len(upload_parts)
+            ):
+                raise LookupError("upload finalization owner disappeared")
+
+            final_issues = unseen_issues(pending_global_issues)
             session.add_all(
                 [
                     DatasetClass(
-                        dataset_id=dataset.id,
+                        dataset_id=current_dataset.id,
                         class_id=class_id,
                         name=name,
                     )
@@ -958,7 +1485,7 @@ async def ingest_collected(
             session.add_all(
                 [
                     ProjectClass(
-                        project_id=project.id,
+                        project_id=current_project.id,
                         class_id=class_id,
                         name=name,
                         color=class_color(class_id),
@@ -966,6 +1493,32 @@ async def ingest_collected(
                     for class_id, name in new_project_classes.items()
                 ]
             )
+            for class_id, name in project_renames.items():
+                await session.execute(
+                    update(ProjectClass)
+                    .where(
+                        ProjectClass.project_id == current_project.id,
+                        ProjectClass.class_id == class_id,
+                    )
+                    .values(name=name)
+                )
+                await session.execute(
+                    update(DatasetClass)
+                    .where(
+                        DatasetClass.class_id == class_id,
+                        DatasetClass.dataset_id.in_(
+                            select(Dataset.id).where(
+                                Dataset.project_id == current_project.id,
+                                Dataset.owner_id == current_dataset.owner_id,
+                                or_(
+                                    Dataset.is_placeholder.is_(False),
+                                    Dataset.id == current_dataset.id,
+                                ),
+                            )
+                        ),
+                    )
+                    .values(name=name)
+                )
             session.add_all(
                 [
                     ImportIssue(
@@ -974,61 +1527,74 @@ async def ingest_collected(
                         path=issue.path,
                         detail=issue.detail,
                     )
-                    for issue in issues
+                    for issue in final_issues
                 ]
             )
-            dataset.image_count += new_image_count
-            dataset.annotation_count += new_annotation_count
-            dataset.class_count += len(new_dataset_classes)
-            was_hidden_upload_draft = dataset.is_placeholder
-            dataset.status = (
-                "ready" if dataset.image_count > 0 else "failed"
+            current_dataset.class_count += len(new_dataset_classes)
+            was_hidden_upload_draft = any(
+                part.is_placeholder for part in current_parts
             )
-            if dataset.status == "ready":
-                # Upload-created datasets stay hidden while parsing can pause
-                # for class resolution. Publish only with committed images.
-                dataset.is_placeholder = False
-            if new_project_classes or (
-                was_hidden_upload_draft and dataset.status == "ready"
+            made_dataset_visible = False
+            for current_part in current_parts:
+                current_part.status = (
+                    "ready" if current_part.image_count > 0 else "failed"
+                )
+                if current_part.status == "ready":
+                    made_dataset_visible = (
+                        current_part.is_placeholder or made_dataset_visible
+                    )
+                    current_part.is_placeholder = False
+            if new_project_classes or project_renames or (
+                was_hidden_upload_draft and made_dataset_visible
             ):
-                project.updated_at = func.now()
-            job.state = "done"
-            job.phase = "done"
-            job.total = len(items)
-            job.processed = len(items)
-            job.failed = rejected_count
-            job.class_resolution_plan = None
-            job.class_resolutions = None
-
-            await increase_bytes_used(
-                session,
-                dataset.owner_id,
-                ingested_bytes,
+                current_project.updated_at = func.now()
+            current_job.state = "done"
+            current_job.phase = "done"
+            current_job.total = len(items)
+            current_job.processed = len(items)
+            current_job.failed = rejected_count + sum(
+                issue.kind in {"broken_image", "rejected_file"}
+                for issue in final_issues
             )
-
-            os.replace(staging, final_batch)
-            staging = None
-            if before_commit is not None:
+            current_job.ingest_cursor = len(work_items)
+            current_job.image_total = len(work_items)
+            current_job.image_processed = len(work_items)
+            current_job.class_resolution_plan = None
+            current_job.class_resolutions = None
+            if not work_items and before_commit is not None:
                 before_commit()
-            commit_attempted = True
             await session.commit()
     except ClassResolutionRequired:
-        if staging is not None:
-            shutil.rmtree(staging, ignore_errors=True)
-        if final_batch is not None:
-            shutil.rmtree(final_batch, ignore_errors=True)
         raise
     except asyncio.CancelledError:
-        if staging is not None:
-            shutil.rmtree(staging, ignore_errors=True)
-        if final_batch is not None and not commit_attempted:
-            shutil.rmtree(final_batch, ignore_errors=True)
+        for partition_path in reversed(uncommitted_partition_paths):
+            shutil.rmtree(partition_path, ignore_errors=True)
+        if active_staging is not None:
+            shutil.rmtree(active_staging, ignore_errors=True)
+        if active_final_chunk is not None:
+            async with session_factory() as checkpoint_session:
+                committed_cursor = await checkpoint_session.scalar(
+                    select(UploadJob.ingest_cursor).where(
+                        UploadJob.id == job_id
+                    )
+                )
+            if (committed_cursor or 0) < active_chunk_end:
+                shutil.rmtree(active_final_chunk, ignore_errors=True)
         raise
     except Exception as error:
-        if staging is not None:
-            shutil.rmtree(staging, ignore_errors=True)
-        if final_batch is not None and not commit_attempted:
-            shutil.rmtree(final_batch, ignore_errors=True)
+        for partition_path in reversed(uncommitted_partition_paths):
+            shutil.rmtree(partition_path, ignore_errors=True)
+        if active_staging is not None:
+            shutil.rmtree(active_staging, ignore_errors=True)
+        if active_final_chunk is not None:
+            async with session_factory() as checkpoint_session:
+                committed_cursor = await checkpoint_session.scalar(
+                    select(UploadJob.ingest_cursor).where(
+                        UploadJob.id == job_id
+                    )
+                )
+            if (committed_cursor or 0) < active_chunk_end:
+                shutil.rmtree(active_final_chunk, ignore_errors=True)
         if not is_lock_not_available(error):
             await fail_job(session_factory, job_id, str(error))
         raise
@@ -1059,6 +1625,8 @@ async def run_upload_batch_job(
 ) -> None:
     preserve_uploads = False
     try:
+        if not await claim_upload_job(session_factory, job_id):
+            return
         async with session_factory() as session:
             uploads = (
                 await session.scalars(
@@ -1069,6 +1637,24 @@ async def run_upload_batch_job(
             ).all()
             if len(uploads) != len(upload_ids):
                 raise LookupError("one or more upload sessions do not exist")
+
+        await transition_job(
+            session_factory,
+            job_id,
+            "assembling",
+            state="running",
+            total=len(uploads),
+            processed=0,
+        )
+        for index, upload in enumerate(uploads, start=1):
+            await assemble_uploads(settings, [upload])
+            await transition_job(
+                session_factory,
+                job_id,
+                "assembling",
+                total=len(uploads),
+                processed=index,
+            )
 
         groups: list[list[CollectedFile]] = []
         zip_issues: list[ZipIssue] = []
@@ -1118,9 +1704,9 @@ async def run_upload_batch_job(
             job_id,
             items,
             initial_phases=(
-                ("uploading", "extracting")
+                ("extracting",)
                 if has_zip
-                else ("uploading",)
+                else ()
             ),
             initial_issues=[
                 _issue(issue.kind, issue.path, issue.detail)

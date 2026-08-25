@@ -35,7 +35,13 @@ os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 from app.auth.jwks import JWKSVerifier  # noqa: E402
 from app.config import Settings  # noqa: E402
 from app.main import create_app  # noqa: E402
-from app.models import Dataset, Project, TrainingRun, UserStorage  # noqa: E402
+from app.models import (  # noqa: E402
+    Dataset,
+    MediaObject,
+    Project,
+    TrainingRun,
+    UserStorage,
+)
 
 
 @dataclass(frozen=True)
@@ -154,6 +160,9 @@ async def cleanup_test_datasets() -> AsyncIterator[None]:
             )
             await session.execute(
                 delete(Project).where(Project.name.like("test-%"))
+            )
+            await session.execute(
+                delete(MediaObject).where(~MediaObject.images.any())
             )
             await session.execute(delete(UserStorage))
             await session.commit()

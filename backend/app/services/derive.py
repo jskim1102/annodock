@@ -79,10 +79,20 @@ def _decoded_rgb(source: Path, extension: str) -> PillowImage.Image:
         raise ImageDecodeError(f"cannot decode image: {error}") from error
 
 
+def _link_or_copy(source: Path, target: Path) -> None:
+    """Reuse immutable upload bytes, with a cross-filesystem fallback."""
+
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+
+
 def _prepare_image_sync(
     source: Path,
     batch_root: Path,
     rel_path: str,
+    link_original: bool,
 ) -> PreparedImage:
     relative = _safe_relative(rel_path)
     extension = relative.suffix.removeprefix(".").lower()
@@ -106,7 +116,10 @@ def _prepare_image_sync(
 
     try:
         original_target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, original_target)
+        if link_original:
+            _link_or_copy(source, original_target)
+        else:
+            shutil.copy2(source, original_target)
         created.append(original_target)
 
         decoded = _decoded_rgb(source, extension)
@@ -150,6 +163,8 @@ async def prepare_image(
     source: Path,
     batch_root: Path,
     rel_path: str,
+    *,
+    link_original: bool = False,
 ) -> PreparedImage:
     """Run CPU-bound decoding outside the event loop."""
 
@@ -160,4 +175,5 @@ async def prepare_image(
         source,
         batch_root,
         rel_path,
+        link_original,
     )

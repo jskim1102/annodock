@@ -30,6 +30,7 @@ from app.services.storage import (
     storage_relative_path,
 )
 from app.services.uploads import upload_directory
+from tests.factories import image_with_media
 
 
 pytestmark = pytest.mark.asyncio
@@ -457,7 +458,8 @@ async def test_dataset_delete_reaper_tick_cannot_remove_inflight_quarantine(
         upload_root = upload_directory(app.state.settings, upload_id)
         upload_marker = upload_root / "upload-marker.bin"
         upload_marker.write_bytes(b"upload")
-        image = Image(
+        image = image_with_media(
+            owner_id=dataset.owner_id,
             dataset_id=dataset_id,
             stem="sample",
             filename="sample.jpg",

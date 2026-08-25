@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 
 from app.models import Annotation, Dataset, DatasetClass, Image
 from app.services.storage import contained_storage_path
+from tests.factories import image_with_media
 
 
 pytestmark = pytest.mark.asyncio
@@ -42,7 +43,8 @@ async def create_image_with_annotation(
         thumb_path = storage / "thumb.jpg"
         image_path.write_bytes(b"image")
         thumb_path.write_bytes(b"thumb")
-        image = Image(
+        image = image_with_media(
+            owner_id=dataset.owner_id,
             dataset_id=dataset_id,
             stem="sample",
             filename="sample.jpg",

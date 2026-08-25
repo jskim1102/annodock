@@ -123,12 +123,21 @@ async def extract_dataset_snapshot(
         raise DatasetExtractNotFound(
             "선택한 프로젝트 클래스를 찾을 수 없습니다."
         )
+    selected_class_ids = frozenset(class_ids)
+    selected_project_class_rows = [
+        row
+        for row in project_class_rows
+        if row.class_id in selected_class_ids
+    ]
 
     image_rows = list(
         (
             await session.scalars(
                 select(Image)
-                .options(selectinload(Image.annotations))
+                .options(
+                    selectinload(Image.annotations),
+                    selectinload(Image.media_object),
+                )
                 .where(
                     Image.dataset_id.in_(dataset_ids),
                     Image.annotations.any(
@@ -163,6 +172,7 @@ async def extract_dataset_snapshot(
         status="pending",
         storage_path="",
         is_merged=False,
+        is_extracted=True,
     )
     session.add(dataset)
     storage_path: Path | None = None
@@ -177,25 +187,29 @@ async def extract_dataset_snapshot(
             copied = copy_source_images(
                 settings,
                 target_dataset_id=dataset.id,
+                owner_id=owner_id,
                 target_storage=storage_path,
                 sources=sources,
                 images_by_dataset=images_by_dataset,
                 class_remap=class_remap,
                 occupied_keys=set(),
                 reserved_keys=reserved_keys,
-                included_class_ids=frozenset(class_ids),
+                included_class_ids=selected_class_ids,
             )
         except DatasetMergeConflict as error:
             raise DatasetExtractConflict(
                 "추출할 이미지의 파일명이 올바르지 않습니다."
             ) from error
 
-        quota = await quota_status(
-            session,
-            owner_id,
-            limit_bytes=settings.quota_bytes_per_user,
-            required_bytes=copied.accounted_bytes,
-        )
+        # Shared existing media is attached to transient Image rows here. Keep
+        # the quota read from autoflushing those rows before add_all below.
+        with session.no_autoflush:
+            quota = await quota_status(
+                session,
+                owner_id,
+                limit_bytes=settings.quota_bytes_per_user,
+                required_bytes=copied.accounted_bytes,
+            )
         if not quota.allowed:
             raise DatasetExtractQuotaExceeded(quota.detail)
 
@@ -206,13 +220,13 @@ async def extract_dataset_snapshot(
                     class_id=project_class.class_id,
                     name=project_class.name,
                 )
-                for project_class in project_class_rows
+                for project_class in selected_project_class_rows
             ]
         )
         session.add_all(copied.images)
         dataset.image_count = len(copied.images)
         dataset.annotation_count = copied.annotation_count
-        dataset.class_count = len(project_class_rows)
+        dataset.class_count = len(selected_project_class_rows)
         dataset.status = "ready"
         project.updated_at = func.now()
         await increase_bytes_used(session, owner_id, copied.accounted_bytes)

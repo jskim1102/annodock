@@ -22,6 +22,7 @@ from app.models import (
     DatasetClass,
     DatasetMergeSource,
     Image,
+    MediaObject,
     Project,
     ProjectClass,
     TrainingRun,
@@ -33,9 +34,10 @@ from app.services.image_names import (
     replace_filename_stem,
 )
 from app.services.quota import (
-    dataset_accounted_bytes,
+    apply_dataset_storage_release,
     decrease_bytes_used,
     increase_bytes_used,
+    plan_dataset_storage_release,
 )
 from app.services.storage import (
     contained_storage_path,
@@ -88,6 +90,45 @@ def _link_or_copy(source: Path, target: Path) -> None:
             raise
 
 
+def _link_bundle_or_copy(pairs: list[tuple[Path, Path]]) -> bool:
+    """Hardlink an immutable media bundle atomically, or copy all of it.
+
+    Returning ``True`` means every target is another directory entry for the
+    same physical bundle.  A single failed link rolls the bundle back before
+    copying so quota accounting never mistakes a partial copy for shared data.
+    """
+
+    for source, target in pairs:
+        if not source.is_file():
+            raise FileNotFoundError(
+                f"병합할 이미지 파일이 없습니다: {source.name}"
+            )
+        if target.exists():
+            raise FileExistsError(
+                f"병합 대상 파일이 이미 있습니다: {target.name}"
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+    linked_targets: list[Path] = []
+    try:
+        for source, target in pairs:
+            os.link(source, target)
+            linked_targets.append(target)
+        return True
+    except OSError:
+        for target in reversed(linked_targets):
+            target.unlink(missing_ok=True)
+
+    try:
+        for source, target in pairs:
+            shutil.copy2(source, target)
+    except Exception:
+        for _source, target in reversed(pairs):
+            target.unlink(missing_ok=True)
+        raise
+    return False
+
+
 def _safe_filename(value: str) -> str:
     filename = Path(value).name
     if (
@@ -104,6 +145,7 @@ def copy_source_images(
     settings: Settings,
     *,
     target_dataset_id: int,
+    owner_id: int,
     target_storage: Path,
     sources: list[Dataset],
     images_by_dataset: dict[int, list[Image]],
@@ -182,10 +224,6 @@ def copy_source_images(
                 settings.storage_dir,
                 source_image.thumb_path,
             )
-            _link_or_copy(source_original, original_target)
-            recorded_files.append(original_target)
-            _link_or_copy(source_thumb, thumb_target)
-            recorded_files.append(thumb_target)
             original_bytes = (
                 source_image.original_bytes or source_original.stat().st_size
             )
@@ -205,17 +243,52 @@ def copy_source_images(
                     / split_directory
                     / f"{stem}.jpg"
                 )
-                _link_or_copy(source_display, display_target)
-                recorded_files.append(display_target)
                 display_bytes = (
                     source_image.display_bytes or source_display.stat().st_size
                 )
-            accounted_bytes += original_bytes + display_bytes + thumb_bytes
+
+            path_pairs = [
+                (source_original, original_target),
+                (source_thumb, thumb_target),
+            ]
+            if display_target is not None:
+                path_pairs.append((source_display, display_target))
+
+            source_media = source_image.media_object
+            can_share_media = (
+                source_media is not None and source_media.owner_id == owner_id
+            )
+            if can_share_media:
+                hardlinked = _link_bundle_or_copy(path_pairs)
+            else:
+                hardlinked = False
+                for source_path, target_path in path_pairs:
+                    _link_or_copy(source_path, target_path)
+            recorded_files.extend(target for _source, target in path_pairs)
+
+            media_object: MediaObject | None = None
+            physical_bytes = original_bytes + display_bytes + thumb_bytes
+            if can_share_media and hardlinked:
+                media_object = source_media
+            elif can_share_media:
+                media_object = MediaObject(
+                    owner_id=owner_id,
+                    created_by_dataset_id=target_dataset_id,
+                    original_bytes=original_bytes,
+                    display_bytes=display_bytes,
+                    thumb_bytes=thumb_bytes,
+                )
+                accounted_bytes += physical_bytes
+            else:
+                # Nullable legacy rows keep their established accounting until
+                # a dedicated reconciliation migrates their physical inodes.
+                accounted_bytes += physical_bytes
 
             annotation_count += len(annotations)
             copied_images.append(
                 Image(
                     dataset_id=target_dataset_id,
+                    media_object=media_object,
                     stem=stem,
                     filename=merged_filename,
                     rel_path=f"images/{split_directory}/{merged_filename}",
@@ -441,7 +514,10 @@ async def merge_datasets(
     image_rows = (
         await session.scalars(
             select(Image)
-            .options(selectinload(Image.annotations))
+            .options(
+                selectinload(Image.annotations),
+                selectinload(Image.media_object),
+            )
             .where(Image.dataset_id.in_(dataset_ids))
             .order_by(Image.dataset_id, Image.id)
         )
@@ -528,6 +604,7 @@ async def merge_datasets(
         copied = copy_source_images(
             settings,
             target_dataset_id=dataset.id,
+            owner_id=owner_id,
             target_storage=storage_path,
             sources=sources,
             images_by_dataset=images_by_dataset,
@@ -752,7 +829,10 @@ async def extend_merged_dataset(
     image_rows = (
         await session.scalars(
             select(Image)
-            .options(selectinload(Image.annotations))
+            .options(
+                selectinload(Image.annotations),
+                selectinload(Image.media_object),
+            )
             .where(Image.dataset_id.in_(incoming_ids))
             .order_by(Image.dataset_id, Image.id)
         )
@@ -833,6 +913,7 @@ async def extend_merged_dataset(
         copied = copy_source_images(
             settings,
             target_dataset_id=target.id,
+            owner_id=owner_id,
             target_storage=target_storage,
             sources=sources,
             images_by_dataset=images_by_dataset,
@@ -893,12 +974,11 @@ async def extend_merged_dataset(
                 )
                 next_position += 1
 
-        losing_accounted_bytes = 0
-        for losing_merge in losing_merges:
-            losing_accounted_bytes += await dataset_accounted_bytes(
-                session,
-                losing_merge.id,
-            )
+        await session.flush()
+        release_plan = await plan_dataset_storage_release(
+            session,
+            losing_ids,
+        )
 
         staged_deletions = await stage_deletions_async(
             settings.storage_dir,
@@ -906,12 +986,14 @@ async def extend_merged_dataset(
         )
         for losing_merge in losing_merges:
             await session.delete(losing_merge)
+        await session.flush()
+        await apply_dataset_storage_release(session, release_plan)
 
         target.image_count += len(copied.images)
         target.annotation_count += copied.annotation_count
         target.class_count = len(project_class_rows)
         project.updated_at = func.now()
-        quota_delta = copied.accounted_bytes - losing_accounted_bytes
+        quota_delta = copied.accounted_bytes - release_plan.released_bytes
         if quota_delta > 0:
             await increase_bytes_used(session, owner_id, quota_delta)
         elif quota_delta < 0:

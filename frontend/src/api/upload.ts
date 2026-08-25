@@ -47,6 +47,8 @@ export interface PreparedUploadBatch {
 export interface UploadProgress {
   uploadedBytes: number;
   totalBytes: number;
+  uploadedImages: number;
+  totalImages: number;
   currentPath: string;
 }
 
@@ -232,12 +234,20 @@ export async function transferUploadBatch(
 ): Promise<number | null> {
   const uploadIds: number[] = [];
   let completedBytes = 0;
+  let completedImages = 0;
+  const totalImages = batch.uploads.reduce(
+    (count, upload) => count + (upload.item.kind === "image" ? 1 : 0),
+    0,
+  );
   for (const upload of batch.uploads) {
     if (upload.session.state === "complete") {
       completedBytes += upload.item.file.size;
+      if (upload.item.kind === "image") completedImages += 1;
       onProgress({
         uploadedBytes: completedBytes,
         totalBytes: batch.totalBytes,
+        uploadedImages: completedImages,
+        totalImages,
         currentPath: upload.item.relPath,
       });
       continue;
@@ -257,10 +267,22 @@ export async function transferUploadBatch(
       onProgress({
         uploadedBytes: completedBytes + end,
         totalBytes: batch.totalBytes,
+        uploadedImages: completedImages + (
+          upload.item.kind === "image" && end === upload.item.file.size ? 1 : 0
+        ),
+        totalImages,
         currentPath: upload.item.relPath,
       });
     }
     completedBytes += upload.item.file.size;
+    if (upload.item.kind === "image") completedImages += 1;
+    onProgress({
+      uploadedBytes: completedBytes,
+      totalBytes: batch.totalBytes,
+      uploadedImages: completedImages,
+      totalImages,
+      currentPath: upload.item.relPath,
+    });
     uploadIds.push(upload.session.upload_id);
   }
   if (uploadIds.length === 0) {
@@ -302,6 +324,6 @@ export async function pollUploadJob(
       || job.state === "done"
       || job.state === "failed"
     ) return job;
-    await delay(1000);
+    await delay(500);
   }
 }

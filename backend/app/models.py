@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from uuid import UUID
 
 from sqlalchemy import (
     JSON,
@@ -17,6 +18,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    Uuid,
     func,
     text,
 )
@@ -81,6 +83,21 @@ class Dataset(Base):
     __tablename__ = "datasets"
     __table_args__ = (
         UniqueConstraint("owner_id", "name", name="uq_datasets_owner_name"),
+        CheckConstraint(
+            "(upload_group_id IS NULL AND upload_part_index IS NULL "
+            "AND upload_part_count IS NULL) OR "
+            "(upload_group_id IS NOT NULL AND upload_part_index >= 1 "
+            "AND upload_part_count >= 2 "
+            "AND upload_part_index <= upload_part_count)",
+            name="ck_datasets_upload_partition_fields",
+        ),
+        UniqueConstraint(
+            "owner_id",
+            "upload_group_id",
+            "upload_part_index",
+            name="uq_datasets_upload_group_part",
+        ),
+        Index("ix_datasets_upload_group_id", "upload_group_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -107,12 +124,20 @@ class Dataset(Base):
     is_merged: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    is_extracted: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     # Rows created by the pre-project UI are retained during migration. Empty,
     # untouched rows become hidden placeholders so no user data is deleted or
     # misclassified as an uploaded dataset.
     is_placeholder: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    upload_group_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
+    upload_part_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    upload_part_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -170,6 +195,46 @@ class DatasetClass(Base):
     dataset: Mapped[Dataset] = relationship(back_populates="classes")
 
 
+class MediaObject(Base):
+    """One physically stored immutable image bundle shared by image rows."""
+
+    __tablename__ = "media_objects"
+    __table_args__ = (
+        CheckConstraint(
+            "original_bytes >= 0 AND display_bytes >= 0 AND thumb_bytes >= 0",
+            name="ck_media_objects_bytes_nonnegative",
+        ),
+        Index("ix_media_objects_owner_id", "owner_id"),
+        Index("ix_media_objects_created_by_dataset_id", "created_by_dataset_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Auth users live in another database, so this remains a logical owner
+    # boundary.  Media is never shared across owners.
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Attribute each physical bundle to exactly one current dataset for the
+    # per-dataset "actual occupancy" display.  Deletion transfers this pointer
+    # to a surviving reference and the final reference removes the object.
+    created_by_dataset_id: Mapped[int | None] = mapped_column(
+        ForeignKey("datasets.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    original_bytes: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    display_bytes: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    thumb_bytes: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    images: Mapped[list[Image]] = relationship(back_populates="media_object")
+
+
 class Image(Base):
     __tablename__ = "images"
     __table_args__ = (
@@ -190,6 +255,13 @@ class Image(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     dataset_id: Mapped[int] = mapped_column(
         ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False
+    )
+    # Migration 0012 backfills every pre-existing row. New ingestion always
+    # creates an object; merge/extract rows reuse it when hardlinking succeeds.
+    media_object_id: Mapped[int] = mapped_column(
+        ForeignKey("media_objects.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
     )
     stem: Mapped[str] = mapped_column(String(1024), nullable=False)
     filename: Mapped[str] = mapped_column(String(1024), nullable=False)
@@ -223,6 +295,7 @@ class Image(Base):
     )
 
     dataset: Mapped[Dataset] = relationship(back_populates="images")
+    media_object: Mapped[MediaObject] = relationship(back_populates="images")
     annotations: Mapped[list[Annotation]] = relationship(
         back_populates="image", cascade="all, delete-orphan", passive_deletes=True
     )
@@ -289,6 +362,20 @@ class UploadSession(Base):
 
 class UploadJob(Base):
     __tablename__ = "upload_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "ingest_cursor >= 0",
+            name="ck_upload_jobs_ingest_cursor_nonnegative",
+        ),
+        CheckConstraint(
+            "image_total >= 0",
+            name="ck_upload_jobs_image_total_nonnegative",
+        ),
+        CheckConstraint(
+            "image_processed >= 0",
+            name="ck_upload_jobs_image_processed_nonnegative",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     dataset_id: Mapped[int] = mapped_column(
@@ -308,6 +395,19 @@ class UploadJob(Base):
         Integer, nullable=False, default=0, server_default="0"
     )
     failed: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    # Number of deterministically ordered image inputs committed to durable
+    # dataset batches. Progress may run ahead, but only this cursor is resumed.
+    ingest_cursor: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    # Dedicated image counters keep the progress UI independent from labels,
+    # class metadata, and upload archive bookkeeping included in total/processed.
+    image_total: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    image_processed: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
     # The worker previously received upload ids only as an in-memory task
@@ -394,6 +494,10 @@ class UserStorage(Base):
             "bytes_used >= 0",
             name="ck_user_storage_bytes_used_nonnegative",
         ),
+        CheckConstraint(
+            "quota_limit_bytes IS NULL OR quota_limit_bytes > 0",
+            name="ck_user_storage_quota_limit_positive",
+        ),
     )
 
     # Logical auth-service user reference; no cross-database FK is possible.
@@ -402,6 +506,11 @@ class UserStorage(Base):
     )
     bytes_used: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0, server_default="0"
+    )
+    # NULL inherits the deployment-wide default. Admin-set overrides remain
+    # stable when that default changes later.
+    quota_limit_bytes: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

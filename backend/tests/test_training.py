@@ -19,6 +19,7 @@ from app.services.proc_identity import ProcessIdentity, parse_proc_stat, read_pr
 from app.services.storage import contained_storage_path, storage_relative_path
 from app.services import training
 from app.worker import callbacks, train_worker
+from tests.factories import image_with_media
 
 
 pytestmark = pytest.mark.asyncio
@@ -65,7 +66,8 @@ async def _dataset(
             )
             source = root / f"image {index}.jpg"
             source.write_bytes(f"image-{index}".encode())
-            image = Image(
+            image = image_with_media(
+                owner_id=dataset.owner_id,
                 dataset_id=dataset_id,
                 stem=f"image {index}",
                 filename=source.name,

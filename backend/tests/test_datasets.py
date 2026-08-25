@@ -8,6 +8,7 @@ import pytest
 
 from app.models import Dataset, DatasetClass, Image, UploadJob
 from app.services.storage import contained_storage_path
+from tests.factories import image_with_media
 
 
 pytestmark = pytest.mark.asyncio
@@ -53,7 +54,8 @@ async def test_dataset_crud_uses_precomputed_counts_and_removes_storage(
                     class_id=0,
                     name="person",
                 ),
-                Image(
+                image_with_media(
+                    owner_id=dataset_row.owner_id,
                     dataset_id=dataset_id,
                     stem="train-a",
                     filename="train-a.jpg",
@@ -66,7 +68,8 @@ async def test_dataset_crud_uses_precomputed_counts_and_removes_storage(
                     thumb_path=str(storage_path / "train-a-thumb.jpg"),
                     box_count=4,
                 ),
-                Image(
+                image_with_media(
+                    owner_id=dataset_row.owner_id,
                     dataset_id=dataset_id,
                     stem="val-a",
                     filename="val-a.jpg",

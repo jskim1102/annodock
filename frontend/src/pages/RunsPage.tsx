@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 
+import { invalidateStorageQuotaCache } from "../api/client";
 import {
   deleteRun,
   deleteRunArtifacts,
@@ -122,6 +123,7 @@ export function RunsPage() {
   const [deleteTargets, setDeleteTargets] = useState<RunSummary[] | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const mountedRef = useRef(true);
+  const observedRunStatesRef = useRef<Map<number, RunState>>(new Map());
 
   useEffect(() => {
     mountedRef.current = true;
@@ -141,6 +143,16 @@ export function RunsPage() {
       try {
         const response = await getRuns();
         if (!active) return;
+        const completedSinceLastPoll = response.items.some((run) => {
+          const previousState = observedRunStatesRef.current.get(run.id);
+          return previousState !== undefined
+            && ACTIVE_STATES.has(previousState)
+            && !ACTIVE_STATES.has(run.state);
+        });
+        observedRunStatesRef.current = new Map(
+          response.items.map((run) => [run.id, run.state]),
+        );
+        if (completedSinceLastPoll) invalidateStorageQuotaCache();
         setRuns(response.items);
         setError(null);
         if (response.items.some((run) => ACTIVE_STATES.has(run.state))) {
@@ -204,6 +216,7 @@ export function RunsPage() {
           : message);
       }
     } finally {
+      if (completedIds.size > 0) invalidateStorageQuotaCache();
       try {
         const response = await getRuns();
         if (mountedRef.current) {
@@ -256,6 +269,7 @@ export function RunsPage() {
           : message);
       }
     } finally {
+      if (completedIds.size > 0) invalidateStorageQuotaCache();
       try {
         const response = await getRuns();
         if (mountedRef.current) {

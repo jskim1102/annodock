@@ -347,16 +347,16 @@ async def test_gc_and_dataset_delete_do_not_deadlock(
     allow_delete_to_continue = asyncio.Event()
     sweeper_has_upload_lock = asyncio.Event()
     allow_sweeper_to_continue = asyncio.Event()
-    original_accounted_bytes = datasets_router.dataset_accounted_bytes
+    original_release_plan = datasets_router.plan_dataset_storage_release
     original_stage_upload_paths = cleanup_service._stage_upload_paths
 
     async def pause_delete_after_dataset_lock(
         session: AsyncSession,
-        target_dataset_id: int,
-    ) -> int:
+        target_dataset_ids: list[int],
+    ):
         delete_has_dataset_lock.set()
         await allow_delete_to_continue.wait()
-        return await original_accounted_bytes(session, target_dataset_id)
+        return await original_release_plan(session, target_dataset_ids)
 
     async def pause_sweeper_after_upload_locks(
         storage_dir: Path,
@@ -368,7 +368,7 @@ async def test_gc_and_dataset_delete_do_not_deadlock(
 
     monkeypatch.setattr(
         datasets_router,
-        "dataset_accounted_bytes",
+        "plan_dataset_storage_release",
         pause_delete_after_dataset_lock,
     )
     monkeypatch.setattr(
@@ -433,7 +433,7 @@ async def test_gc_high_id_first_and_dataset_delete_do_not_deadlock(
     allow_delete_to_continue = asyncio.Event()
     original_iterdir = Path.iterdir
     original_scalar = AsyncSession.scalar
-    original_accounted_bytes = datasets_router.dataset_accounted_bytes
+    original_release_plan = datasets_router.plan_dataset_storage_release
     sweeper_task: asyncio.Task | None = None
 
     def high_id_first(path: Path):
@@ -466,17 +466,17 @@ async def test_gc_high_id_first_and_dataset_delete_do_not_deadlock(
 
     async def pause_delete_after_dataset_lock(
         session: AsyncSession,
-        target_dataset_id: int,
-    ) -> int:
+        target_dataset_ids: list[int],
+    ):
         delete_has_dataset_lock.set()
         await allow_delete_to_continue.wait()
-        return await original_accounted_bytes(session, target_dataset_id)
+        return await original_release_plan(session, target_dataset_ids)
 
     monkeypatch.setattr(Path, "iterdir", high_id_first)
     monkeypatch.setattr(AsyncSession, "scalar", pause_after_high_lookup)
     monkeypatch.setattr(
         datasets_router,
-        "dataset_accounted_bytes",
+        "plan_dataset_storage_release",
         pause_delete_after_dataset_lock,
     )
 

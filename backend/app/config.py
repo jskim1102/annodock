@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     run_artifact_keep_days: int = Field(default=30, ge=0)
     upload_gc_ttl_hours: int = Field(default=24, gt=0)
     upload_gc_resolution_ttl_days: int = Field(default=7, gt=0)
+    ingest_batch_size: int = Field(default=2_000, ge=1, le=10_000)
+    dataset_max_images: int = Field(default=5_000, ge=1, le=100_000)
 
     @field_validator("storage_dir", mode="after")
     @classmethod

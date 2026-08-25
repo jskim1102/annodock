@@ -43,6 +43,7 @@ EXPECTED_CLASS_COUNT = 80
 ARTIFACT_NAMES = ("best.pt", "last.pt", "results.csv")
 DEFAULT_TRAIN_IMGSZ = 640
 DEFAULT_TRAIN_EPOCHS = 2
+SMOKE_TEMP_PREFIX = "annodock-smoke-"
 TRANSIENT_HTTP_ERRORS = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
@@ -137,29 +138,29 @@ def _storage_dir(values: dict[str, str]) -> Path:
 
 def _training_imgsz() -> int:
     raw_value = os.environ.get(
-        "DEEPLABEL_SMOKE_IMGSZ",
+        "ANNODOCK_SMOKE_IMGSZ",
         str(DEFAULT_TRAIN_IMGSZ),
     )
     try:
         value = int(raw_value)
     except ValueError as error:
-        raise AssertionError("DEEPLABEL_SMOKE_IMGSZ must be an integer") from error
+        raise AssertionError("ANNODOCK_SMOKE_IMGSZ must be an integer") from error
     if not 32 <= value <= 2_048:
-        raise AssertionError("DEEPLABEL_SMOKE_IMGSZ must be between 32 and 2048")
+        raise AssertionError("ANNODOCK_SMOKE_IMGSZ must be between 32 and 2048")
     return value
 
 
 def _training_epochs() -> int:
     raw_value = os.environ.get(
-        "DEEPLABEL_SMOKE_EPOCHS",
+        "ANNODOCK_SMOKE_EPOCHS",
         str(DEFAULT_TRAIN_EPOCHS),
     )
     try:
         value = int(raw_value)
     except ValueError as error:
-        raise AssertionError("DEEPLABEL_SMOKE_EPOCHS must be an integer") from error
+        raise AssertionError("ANNODOCK_SMOKE_EPOCHS must be an integer") from error
     if not 2 <= value <= 100:
-        raise AssertionError("DEEPLABEL_SMOKE_EPOCHS must be between 2 and 100")
+        raise AssertionError("ANNODOCK_SMOKE_EPOCHS must be between 2 and 100")
     return value
 
 
@@ -743,7 +744,7 @@ def main() -> None:
     _emit(f"auth_user_id={smoke_auth.user_id}")
     _emit("auth_local_roundtrip=PASS")
     try:
-        with tempfile.TemporaryDirectory(prefix="deeplabel-smoke-") as temp:
+        with tempfile.TemporaryDirectory(prefix=SMOKE_TEMP_PREFIX) as temp:
             archive_path, extracted_size = _prepare_coco8_archive(
                 Path(temp).resolve()
             )

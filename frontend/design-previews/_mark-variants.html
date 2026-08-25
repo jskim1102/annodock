@@ -1,0 +1,328 @@
+<title>Annodock Mark on Dark</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<style>
+  :root {
+    --ground: #f7f6f1;
+    --panel: #ffffff;
+    --ink: #141a20;
+    --ink-soft: #4c5866;
+    --ink-faint: #8b96a3;
+    --line: rgba(15, 118, 110, .18);
+    --accent: #0f766e;
+    --accent-soft: rgba(15, 118, 110, .09);
+    --pick: #b45309;
+    --pick-soft: rgba(180, 83, 9, .10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0c0f14;
+      --panel: #131821;
+      --ink: #e6ebf1;
+      --ink-soft: #9aa7b5;
+      --ink-faint: #6a7684;
+      --line: rgba(51, 191, 166, .20);
+      --accent: #33bfa6;
+      --accent-soft: rgba(51, 191, 166, .12);
+      --pick: #f0a44a;
+      --pick-soft: rgba(240, 164, 74, .12);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0c0f14;
+    --panel: #131821;
+    --ink: #e6ebf1;
+    --ink-soft: #9aa7b5;
+    --ink-faint: #6a7684;
+    --line: rgba(51, 191, 166, .20);
+    --accent: #33bfa6;
+    --accent-soft: rgba(51, 191, 166, .12);
+    --pick: #f0a44a;
+    --pick-soft: rgba(240, 164, 74, .12);
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+    line-height: 1.55;
+    margin: 0;
+    padding: 40px 24px 72px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; display: flex; flex-direction: column; gap: 34px; }
+
+  .label {
+    font-family: "IBM Plex Sans Condensed", "IBM Plex Sans", sans-serif;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .09em;
+    font-size: 12px;
+    color: var(--ink-faint);
+  }
+  code, .hex {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: .88em;
+  }
+
+  header { display: flex; flex-direction: column; gap: 10px; border-bottom: 1px solid var(--line); padding-bottom: 26px; }
+  h1 { font-size: 30px; font-weight: 600; margin: 0; letter-spacing: -.01em; text-wrap: balance; }
+  header p { margin: 0; max-width: 62ch; color: var(--ink-soft); }
+
+  .row {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    display: grid;
+    grid-template-columns: minmax(240px, 300px) 1fr;
+  }
+  @media (max-width: 800px) { .row { grid-template-columns: 1fr; } }
+
+  .row-info { padding: 20px 22px; display: flex; flex-direction: column; gap: 9px; border-right: 1px solid var(--line); }
+  @media (max-width: 800px) { .row-info { border-right: none; border-bottom: 1px solid var(--line); } }
+  .row-info h2 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -.005em; }
+  .row-info p { margin: 0; font-size: 14px; color: var(--ink-soft); }
+  .row-info ul { margin: 2px 0 0; padding-left: 17px; font-size: 13.5px; color: var(--ink-soft); display: flex; flex-direction: column; gap: 4px; }
+
+  .tag { align-self: flex-start; font-size: 11px; letter-spacing: .07em; text-transform: uppercase;
+         font-family: "IBM Plex Sans Condensed", sans-serif; font-weight: 600;
+         padding: 3px 8px; border-radius: 4px; background: var(--accent-soft); color: var(--accent); }
+  .tag.now { background: var(--pick-soft); color: var(--pick); }
+
+  .strip { display: grid; grid-template-columns: repeat(4, 1fr); }
+  @media (max-width: 620px) { .strip { grid-template-columns: repeat(2, 1fr); } }
+  .cell {
+    padding: 18px 12px 14px;
+    display: flex; flex-direction: column; align-items: center; gap: 12px;
+    border-left: 1px solid rgba(128, 128, 128, .16);
+  }
+  .cell:first-child { border-left: none; }
+  .marks { display: flex; align-items: flex-end; gap: 14px; min-height: 84px; }
+  .cell .caption { font-family: "IBM Plex Mono", monospace; font-size: 10.5px; letter-spacing: .02em; opacity: .62; }
+
+  .cell.on-bg    { background: #10131a; color: #10131a; }
+  .cell.on-surf  { background: #171b24; color: #171b24; }
+  .cell.on-shot  { background: #2b2b2b; color: #2b2b2b; }
+  .cell.on-white { background: #ffffff; color: #ffffff; }
+  .cell.on-bg .caption, .cell.on-surf .caption, .cell.on-shot .caption { color: #cfd6de; }
+  .cell.on-white .caption { color: #5b6672; }
+
+  .wordmark { display: flex; align-items: center; gap: 9px; }
+  .wordmark .txt { font-size: 20px; font-weight: 600; letter-spacing: -.015em; }
+  .on-bg .wordmark .txt, .on-surf .wordmark .txt, .on-shot .wordmark .txt { color: #f2f5f8; }
+  .on-white .wordmark .txt { color: #141a20; }
+  .wordmark .txt em { font-style: normal; font-weight: 500; opacity: .55; }
+
+  .duel { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--panel); }
+  .duel-head { padding: 18px 22px 14px; display: flex; flex-direction: column; gap: 6px; }
+  .duel-head p { margin: 0; font-size: 14px; color: var(--ink-soft); }
+  .duel-stage {
+    background: #2b2b2b; color: #2b2b2b;
+    display: flex; justify-content: center; gap: 64px; flex-wrap: wrap;
+    padding: 34px 24px 26px;
+  }
+  .duel-stage figure { margin: 0; display: flex; flex-direction: column; align-items: center; gap: 14px; }
+  .duel-stage figcaption {
+    font-family: "IBM Plex Sans Condensed", sans-serif; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .08em; font-size: 12px; color: #cfd6de;
+  }
+  .deltas { display: grid; grid-template-columns: repeat(3, 1fr); }
+  @media (max-width: 760px) { .deltas { grid-template-columns: 1fr; } }
+  .delta { padding: 16px 20px 18px; border-left: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px; }
+  .delta:first-child { border-left: none; }
+  @media (max-width: 760px) { .delta { border-left: none; border-top: 1px solid var(--line); } .delta:first-child { border-top: none; } }
+  .delta p { margin: 0; font-size: 13px; color: var(--ink-soft); }
+  .chips { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .chip {
+    font-family: "IBM Plex Mono", monospace; font-size: 11px;
+    padding: 5px 9px; border-radius: 4px; color: #eaf3f0;
+    border: 1px solid rgba(255, 255, 255, .16);
+  }
+  .chip.strike { text-decoration: line-through; text-decoration-thickness: 1px; opacity: .8; }
+  .arrow { color: var(--ink-faint); font-size: 13px; }
+
+  .note { border: 1px solid var(--line); border-radius: 10px; padding: 18px 22px; background: var(--accent-soft); }
+  .note h2 { margin: 0 0 8px; font-size: 16px; font-weight: 600; }
+  .note p, .note li { margin: 0; font-size: 14px; color: var(--ink-soft); }
+  .note ul { margin: 6px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 5px; }
+  svg { display: block; }
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <!-- A: current on-dark asset -->
+    <linearGradient id="aBack" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1d8a7f"/><stop offset="1" stop-color="#0a4f4a"/></linearGradient>
+    <linearGradient id="aFront" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5fe0c8"/><stop offset="1" stop-color="#2aa78f"/></linearGradient>
+    <filter id="aShadow" x="-30%" y="-30%" width="160%" height="160%"><feDropShadow dx="0" dy="5" stdDeviation="5" flood-color="#000000" flood-opacity=".55"/></filter>
+    <symbol id="markA" viewBox="0 0 96 96">
+      <g filter="url(#aShadow)">
+        <path d="M26 12 H54 Q62 12 62 20 V44 Q62 48 58 48 H50 Q46 48 46 52 V62 Q46 68 40 68 H26 Q18 68 18 60 V20 Q18 12 26 12 Z" fill="#04302c" transform="translate(3.2,3.2)"/>
+        <path d="M26 12 H54 Q62 12 62 20 V44 Q62 48 58 48 H50 Q46 48 46 52 V62 Q46 68 40 68 H26 Q18 68 18 60 V20 Q18 12 26 12 Z" fill="url(#aBack)"/>
+        <path d="M62 32 H70 Q78 32 78 40 V76 Q78 84 70 84 H42 Q34 84 34 76 V56 Q34 52 38 52 H50 Q58 52 58 44 V36 Q58 32 62 32 Z" fill="#156a5a" transform="translate(3.2,3.2)"/>
+        <path d="M62 32 H70 Q78 32 78 40 V76 Q78 84 70 84 H42 Q34 84 34 76 V56 Q34 52 38 52 H50 Q58 52 58 44 V36 Q58 32 62 32 Z" fill="url(#aFront)"/>
+      </g>
+    </symbol>
+
+    <!-- B: brightened, ghost + black shadow removed, dark hairline between tiles -->
+    <linearGradient id="bBack" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#39b9a2"/><stop offset="1" stop-color="#1c8b7c"/></linearGradient>
+    <linearGradient id="bFront" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8ff3dd"/><stop offset="1" stop-color="#45d0b4"/></linearGradient>
+    <symbol id="markB" viewBox="0 0 96 96">
+      <path d="M26 12 H54 Q62 12 62 20 V44 Q62 48 58 48 H50 Q46 48 46 52 V62 Q46 68 40 68 H26 Q18 68 18 60 V20 Q18 12 26 12 Z" fill="url(#bBack)"/>
+      <path d="M62 32 H70 Q78 32 78 40 V76 Q78 84 70 84 H42 Q34 84 34 76 V56 Q34 52 38 52 H50 Q58 52 58 44 V36 Q58 32 62 32 Z"
+            fill="url(#bFront)" stroke="#083f3a" stroke-width="2.4" paint-order="stroke"/>
+    </symbol>
+
+    <!-- C: knockout gap in the page background color -->
+    <linearGradient id="cBack" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2fb9a4"/><stop offset="1" stop-color="#15806f"/></linearGradient>
+    <linearGradient id="cFront" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7defd6"/><stop offset="1" stop-color="#31c4a8"/></linearGradient>
+    <symbol id="markC" viewBox="0 0 96 96">
+      <path d="M26 12 H54 Q62 12 62 20 V44 Q62 48 58 48 H50 Q46 48 46 52 V62 Q46 68 40 68 H26 Q18 68 18 60 V20 Q18 12 26 12 Z" fill="url(#cBack)"/>
+      <path d="M62 32 H70 Q78 32 78 40 V76 Q78 84 70 84 H42 Q34 84 34 76 V56 Q34 52 38 52 H50 Q58 52 58 44 V36 Q58 32 62 32 Z"
+            fill="url(#cFront)" stroke="currentColor" stroke-width="4" paint-order="stroke"/>
+    </symbol>
+
+    <!-- D: back tile outlined, front tile solid -->
+    <linearGradient id="dFront" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6fe8d0"/><stop offset="1" stop-color="#2fb59c"/></linearGradient>
+    <symbol id="markD" viewBox="0 0 96 96">
+      <path d="M26 12 H54 Q62 12 62 20 V44 Q62 48 58 48 H50 Q46 48 46 52 V62 Q46 68 40 68 H26 Q18 68 18 60 V20 Q18 12 26 12 Z"
+            fill="none" stroke="#33bfa6" stroke-width="5"/>
+      <path d="M62 32 H70 Q78 32 78 40 V76 Q78 84 70 84 H42 Q34 84 34 76 V56 Q34 52 38 52 H50 Q58 52 58 44 V36 Q58 32 62 32 Z"
+            fill="url(#dFront)" stroke="currentColor" stroke-width="4.5" paint-order="stroke"/>
+    </symbol>
+  </defs>
+</svg>
+
+<div class="wrap">
+  <header>
+    <span class="label">Annodock · brand mark</span>
+    <h1>다크 배경 위 마크 후보 비교</h1>
+    <p>현재 <code>annodock-mark-on-dark.svg</code> 는 어두운 배경에서 형태가 무너진다. 아래 세 후보를 앱의 실제 다크 표면 세 종류와 라이트 배경 위에서 같은 크기로 비교한다. 라이트 모드 에셋은 손대지 않는다 — 흰 배경 열은 회귀 확인용이다.</p>
+  </header>
+
+  <section class="duel">
+    <div class="duel-head">
+      <span class="label">먼저 이것부터 — A 와 B 확대 대조</span>
+      <p>작은 크기에서는 두 후보가 같아 보인다. 같은 배경 <span class="hex">#2b2b2b</span> 위 160px 로 붙여 놓은 것.</p>
+    </div>
+    <div class="duel-stage">
+      <figure><svg width="160" height="160"><use href="#markA"/></svg><figcaption>A · 현재</figcaption></figure>
+      <figure><svg width="160" height="160"><use href="#markB"/></svg><figcaption>B · 밝힘</figcaption></figure>
+    </div>
+    <div class="deltas">
+      <div class="delta">
+        <span class="label">뒤 타일 어두운 끝</span>
+        <div class="chips"><span class="chip" style="background:#0a4f4a">#0a4f4a</span><span class="arrow">→</span><span class="chip" style="background:#1c8b7c">#1c8b7c</span></div>
+        <p>이 색이 배경에 먹혀 오른쪽아래 모서리가 사라지던 지점.</p>
+      </div>
+      <div class="delta">
+        <span class="label">앞 타일 밝은 끝</span>
+        <div class="chips"><span class="chip" style="background:#5fe0c8;color:#06302b">#5fe0c8</span><span class="arrow">→</span><span class="chip" style="background:#8ff3dd;color:#06302b">#8ff3dd</span></div>
+        <p>두 타일 사이 명도 간격을 벌려 앞뒤가 갈리게 함.</p>
+      </div>
+      <div class="delta">
+        <span class="label">삭제한 것</span>
+        <div class="chips"><span class="chip strike" style="background:#04302c">고스트 레이어</span><span class="chip strike" style="background:#000">검정 섀도 .55</span></div>
+        <p>다크 배경에서 깊이는 안 만들고 가장자리만 탁하게 하던 두 겹.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="row">
+    <div class="row-info">
+      <span class="tag now">현재</span>
+      <h2>A — 지금 에셋</h2>
+      <p>진단된 문제 셋:</p>
+      <ul>
+        <li>뒤 타일 그라디언트 끝점 <span class="hex">#0a4f4a</span> 가 배경과 명도차 부족</li>
+        <li><span class="hex">translate(3.2,3.2)</span> 고스트 레이어가 거의 검정 → 두 타일 분리 사라짐</li>
+        <li>검정 드롭섀도 <span class="hex">opacity .55</span> 가 다크 위에서 가장자리만 탁하게 만듦</li>
+      </ul>
+    </div>
+    <div class="strip">
+      <div class="cell on-bg"><div class="marks"><svg width="20" height="20"><use href="#markA"/></svg><svg width="32" height="32"><use href="#markA"/></svg><svg width="72" height="72"><use href="#markA"/></svg></div><span class="caption">#10131a · --color-bg</span></div>
+      <div class="cell on-surf"><div class="marks"><svg width="20" height="20"><use href="#markA"/></svg><svg width="32" height="32"><use href="#markA"/></svg><svg width="72" height="72"><use href="#markA"/></svg></div><span class="caption">#171b24 · --color-surface</span></div>
+      <div class="cell on-shot"><div class="marks"><svg width="20" height="20"><use href="#markA"/></svg><svg width="32" height="32"><use href="#markA"/></svg><svg width="72" height="72"><use href="#markA"/></svg></div><span class="caption">#2b2b2b · 스크린샷</span></div>
+      <div class="cell on-white"><div class="marks"><svg width="20" height="20"><use href="#markA"/></svg><svg width="32" height="32"><use href="#markA"/></svg><svg width="72" height="72"><use href="#markA"/></svg></div><span class="caption">#ffffff · 회귀 확인</span></div>
+    </div>
+  </section>
+
+  <section class="row">
+    <div class="row-info">
+      <span class="tag">후보</span>
+      <h2>B — 밝히고 그림자 제거</h2>
+      <p>형태는 그대로, 톤만 다크용으로 다시 잡음.</p>
+      <ul>
+        <li>뒤 타일 <span class="hex">#39b9a2 → #1c8b7c</span>, 앞 타일 <span class="hex">#8ff3dd → #45d0b4</span></li>
+        <li>고스트 레이어·검정 섀도 삭제</li>
+        <li>두 타일 경계는 짙은 청록 헤어라인 <span class="hex">#083f3a</span> 2.4px</li>
+      </ul>
+    </div>
+    <div class="strip">
+      <div class="cell on-bg"><div class="marks"><svg width="20" height="20"><use href="#markB"/></svg><svg width="32" height="32"><use href="#markB"/></svg><svg width="72" height="72"><use href="#markB"/></svg></div><span class="caption">#10131a · --color-bg</span></div>
+      <div class="cell on-surf"><div class="marks"><svg width="20" height="20"><use href="#markB"/></svg><svg width="32" height="32"><use href="#markB"/></svg><svg width="72" height="72"><use href="#markB"/></svg></div><span class="caption">#171b24 · --color-surface</span></div>
+      <div class="cell on-shot"><div class="marks"><svg width="20" height="20"><use href="#markB"/></svg><svg width="32" height="32"><use href="#markB"/></svg><svg width="72" height="72"><use href="#markB"/></svg></div><span class="caption">#2b2b2b · 스크린샷</span></div>
+      <div class="cell on-white"><div class="marks"><svg width="20" height="20"><use href="#markB"/></svg><svg width="32" height="32"><use href="#markB"/></svg><svg width="72" height="72"><use href="#markB"/></svg></div><span class="caption">#ffffff · 회귀 확인</span></div>
+    </div>
+  </section>
+
+  <section class="row">
+    <div class="row-info">
+      <span class="tag">후보</span>
+      <h2>C — 배경색으로 도려낸 갭</h2>
+      <p>B 와 같은 톤이되, 분리선을 어두운 선이 아니라 <strong>배경색 4px 갭</strong> 으로 처리. 어느 표면에 올려도 갭이 그 표면 색이라 항상 같은 깊이감이 난다.</p>
+      <ul>
+        <li>대가: 배경색이 SVG 안에 박히므로 표면마다 값이 달라짐 — CSS <span class="hex">currentColor</span> 로 주입해야 함</li>
+      </ul>
+    </div>
+    <div class="strip">
+      <div class="cell on-bg"><div class="marks"><svg width="20" height="20"><use href="#markC"/></svg><svg width="32" height="32"><use href="#markC"/></svg><svg width="72" height="72"><use href="#markC"/></svg></div><span class="caption">#10131a · --color-bg</span></div>
+      <div class="cell on-surf"><div class="marks"><svg width="20" height="20"><use href="#markC"/></svg><svg width="32" height="32"><use href="#markC"/></svg><svg width="72" height="72"><use href="#markC"/></svg></div><span class="caption">#171b24 · --color-surface</span></div>
+      <div class="cell on-shot"><div class="marks"><svg width="20" height="20"><use href="#markC"/></svg><svg width="32" height="32"><use href="#markC"/></svg><svg width="72" height="72"><use href="#markC"/></svg></div><span class="caption">#2b2b2b · 스크린샷</span></div>
+      <div class="cell on-white"><div class="marks"><svg width="20" height="20"><use href="#markC"/></svg><svg width="32" height="32"><use href="#markC"/></svg><svg width="72" height="72"><use href="#markC"/></svg></div><span class="caption">#ffffff · 회귀 확인</span></div>
+    </div>
+  </section>
+
+  <section class="row">
+    <div class="row-info">
+      <span class="tag">후보</span>
+      <h2>D — 뒤 타일 아웃라인</h2>
+      <p>뒤 타일을 면이 아니라 <span class="hex">#33bfa6</span> 5px 선으로. 앞 타일만 채운다.</p>
+      <ul>
+        <li>다크에서 가장 또렷하고 가벼움</li>
+        <li>대가: 라이트 모드와 형태 인상이 달라져 두 테마가 다른 로고처럼 보일 수 있음</li>
+        <li>20px 에서 선이 뭉개지는지 왼쪽 열에서 확인</li>
+      </ul>
+    </div>
+    <div class="strip">
+      <div class="cell on-bg"><div class="marks"><svg width="20" height="20"><use href="#markD"/></svg><svg width="32" height="32"><use href="#markD"/></svg><svg width="72" height="72"><use href="#markD"/></svg></div><span class="caption">#10131a · --color-bg</span></div>
+      <div class="cell on-surf"><div class="marks"><svg width="20" height="20"><use href="#markD"/></svg><svg width="32" height="32"><use href="#markD"/></svg><svg width="72" height="72"><use href="#markD"/></svg></div><span class="caption">#171b24 · --color-surface</span></div>
+      <div class="cell on-shot"><div class="marks"><svg width="20" height="20"><use href="#markD"/></svg><svg width="32" height="32"><use href="#markD"/></svg><svg width="72" height="72"><use href="#markD"/></svg></div><span class="caption">#2b2b2b · 스크린샷</span></div>
+      <div class="cell on-white"><div class="marks"><svg width="20" height="20"><use href="#markD"/></svg><svg width="32" height="32"><use href="#markD"/></svg><svg width="72" height="72"><use href="#markD"/></svg></div><span class="caption">#ffffff · 회귀 확인</span></div>
+    </div>
+  </section>
+
+  <section class="row">
+    <div class="row-info">
+      <span class="tag">문맥</span>
+      <h2>워드마크와 나란히</h2>
+      <p>실제로 마크가 놓이는 자리. 스크린샷과 같은 조합으로 네 후보를 32px 에서 비교한다.</p>
+    </div>
+    <div class="strip">
+      <div class="cell on-shot"><div class="marks"><span class="wordmark"><svg width="32" height="32"><use href="#markA"/></svg><span class="txt">Anno<em>dock</em></span></span></div><span class="caption">A · 현재</span></div>
+      <div class="cell on-shot"><div class="marks"><span class="wordmark"><svg width="32" height="32"><use href="#markB"/></svg><span class="txt">Anno<em>dock</em></span></span></div><span class="caption">B · 밝힘</span></div>
+      <div class="cell on-shot"><div class="marks"><span class="wordmark"><svg width="32" height="32"><use href="#markC"/></svg><span class="txt">Anno<em>dock</em></span></span></div><span class="caption">C · 갭</span></div>
+      <div class="cell on-shot"><div class="marks"><span class="wordmark"><svg width="32" height="32"><use href="#markD"/></svg><span class="txt">Anno<em>dock</em></span></span></div><span class="caption">D · 아웃라인</span></div>
+    </div>
+  </section>
+
+  <div class="note">
+    <h2>고를 때 볼 것</h2>
+    <ul>
+      <li><strong>20px 열</strong> — 사이드바 실제 크기다. 여기서 두 타일이 한 덩어리로 뭉치면 탈락.</li>
+      <li><strong>#2b2b2b 열</strong> — 로그인 화면처럼 표면이 밝을 때 후보가 너무 튀지 않는지.</li>
+      <li><strong>흰 배경 열</strong> — 다크 에셋만 바꿀 계획이면 이 열은 무시해도 된다. 두 테마 한 파일로 통합할 생각이면 여기서도 버텨야 한다.</li>
+    </ul>
+  </div>
+</div>

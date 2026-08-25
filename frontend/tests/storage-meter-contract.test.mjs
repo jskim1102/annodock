@@ -10,9 +10,8 @@ const source = await readFile(
 test("storage meters never present invented usage numbers", () => {
   assert.doesNotMatch(source, /12\.4|100 GiB/);
   assert.equal(
-    source.match(/>—</g)?.length,
+    source.match(/usageLabel \?\? "—"/g)?.length,
     2,
-    "compact and full meters must both state that usage is unavailable",
+    "compact and full meters must both keep the unavailable fallback",
   );
 });
-

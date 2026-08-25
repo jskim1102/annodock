@@ -11,6 +11,7 @@ import {
   getProjects,
   getProjectClassImageCounts,
   imageResourceUrl,
+  invalidateStorageQuotaCache,
   mergeDatasets,
   renameDataset,
   renameProject,
@@ -36,23 +37,21 @@ import {
 } from "../utils/datasetSelectionSummary";
 import { getProjectSummary } from "../utils/projectSummary";
 import { sortProjects, type ProjectSortOrder } from "../utils/projectSort";
+import { formatBytes } from "../utils/formatBytes";
 
-function statusLabel(row: ProjectDatasetSourceRow) {
+function progressPercentage(row: ProjectDatasetSourceRow) {
   if (row.active_job) {
-    const progress = row.active_job.total > 0
+    return row.active_job.total > 0
       ? Math.round(row.active_job.processed / row.active_job.total * 100)
       : 0;
-    return { label: `${row.active_job.phase} ${progress}%`, progress };
   }
   if (row.status === "ready") {
     // ready 이후 진행률 = 라벨링 현황 (라벨 있는 이미지 / 전체 이미지)
-    const progress = row.image_count > 0
+    return row.image_count > 0
       ? Math.round(row.labeled_image_count / row.image_count * 100)
       : 0;
-    return { label: "검수 가능", progress };
   }
-  if (row.status === "failed") return { label: "처리 실패", progress: 0 };
-  return { label: "업로드 대기", progress: 0 };
+  return 0;
 }
 
 function dateLabel(value: string) {
@@ -331,6 +330,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
             name,
             dataset_ids: target.datasets.map((dataset) => dataset.id),
           });
+      invalidateStorageQuotaCache();
       await continueMergedAction(merged.id, target.purpose);
       setMergeTarget(null);
     } catch (reason: unknown) {
@@ -377,6 +377,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
         dataset_ids: [...new Set(target.datasets.map((dataset) => dataset.id))],
         class_ids: [...new Set(classIds)],
       });
+      invalidateStorageQuotaCache();
       try {
         await syncProjectsAfterDatasetMutation();
       } catch {
@@ -436,6 +437,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
     setError(null);
     try {
       await deleteProject(project.id, confirmed);
+      invalidateStorageQuotaCache();
       removeProjectFromView(project);
       setDeleteConfirmation(null);
     } catch (reason: unknown) {
@@ -461,6 +463,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
     setError(null);
     try {
       await deleteDataset(dataset.id);
+      invalidateStorageQuotaCache();
 
       setSelected((current) => {
         const next = new Set(current);
@@ -995,7 +998,7 @@ function ProjectRows({
               <colgroup>
                 <col className="dataset-select-column" />
                 <col />
-                <col className="dataset-review-column" />
+                <col className="dataset-storage-column" />
                 <col className="dataset-progress-column" />
                 <col className="dataset-menu-column" />
               </colgroup>
@@ -1015,14 +1018,14 @@ function ProjectRows({
                     </button>
                   </th>
                   <th scope="col">데이터셋</th>
-                  <th scope="col">검수 상태</th>
+                  <th scope="col">용량</th>
                   <th scope="col">진행률</th>
                   <th scope="col"><span className="sr-only">작업</span></th>
                 </tr>
               </thead>
               <tbody>
                 {project.datasets.map((dataset) => {
-                  const status = statusLabel(dataset);
+                  const progress = progressPercentage(dataset);
                   const ready = dataset.status === "ready";
                   const hasMergeSources = dataset.is_merged && dataset.source_datasets.length > 0;
                   const selectedSourceIds = dataset.source_datasets
@@ -1086,8 +1089,13 @@ function ProjectRows({
                             {ready ? <a className="dataset-name" href={appHref(`/datasets/${dataset.id}/viewer`)}><strong>{dataset.name}{dataset.is_merged ? <span className="merged-dataset-badge">병합</span> : null}</strong><span>이미지 {dataset.image_count.toLocaleString()} · 라벨 {dataset.annotation_count.toLocaleString()}</span></a> : <span className="dataset-name"><strong>{dataset.name}{dataset.is_merged ? <span className="merged-dataset-badge">병합</span> : null}</strong><span>이미지 {dataset.image_count.toLocaleString()} · 라벨 {dataset.annotation_count.toLocaleString()}</span></span>}
                           </div>
                         </td>
-                        <td><span className="dataset-work">{status.label}</span></td>
-                        <td><span className="dataset-progress"><span className="dataset-progress-track"><span className="bar"><i style={{ width: `${status.progress}%` }} /></span><span className="dataset-progress-fraction mono">{dataset.labeled_image_count.toLocaleString()}/{dataset.image_count.toLocaleString()}</span></span><span className="mono">{status.progress}%</span></span></td>
+                        <td>
+                          <span className="dataset-storage-usage">
+                            <span><small>참조</small><strong className="mono">{formatBytes(dataset.storage_bytes)}</strong></span>
+                            <span><small>실제 점유</small><strong className="mono">{formatBytes(dataset.physical_storage_bytes)}</strong></span>
+                          </span>
+                        </td>
+                        <td><span className="dataset-progress"><span className="dataset-progress-track"><span className="bar"><i style={{ width: `${progress}%` }} /></span><span className="dataset-progress-fraction mono">{dataset.labeled_image_count.toLocaleString()}/{dataset.image_count.toLocaleString()}</span></span><span className="mono">{progress}%</span></span></td>
                         <td className="dataset-menu-cell">
                           <DatasetRowMenu
                             datasetId={dataset.id}
@@ -1110,7 +1118,7 @@ function ProjectRows({
                               <colgroup>
                                 <col className="merged-source-select-column" />
                                 <col />
-                                <col className="dataset-review-column" />
+                                <col className="dataset-storage-column" />
                                 <col className="dataset-progress-column" />
                                 <col className="dataset-menu-column" />
                               </colgroup>
@@ -1150,12 +1158,17 @@ function ProjectRows({
                                         <span>이미지 {source.image_count.toLocaleString()} · 라벨 {source.annotation_count.toLocaleString()}</span>
                                       </a>
                                     </td>
-                                    <td />
+                                    <td>
+                                      <span className="dataset-storage-usage">
+                                        <span><small>참조</small><strong className="mono">{formatBytes(source.storage_bytes)}</strong></span>
+                                        <span><small>실제 점유</small><strong className="mono">{formatBytes(source.physical_storage_bytes)}</strong></span>
+                                      </span>
+                                    </td>
                                     <td>
                                       {(() => {
-                                        const sourceStatus = statusLabel(source);
+                                        const sourceProgress = progressPercentage(source);
                                         return (
-                                          <span className="dataset-progress"><span className="dataset-progress-track"><span className="bar"><i style={{ width: `${sourceStatus.progress}%` }} /></span><span className="dataset-progress-fraction mono">{source.labeled_image_count.toLocaleString()}/{source.image_count.toLocaleString()}</span></span><span className="mono">{sourceStatus.progress}%</span></span>
+                                          <span className="dataset-progress"><span className="dataset-progress-track"><span className="bar"><i style={{ width: `${sourceProgress}%` }} /></span><span className="dataset-progress-fraction mono">{source.labeled_image_count.toLocaleString()}/{source.image_count.toLocaleString()}</span></span><span className="mono">{sourceProgress}%</span></span>
                                         );
                                       })()}
                                     </td>

@@ -36,10 +36,13 @@ def _mkdir(path: Path, *, parents: bool = False) -> None:
         raise ValueError(f"real directory is required: {path}")
 
 
-def _label_text(annotations: Sequence[AnnotationSnapshot]) -> str:
+def _label_text(
+    annotations: Sequence[AnnotationSnapshot],
+    class_id_remap: Mapping[int, int],
+) -> str:
     return "".join(
         (
-            f"{annotation.class_id} "
+            f"{class_id_remap[annotation.class_id]} "
             f"{annotation.cx:.6f} "
             f"{annotation.cy:.6f} "
             f"{annotation.w:.6f} "
@@ -85,6 +88,13 @@ def build_run_directory(
     split_mode: str,
 ) -> Path:
     """Create hardlinked images, regenerated labels, and data.yaml."""
+    # Dataset class IDs follow the project-wide catalog and may be sparse
+    # after selected-class extraction. Ultralytics files require dense IDs.
+    source_class_ids = sorted(class_names)
+    class_id_remap = {
+        source_class_id: dense_class_id
+        for dense_class_id, source_class_id in enumerate(source_class_ids)
+    }
     root = Path(out_dir)
     workdir = root / "workdir"
     images_root = workdir / "images"
@@ -117,7 +127,7 @@ def build_run_directory(
             target_stem = target_stems[image.id]
             _link_or_copy(image.file_path, image_dir / f"{target_stem}{suffix}")
             (label_dir / f"{target_stem}.txt").write_text(
-                _label_text(image.annotations),
+                _label_text(image.annotations, class_id_remap),
                 encoding="utf-8",
             )
 
@@ -128,7 +138,10 @@ def build_run_directory(
     }
     if split_mode == "3way":
         payload["test"] = "images/test"
-    payload["names"] = dict(sorted(class_names.items()))
+    payload["names"] = {
+        class_id_remap[source_class_id]: class_names[source_class_id]
+        for source_class_id in source_class_ids
+    }
     data_yaml = workdir / "data.yaml"
     data_yaml.write_text(
         yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),

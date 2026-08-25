@@ -30,12 +30,15 @@ async def test_web_safe_original_is_lossless_and_skips_display_derivative(
         source,
         batch,
         "images/train/source.jpg",
+        link_original=True,
     )
 
     assert prepared.width == 640
     assert prepared.height == 320
     assert prepared.display_relative is None
-    assert (batch / prepared.file_relative).read_bytes() == original_bytes
+    stored_original = batch / prepared.file_relative
+    assert stored_original.read_bytes() == original_bytes
+    assert stored_original.samefile(source)
     with PillowImage.open(batch / prepared.thumb_relative) as thumbnail:
         assert max(thumbnail.size) == 256
         assert thumbnail.format == "JPEG"

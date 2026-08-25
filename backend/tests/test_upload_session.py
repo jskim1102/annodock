@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import func, select
 
 from app.models import UploadJob, UploadSession
+from app.services import uploads as uploads_service
 
 
 pytestmark = pytest.mark.asyncio
@@ -64,6 +65,7 @@ async def upload_file(
 async def test_chunk_upload_is_resumable_idempotent_and_completes_to_a_job(
     client: httpx.AsyncClient,
     app,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dataset_id = await create_dataset(client)
     created = await client.post(
@@ -125,8 +127,18 @@ async def test_chunk_upload_is_resumable_idempotent_and_completes_to_a_job(
             headers={"Content-Type": "application/octet-stream"},
         )
     ).status_code == 204
+    assembly_calls = 0
+    original_assemble = uploads_service._assemble_chunks
+
+    def observe_assembly(*args, **kwargs):
+        nonlocal assembly_calls
+        assembly_calls += 1
+        return original_assemble(*args, **kwargs)
+
+    monkeypatch.setattr(uploads_service, "_assemble_chunks", observe_assembly)
     completed = await client.post(f"/api/uploads/{upload_id}/complete")
     assert completed.status_code == 202
+    assert assembly_calls == 0
     job_id = completed.json()["job_id"]
     assert (
         await client.get(f"/api/uploads/{upload_id}")
@@ -145,7 +157,15 @@ async def test_chunk_upload_is_resumable_idempotent_and_completes_to_a_job(
             / str(upload_id)
             / "source"
         )
-        assert assembled.read_bytes() == b"abcdefghijkl"
+        assert not assembled.exists()
+        assert sorted(
+            path.read_bytes()
+            for path in (assembled.parent / "chunks").glob("*.part")
+        ) == [b"abcd", b"efgh", b"ijkl"]
+
+    published = original_assemble(app.state.settings, upload)
+    assert published.read_bytes() == b"abcdefghijkl"
+    assert not (published.parent / "chunks").exists()
 
 
 async def test_chunk_validation_and_aborted_sessions_fail_closed(

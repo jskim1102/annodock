@@ -62,7 +62,10 @@ test("class conflicts pause the same upload job before dataset writes", () => {
   assert.ok(pauseIndex >= 0 && pauseIndex < completionIndex);
   assert.match(uploadPage.slice(pauseIndex, completionIndex), /return;/);
   assert.doesNotMatch(uploadPage.slice(pauseIndex, completionIndex), /setDone\(true\)/);
-  assert.match(uploadPage, /const canNavigateAfterUpload = done && labelingDataset !== null/);
+  assert.match(
+    uploadPage,
+    /const canNavigateAfterUpload = done && percentage === 100 && labelingDataset !== null/,
+  );
 });
 
 test("one choice is reused only for the same class-name mismatch", async () => {

@@ -19,7 +19,9 @@ from app.models import (
     Dataset,
     DatasetClass,
     DatasetMergeSource,
+    ExportArtifact,
     Image,
+    MediaObject,
     Project,
     ProjectClass,
     TrainingRun,
@@ -28,9 +30,10 @@ from app.models import (
 )
 from app.services.cleanup import contained_training_run_path
 from app.services.quota import (
-    dataset_accounted_bytes,
+    apply_dataset_storage_release,
     decrease_bytes_used,
     path_tree_bytes,
+    plan_dataset_storage_release,
 )
 from app.services.storage import (
     StorageBoundaryError,
@@ -134,6 +137,8 @@ class ProjectDatasetSourceRow(BaseModel):
     labeled_image_count: int
     annotation_count: int
     class_count: int
+    storage_bytes: int
+    physical_storage_bytes: int
     created_at: datetime
     status: DatasetStatus
     is_merged: bool
@@ -259,7 +264,12 @@ async def _project_rows(
                 Dataset.is_placeholder.is_(False),
                 ~Dataset.id.in_(source_dataset_ids),
             )
-            .order_by(Dataset.created_at.desc(), Dataset.id.desc())
+            .order_by(
+                Dataset.created_at.desc(),
+                Dataset.upload_group_id.desc().nulls_last(),
+                Dataset.upload_part_index.asc().nulls_last(),
+                Dataset.id.desc(),
+            )
         )
     ).all()
     visible_dataset_ids = [dataset.id for dataset, _ in dataset_rows]
@@ -319,6 +329,115 @@ async def _project_rows(
         if counted_dataset_ids
         else {}
     )
+    image_storage_bytes: dict[int, int] = (
+        dict(
+            (
+                await session.execute(
+                    select(
+                        Image.dataset_id,
+                        func.coalesce(
+                            func.sum(
+                                Image.original_bytes
+                                + Image.display_bytes
+                                + Image.thumb_bytes
+                            ),
+                            0,
+                        ),
+                    )
+                    .where(Image.dataset_id.in_(counted_dataset_ids))
+                    .group_by(Image.dataset_id)
+                )
+            ).all()
+        )
+        if counted_dataset_ids
+        else {}
+    )
+    legacy_image_storage_bytes: dict[int, int] = (
+        dict(
+            (
+                await session.execute(
+                    select(
+                        Image.dataset_id,
+                        func.coalesce(
+                            func.sum(
+                                Image.original_bytes
+                                + Image.display_bytes
+                                + Image.thumb_bytes
+                            ),
+                            0,
+                        ),
+                    )
+                    .where(
+                        Image.dataset_id.in_(counted_dataset_ids),
+                        Image.media_object_id.is_(None),
+                    )
+                    .group_by(Image.dataset_id)
+                )
+            ).all()
+        )
+        if counted_dataset_ids
+        else {}
+    )
+    media_storage_bytes: dict[int, int] = (
+        dict(
+            (
+                await session.execute(
+                    select(
+                        MediaObject.created_by_dataset_id,
+                        func.coalesce(
+                            func.sum(
+                                MediaObject.original_bytes
+                                + MediaObject.display_bytes
+                                + MediaObject.thumb_bytes
+                            ),
+                            0,
+                        ),
+                    )
+                    .where(
+                        MediaObject.created_by_dataset_id.in_(
+                            counted_dataset_ids
+                        )
+                    )
+                    .group_by(MediaObject.created_by_dataset_id)
+                )
+            ).all()
+        )
+        if counted_dataset_ids
+        else {}
+    )
+    export_storage_bytes: dict[int, int] = (
+        dict(
+            (
+                await session.execute(
+                    select(
+                        ExportArtifact.dataset_id,
+                        func.coalesce(
+                            func.sum(ExportArtifact.archive_bytes),
+                            0,
+                        ),
+                    )
+                    .where(
+                        ExportArtifact.dataset_id.in_(counted_dataset_ids)
+                    )
+                    .group_by(ExportArtifact.dataset_id)
+                )
+            ).all()
+        )
+        if counted_dataset_ids
+        else {}
+    )
+
+    def storage_bytes(dataset_id: int) -> int:
+        return int(image_storage_bytes.get(dataset_id, 0)) + int(
+            export_storage_bytes.get(dataset_id, 0)
+        )
+
+    def physical_storage_bytes(dataset_id: int) -> int:
+        return (
+            int(legacy_image_storage_bytes.get(dataset_id, 0))
+            + int(media_storage_bytes.get(dataset_id, 0))
+            + int(export_storage_bytes.get(dataset_id, 0))
+        )
 
     sources_by_merged_id: dict[int, list[ProjectDatasetSourceRow]] = {}
     for merged_dataset_id, source_dataset, source_job in source_rows:
@@ -333,6 +452,10 @@ async def _project_rows(
                 ),
                 annotation_count=source_dataset.annotation_count,
                 class_count=source_dataset.class_count,
+                storage_bytes=storage_bytes(source_dataset.id),
+                physical_storage_bytes=physical_storage_bytes(
+                    source_dataset.id
+                ),
                 created_at=source_dataset.created_at,
                 status=source_dataset.status,
                 is_merged=source_dataset.is_merged,
@@ -351,6 +474,8 @@ async def _project_rows(
                 labeled_image_count=labeled_image_counts.get(dataset.id, 0),
                 annotation_count=dataset.annotation_count,
                 class_count=dataset.class_count,
+                storage_bytes=storage_bytes(dataset.id),
+                physical_storage_bytes=physical_storage_bytes(dataset.id),
                 created_at=dataset.created_at,
                 status=dataset.status,
                 is_merged=dataset.is_merged,
@@ -736,13 +861,10 @@ async def delete_project(
         upload_ids = []
 
     storage_dir = request.app.state.settings.storage_dir
-    accounted_bytes = 0
+    release_plan = await plan_dataset_storage_release(session, dataset_ids)
+    accounted_bytes = release_plan.released_bytes
     deletion_paths = []
     for dataset in datasets:
-        accounted_bytes += await dataset_accounted_bytes(
-            session,
-            dataset.id,
-        )
         if dataset.storage_path:
             deletion_paths.append(dataset.storage_path)
     deletion_paths.extend(
@@ -766,7 +888,14 @@ async def delete_project(
         for dataset in datasets:
             await session.delete(dataset)
         await session.flush()
+        await apply_dataset_storage_release(session, release_plan)
         await session.delete(project)
+        if accounted_bytes:
+            await decrease_bytes_used(
+                session,
+                current_user.id,
+                accounted_bytes,
+            )
         await session.commit()
     except BaseException as error:
         restore_staged_deletions(reversed(staged_deletions))
@@ -780,11 +909,4 @@ async def delete_project(
         raise
 
     await asyncio.to_thread(finalize_staged_deletions, staged_deletions)
-    if accounted_bytes:
-        await decrease_bytes_used(
-            session,
-            current_user.id,
-            accounted_bytes,
-        )
-        await session.commit()
     return Response(status_code=204)

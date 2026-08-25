@@ -6,7 +6,7 @@ services:
     env_file:
       - .env
     environment:
-      DEEPLABEL_RUNTIME: docker
+      ANNODOCK_RUNTIME: docker
       STORAGE_DIR: /app/storage
     command:
       - sh

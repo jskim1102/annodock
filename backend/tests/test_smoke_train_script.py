@@ -114,9 +114,9 @@ def test_smoke_auth_registers_once_on_a_fresh_environment() -> None:
 def test_training_imgsz_defaults_and_rejects_invalid_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("DEEPLABEL_SMOKE_IMGSZ", raising=False)
+    monkeypatch.delenv("ANNODOCK_SMOKE_IMGSZ", raising=False)
     assert smoke_train._training_imgsz() == 640
-    monkeypatch.setenv("DEEPLABEL_SMOKE_IMGSZ", "not-a-size")
+    monkeypatch.setenv("ANNODOCK_SMOKE_IMGSZ", "not-a-size")
     with pytest.raises(AssertionError, match="must be an integer"):
         smoke_train._training_imgsz()
 
@@ -124,9 +124,9 @@ def test_training_imgsz_defaults_and_rejects_invalid_override(
 def test_training_epochs_defaults_and_rejects_out_of_range_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("DEEPLABEL_SMOKE_EPOCHS", raising=False)
+    monkeypatch.delenv("ANNODOCK_SMOKE_EPOCHS", raising=False)
     assert smoke_train._training_epochs() == 2
-    monkeypatch.setenv("DEEPLABEL_SMOKE_EPOCHS", "1")
+    monkeypatch.setenv("ANNODOCK_SMOKE_EPOCHS", "1")
     with pytest.raises(AssertionError, match="between 2 and 100"):
         smoke_train._training_epochs()
 
@@ -134,12 +134,16 @@ def test_training_epochs_defaults_and_rejects_out_of_range_override(
 def test_host_database_url_rewrites_only_shared_container_endpoint() -> None:
     container_url = (
         "postgresql+asyncpg://postgres:secret@"
-        "harness-shared-postgres:5432/deeplabel"
+        "harness-shared-postgres:5432/annodock"
     )
 
     assert smoke_train._host_database_url({"DATABASE_URL": container_url}) == (
-        "postgresql+asyncpg://postgres:secret@localhost:5435/deeplabel"
+        "postgresql+asyncpg://postgres:secret@localhost:5435/annodock"
     )
+
+
+def test_smoke_temp_prefix_uses_annodock_namespace() -> None:
+    assert smoke_train.SMOKE_TEMP_PREFIX == "annodock-smoke-"
 
 
 def test_storage_dir_resolves_relative_to_backend_root() -> None:
