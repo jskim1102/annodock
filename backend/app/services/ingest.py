@@ -78,6 +78,7 @@ from app.services.uploads import (
     assemble_uploads,
     assembled_upload_path,
     upload_directory,
+    upload_ids_match,
 )
 from app.services.validate import RejectedFile, validate_image_file
 from app.services.zipsafe import ZipIssue, ZipLimits, ZipSafetyError
@@ -1631,7 +1632,7 @@ async def run_upload_batch_job(
             uploads = (
                 await session.scalars(
                     select(UploadSession)
-                    .where(UploadSession.id.in_(upload_ids))
+                    .where(upload_ids_match(upload_ids))
                     .order_by(UploadSession.id)
                 )
             ).all()
@@ -1646,15 +1647,23 @@ async def run_upload_batch_job(
             total=len(uploads),
             processed=0,
         )
+        last_progress_publish = 0.0
         for index, upload in enumerate(uploads, start=1):
             await assemble_uploads(settings, [upload])
-            await transition_job(
-                session_factory,
-                job_id,
-                "assembling",
-                total=len(uploads),
-                processed=index,
-            )
+            now = time.monotonic()
+            if (
+                now - last_progress_publish
+                >= PROGRESS_PUBLISH_INTERVAL_SECONDS
+                or index == len(uploads)
+            ):
+                last_progress_publish = now
+                await transition_job(
+                    session_factory,
+                    job_id,
+                    "assembling",
+                    total=len(uploads),
+                    processed=index,
+                )
 
         groups: list[list[CollectedFile]] = []
         zip_issues: list[ZipIssue] = []

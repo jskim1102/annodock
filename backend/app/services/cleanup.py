@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.db import set_local_lock_timeout
 from app.models import Dataset, TrainingRun, UploadJob, UploadSession
 from app.services.quota import decrease_bytes_used, path_tree_bytes
+from app.services.uploads import upload_ids_match
 from app.services.storage import (
     StagedDeletion,
     StorageBoundaryError,
@@ -183,11 +184,42 @@ async def sweep_upload_storage(
                     if isinstance(item, int) and item > 0
                 }
             )
+            # Unlocked staleness pre-check: fresh non-terminal groups skip
+            # the FOR UPDATE + tree walk below, so a large in-flight job's
+            # progress commits never stall behind sweep locks. Anything
+            # stale or terminal-looking falls through to the locked path,
+            # which stays authoritative.
+            terminal_guess = (
+                snapshot_job.state in {"done", "failed"}
+                if snapshot_job is not None
+                else upload.state == "aborted"
+            )
+            if not terminal_guess:
+                awaiting_guess = (
+                    snapshot_job is not None
+                    and snapshot_job.state == "awaiting_class_resolution"
+                )
+                guess_ttl = timedelta(
+                    days=resolution_ttl_days if awaiting_guess else 0,
+                    hours=0 if awaiting_guess else ttl_hours,
+                )
+                guess_mtimes = [
+                    await asyncio.to_thread(_latest_tree_mtime, path)
+                    for item in group_ids
+                    if (path := upload_root / str(item)).is_dir()
+                ]
+                latest_guess = max(
+                    guess_mtimes,
+                    default=observed_at.timestamp(),
+                )
+                if latest_guess >= (observed_at - guess_ttl).timestamp():
+                    processed_ids.update(group_ids)
+                    continue
             uploads = list(
                 (
                     await session.scalars(
                         select(UploadSession)
-                        .where(UploadSession.id.in_(group_ids))
+                        .where(upload_ids_match(group_ids))
                         .order_by(UploadSession.id)
                         .with_for_update()
                         .execution_options(populate_existing=True)

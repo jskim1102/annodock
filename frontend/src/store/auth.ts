@@ -67,6 +67,22 @@ function publish(next: AuthSnapshot) {
   listeners.forEach((listener) => listener());
 }
 
+function sameUser(left: AuthUser | null, right: AuthUser | null): boolean {
+  if (left === right) return true;
+  if (left === null || right === null) return false;
+  return left.id === right.id
+    && left.email === right.email
+    && left.username === right.username
+    && left.identities.length === right.identities.length
+    && left.identities.every((identity, index) => identity === right.identities[index]);
+}
+
+function sameSnapshot(left: AuthSnapshot, right: AuthSnapshot): boolean {
+  return left.accessToken === right.accessToken
+    && left.refreshToken === right.refreshToken
+    && sameUser(left.user, right.user);
+}
+
 function persist(next: AuthSnapshot) {
   // One JSON record keeps a rotated access/refresh pair from being restored
   // half-updated after a reload.
@@ -79,6 +95,25 @@ function persist(next: AuthSnapshot) {
 }
 
 export function getAuthSnapshot(): AuthSnapshot {
+  return snapshot;
+}
+
+export function syncAuthSessionFromStorage(
+  preserveCurrentWhenEmpty = false,
+): AuthSnapshot {
+  const stored = loadSnapshot();
+  if (
+    preserveCurrentWhenEmpty
+    && stored.accessToken === null
+    && stored.refreshToken === null
+    && snapshot.accessToken !== null
+    && snapshot.refreshToken !== null
+  ) return snapshot;
+  if (sameSnapshot(snapshot, stored)) return snapshot;
+  if (snapshot.user?.id !== stored.user?.id || stored.accessToken === null) {
+    clearAuthenticatedResourceCache();
+  }
+  publish(stored);
   return snapshot;
 }
 
@@ -120,4 +155,10 @@ export function subscribeAuth(listener: () => void): () => void {
 
 export function useAuthSession(): AuthSnapshot {
   return useSyncExternalStore(subscribeAuth, getAuthSnapshot, getAuthSnapshot);
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", () => {
+    syncAuthSessionFromStorage();
+  });
 }

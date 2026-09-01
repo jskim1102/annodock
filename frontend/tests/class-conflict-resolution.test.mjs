@@ -58,7 +58,7 @@ test("class conflicts pause the same upload job before dataset writes", () => {
   const pauseIndex = uploadPage.indexOf(
     'while (terminal.state === "awaiting_class_resolution")',
   );
-  const completionIndex = uploadPage.indexOf("completedBatches += 1;");
+  const completionIndex = uploadPage.indexOf("completedWork += unitBytes;");
   assert.ok(pauseIndex >= 0 && pauseIndex < completionIndex);
   assert.match(uploadPage.slice(pauseIndex, completionIndex), /return;/);
   assert.doesNotMatch(uploadPage.slice(pauseIndex, completionIndex), /setDone\(true\)/);
@@ -149,7 +149,7 @@ test("the upload loop automatically submits fully remembered conflicts", () => {
   assert.match(uploadPage, /const classResolutionPreferencesRef = useRef/);
   assert.match(uploadPage, /resolutionsFromPreferences\([\s\S]*terminal\.class_resolution/);
   assert.match(uploadPage, /while \(terminal\.state === "awaiting_class_resolution"\)/);
-  assert.match(uploadPage, /await resolveJobClassConflicts\(jobId/);
+  assert.match(uploadPage, /await resolveJobClassConflicts\(activeJobId/);
   assert.match(uploadPage, /자동 적용/);
 });
 

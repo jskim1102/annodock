@@ -1,5 +1,5 @@
 import { refreshAuthSession } from "./auth";
-import { clearAuthSession, getAuthSnapshot } from "../store/auth";
+import { getAuthSnapshot } from "../store/auth";
 
 export type DatasetStatus = "pending" | "processing" | "ready" | "failed" | "archived";
 export type JobState =
@@ -225,6 +225,16 @@ export class ApiError extends Error {
   }
 }
 
+export class ApiRequestTimeoutError extends ApiError {
+  constructor() {
+    super(
+      0,
+      "서버 응답 제한 시간을 초과했습니다. 업로드를 일시 중지했습니다. 이어 올리기를 다시 시도해 주세요.",
+    );
+    this.name = "ApiRequestTimeoutError";
+  }
+}
+
 async function errorFromResponse(response: Response): Promise<ApiError> {
   let message = `요청 실패 (${response.status})`;
   let detail: unknown;
@@ -250,7 +260,11 @@ export async function responseOrThrow(response: Response): Promise<Response> {
   return response;
 }
 
-function authorizedInit(init: RequestInit | undefined, accessToken: string | null) {
+function authorizedInit(
+  init: RequestInit | undefined,
+  accessToken: string | null,
+  signal: AbortSignal,
+): RequestInit {
   const headers = new Headers(init?.headers);
   if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
   return {
@@ -260,7 +274,14 @@ function authorizedInit(init: RequestInit | undefined, accessToken: string | nul
     // authenticated response after a different user logs in on the same origin.
     cache: init?.cache ?? "no-store",
     headers,
+    signal,
   };
+}
+
+const API_REQUEST_DEADLINE_MS = 120_000;
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("요청이 취소되었습니다.", "AbortError");
 }
 
 async function fetchApiOnce(
@@ -272,7 +293,47 @@ async function fetchApiOnce(
   if (url.origin !== window.location.origin || !url.pathname.startsWith("/api/")) {
     throw new Error("apiFetch는 동일 오리진 /api 경로만 호출할 수 있습니다.");
   }
-  return fetch(path, authorizedInit(init, accessToken));
+
+  const callerSignal = init?.signal;
+  if (callerSignal?.aborted) throw abortReason(callerSignal);
+
+  const controller = new AbortController();
+  const timeoutError = new ApiRequestTimeoutError();
+  let timedOut = false;
+  let timeoutId: number | undefined;
+  let removeCallerAbort: (() => void) | undefined;
+
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort(timeoutError);
+      reject(timeoutError);
+    }, API_REQUEST_DEADLINE_MS);
+  });
+  const callerAbort = callerSignal
+    ? new Promise<never>((_resolve, reject) => {
+        const onAbort = () => {
+          const reason = abortReason(callerSignal);
+          controller.abort(reason);
+          reject(reason);
+        };
+        callerSignal.addEventListener("abort", onAbort, { once: true });
+        removeCallerAbort = () => callerSignal.removeEventListener("abort", onAbort);
+      })
+    : null;
+
+  try {
+    const request = fetch(path, authorizedInit(init, accessToken, controller.signal));
+    return await Promise.race(
+      callerAbort ? [request, timeout, callerAbort] : [request, timeout],
+    );
+  } catch (error: unknown) {
+    if (timedOut) throw timeoutError;
+    throw error;
+  } finally {
+    if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+    removeCallerAbort?.();
+  }
 }
 
 async function retryApiOnce(
@@ -280,9 +341,7 @@ async function retryApiOnce(
   init: RequestInit | undefined,
   accessToken: string,
 ): Promise<Response> {
-  const retried = await fetchApiOnce(path, init, accessToken);
-  if (retried.status === 401) clearAuthSession();
-  return retried;
+  return fetchApiOnce(path, init, accessToken);
 }
 
 export async function apiFetch(
@@ -298,19 +357,14 @@ export async function apiFetch(
     // Another request already rotated the pair while this request was in flight.
     return retryApiOnce(path, init, current.accessToken);
   }
-  if (!current.refreshToken) {
-    clearAuthSession();
-    return response;
-  }
-
-  try {
-    const refreshedAccess = await refreshAuthSession();
-    // The original request is retried exactly once. A second 401 is returned to
-    // the caller rather than entering another refresh loop.
-    return retryApiOnce(path, init, refreshedAccess);
-  } catch {
-    return response;
-  }
+  // The refresh credential lives in an httpOnly cookie, so recovery remains
+  // possible even if this tab's JavaScript/localStorage copy disappeared.
+  // Refresh errors deliberately propagate: callers can pause and preserve a
+  // resumable operation instead of displaying a frozen progress percentage.
+  const refreshedAccess = await refreshAuthSession(tokenUsed);
+  // The original request is retried exactly once. A second 401 is returned to
+  // the caller rather than entering another refresh loop.
+  return retryApiOnce(path, init, refreshedAccess);
 }
 
 export async function requestJson<T>(

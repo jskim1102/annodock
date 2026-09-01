@@ -35,7 +35,7 @@ const appCss = await readFile(
   "utf8",
 );
 
-test("ETA uses a smoothed rate and resets between upload phases", async () => {
+test("ETA waits for a representative window and resets between upload phases", async () => {
   const { updateProgressEstimate } = await loadUploadProgress();
 
   const first = updateProgressEstimate(null, {
@@ -52,39 +52,85 @@ test("ETA uses a smoothed rate and resets between upload phases", async () => {
     total: 100,
     atMs: 1000,
   });
-  assert.equal(steady.remainingSeconds, 9);
+  assert.equal(steady.remainingSeconds, null);
 
-  const faster = updateProgressEstimate(steady.state, {
+  const stillWarming = updateProgressEstimate(steady.state, {
     key: "transfer:1",
-    completed: 30,
+    completed: 49,
     total: 100,
-    atMs: 2000,
+    atMs: 4999,
   });
-  assert.ok(faster.remainingSeconds >= 5 && faster.remainingSeconds <= 7);
+  assert.equal(stillWarming.remainingSeconds, null);
 
-  const nextPhase = updateProgressEstimate(faster.state, {
+  const stable = updateProgressEstimate(stillWarming.state, {
+    key: "transfer:1",
+    completed: 50,
+    total: 100,
+    atMs: 5000,
+  });
+  assert.equal(stable.remainingSeconds, 5);
+
+  const nextPhase = updateProgressEstimate(stable.state, {
     key: "processing:9",
     completed: 1,
     total: 100,
-    atMs: 2100,
+    atMs: 5100,
   });
   assert.equal(nextPhase.remainingSeconds, null);
 
-  const paused = updateProgressEstimate(steady.state, {
+  const paused = updateProgressEstimate(stable.state, {
     key: "transfer:1",
-    completed: 10,
+    completed: 50,
     total: 100,
-    atMs: 11_000,
+    atMs: 20_000,
   });
+  assert.equal(paused.remainingSeconds, null);
   const resumed = updateProgressEstimate(paused.state, {
     key: "transfer:1",
-    completed: 20,
+    completed: 60,
     total: 100,
-    atMs: 12_000,
+    atMs: 21_000,
   });
   assert.ok(
-    resumed.remainingSeconds > 9,
+    resumed.remainingSeconds > 4,
     "a long stall must not be mistaken for a one-second transfer burst",
+  );
+});
+
+test("ETA ignores alternating tiny labels and image completion bursts", async () => {
+  const { updateProgressEstimate } = await loadUploadProgress();
+  const total = 113_945_839_254;
+  const sizes = [1_014_945, 37, 1_011_727, 37, 971_341, 37, 1_035_064, 37];
+  let estimate = updateProgressEstimate(null, {
+    key: "transfer:large",
+    completed: 0,
+    total,
+    atMs: 0,
+  });
+  let completed = 0;
+  let atMs = 0;
+  const observed = [];
+
+  for (let index = 0; index < 400; index += 1) {
+    completed += sizes[index % sizes.length];
+    // A large image often finishes in the same concurrent burst, while the
+    // following tiny label is the next isolated completion event.
+    atMs += index % 2 === 0 ? 8 : 92;
+    estimate = updateProgressEstimate(estimate.state, {
+      key: "transfer:large",
+      completed,
+      total,
+      atMs,
+    });
+    if (estimate.remainingSeconds !== null) {
+      observed.push(estimate.remainingSeconds);
+    }
+  }
+
+  assert.ok(observed.length > 0);
+  assert.ok(
+    Math.max(...observed) / Math.min(...observed) < 1.03,
+    "per-file completion order must not make a steady upload ETA jump by hours",
   );
 });
 

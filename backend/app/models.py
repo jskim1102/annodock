@@ -152,6 +152,9 @@ class Dataset(Base):
     upload_sessions: Mapped[list[UploadSession]] = relationship(
         back_populates="dataset", cascade="all, delete-orphan", passive_deletes=True
     )
+    upload_batches: Mapped[list[UploadBatch]] = relationship(
+        back_populates="dataset", cascade="all, delete-orphan", passive_deletes=True
+    )
     upload_jobs: Mapped[list[UploadJob]] = relationship(
         back_populates="dataset", cascade="all, delete-orphan", passive_deletes=True
     )
@@ -336,13 +339,80 @@ class Annotation(Base):
     image: Mapped[Image] = relationship(back_populates="annotations")
 
 
+class UploadBatch(Base):
+    """Durable manifest for one logical, potentially very large upload."""
+
+    __tablename__ = "upload_batches"
+    __table_args__ = (
+        CheckConstraint(
+            "expected_file_count > 0",
+            name="ck_upload_batches_expected_file_count_positive",
+        ),
+        CheckConstraint(
+            "expected_total_size >= 0",
+            name="ck_upload_batches_expected_total_size_nonnegative",
+        ),
+        CheckConstraint(
+            "expected_extracted_size >= 0",
+            name="ck_upload_batches_expected_extracted_size_nonnegative",
+        ),
+        CheckConstraint(
+            "largest_file_size >= 0 "
+            "AND largest_file_size <= expected_total_size",
+            name="ck_upload_batches_largest_file_size_valid",
+        ),
+        Index("ix_upload_batches_dataset_id", "dataset_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    dataset_id: Mapped[int] = mapped_column(
+        ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False
+    )
+    expected_file_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_total_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    expected_extracted_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    largest_file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="open", server_default="open"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    dataset: Mapped[Dataset] = relationship(back_populates="upload_batches")
+    upload_sessions: Mapped[list[UploadSession]] = relationship(
+        back_populates="upload_batch", passive_deletes=True
+    )
+    job: Mapped[UploadJob | None] = relationship(
+        back_populates="upload_batch", passive_deletes=True, uselist=False
+    )
+
+
 class UploadSession(Base):
     __tablename__ = "upload_sessions"
+    __table_args__ = (
+        UniqueConstraint(
+            "upload_batch_id",
+            "file_key",
+            name="uq_upload_sessions_batch_file_key",
+        ),
+        Index("ix_upload_sessions_upload_batch_id", "upload_batch_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     dataset_id: Mapped[int] = mapped_column(
         ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False
     )
+    upload_batch_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("upload_batches.id", ondelete="CASCADE"), nullable=True
+    )
+    file_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     filename: Mapped[str] = mapped_column(String(1024), nullable=False)
     size: Mapped[int] = mapped_column(Integer, nullable=False)
     chunk_size: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -358,6 +428,9 @@ class UploadSession(Base):
     )
 
     dataset: Mapped[Dataset] = relationship(back_populates="upload_sessions")
+    upload_batch: Mapped[UploadBatch | None] = relationship(
+        back_populates="upload_sessions"
+    )
 
 
 class UploadJob(Base):
@@ -375,11 +448,18 @@ class UploadJob(Base):
             "image_processed >= 0",
             name="ck_upload_jobs_image_processed_nonnegative",
         ),
+        UniqueConstraint(
+            "upload_batch_id",
+            name="uq_upload_jobs_upload_batch_id",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     dataset_id: Mapped[int] = mapped_column(
         ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False
+    )
+    upload_batch_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("upload_batches.id", ondelete="CASCADE"), nullable=True
     )
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     state: Mapped[str] = mapped_column(
@@ -433,6 +513,9 @@ class UploadJob(Base):
     )
 
     dataset: Mapped[Dataset] = relationship(back_populates="upload_jobs")
+    upload_batch: Mapped[UploadBatch | None] = relationship(
+        back_populates="job"
+    )
     issues: Mapped[list[ImportIssue]] = relationship(
         back_populates="job", cascade="all, delete-orphan", passive_deletes=True
     )

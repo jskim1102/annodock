@@ -3,6 +3,7 @@ import {
   getAuthSnapshot,
   setAuthSession,
   setAuthTokens,
+  syncAuthSessionFromStorage,
   type AuthTokens,
   type AuthUser,
 } from "../store/auth";
@@ -23,6 +24,15 @@ export class AuthApiError extends Error {
   ) {
     super(message);
     this.name = "AuthApiError";
+  }
+}
+
+export class AuthRefreshTimeoutError extends Error {
+  constructor() {
+    super(
+      "인증 갱신 제한 시간을 초과했습니다. 다른 Annodock 탭을 닫고 이어 올리기를 다시 시도해 주세요.",
+    );
+    this.name = "AuthRefreshTimeoutError";
   }
 }
 
@@ -105,10 +115,10 @@ export async function login(
   ));
 }
 
-export async function refreshTokens(refreshToken: string): Promise<AuthTokens> {
+export async function refreshTokens(signal?: AbortSignal): Promise<AuthTokens> {
   return assertTokenPair(await authJson<AuthTokens>(
     "/auth/token/refresh",
-    jsonPost({ refresh_token: refreshToken }),
+    { method: "POST", signal },
   ));
 }
 
@@ -127,19 +137,97 @@ export async function establishAuthSession(tokens: AuthTokens): Promise<AuthUser
 }
 
 let refreshFlight: Promise<string> | null = null;
+const AUTH_REFRESH_LOCK = "annodock:auth-refresh";
+const AUTH_REFRESH_DEADLINE_MS = 15_000;
 
-export function refreshAuthSession(): Promise<string> {
+function withRefreshLock<T>(
+  signal: AbortSignal,
+  callback: () => Promise<T>,
+): Promise<T> {
+  if (typeof navigator === "undefined" || !navigator.locks) return callback();
+  return navigator.locks.request(
+    AUTH_REFRESH_LOCK,
+    { mode: "exclusive", signal },
+    () => {
+      if (signal.aborted) throw signal.reason;
+      return callback();
+    },
+  );
+}
+
+async function withRefreshDeadline<T>(
+  callback: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  const timeoutError = new AuthRefreshTimeoutError();
+  let timedOut = false;
+  let timeoutId: number | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort(timeoutError);
+      reject(timeoutError);
+    }, AUTH_REFRESH_DEADLINE_MS);
+  });
+  try {
+    return await Promise.race([callback(controller.signal), timeout]);
+  } catch (error: unknown) {
+    if (timedOut) throw timeoutError;
+    throw error;
+  } finally {
+    if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+  }
+}
+
+function isTerminalRefreshError(error: unknown): boolean {
+  return error instanceof AuthApiError
+    && [400, 401, 403, 422].includes(error.status);
+}
+
+export function refreshAuthSession(staleAccessToken?: string | null): Promise<string> {
   if (refreshFlight) return refreshFlight;
-  const refreshToken = getAuthSnapshot().refreshToken;
-  if (!refreshToken) return Promise.reject(new Error("refresh token이 없습니다."));
+  const observedAccessToken = staleAccessToken === undefined
+    ? getAuthSnapshot().accessToken
+    : staleAccessToken;
 
-  refreshFlight = refreshTokens(refreshToken)
-    .then((tokens) => {
-      setAuthTokens(tokens);
-      return tokens.access_token;
+  refreshFlight = withRefreshDeadline((signal) => (
+    withRefreshLock(signal, async () => {
+      const synchronized = syncAuthSessionFromStorage(true);
+      if (
+        synchronized.accessToken
+        && synchronized.accessToken !== observedAccessToken
+      ) return synchronized.accessToken;
+
+      try {
+        // The auth service owns refresh rotation in an httpOnly cookie. Keeping
+        // that cookie as the one presented credential prevents stale tabs from
+        // replaying an older JavaScript copy and burning the rotation chain.
+        const tokens = await refreshTokens(signal);
+        setAuthTokens(tokens);
+        return tokens.access_token;
+      } catch (error: unknown) {
+        // A different tab may have completed rotation while this request was in
+        // flight. Adopt that pair before treating the refresh as a real failure.
+        const latest = syncAuthSessionFromStorage(true);
+        if (latest.accessToken && latest.accessToken !== observedAccessToken) {
+          return latest.accessToken;
+        }
+        // Network/5xx failures are not proof that the refresh credential is bad.
+        // Preserve the durable upload session so the same operation can resume.
+        if (isTerminalRefreshError(error)) clearAuthSession();
+        throw error;
+      }
     })
+  ))
     .catch((error: unknown) => {
-      clearAuthSession();
+      if (error instanceof AuthRefreshTimeoutError) {
+        // The lock holder may have rotated the token immediately before our
+        // deadline. Prefer that durable result over pausing a healthy upload.
+        const latest = syncAuthSessionFromStorage(true);
+        if (latest.accessToken && latest.accessToken !== observedAccessToken) {
+          return latest.accessToken;
+        }
+      }
       throw error;
     })
     .finally(() => {

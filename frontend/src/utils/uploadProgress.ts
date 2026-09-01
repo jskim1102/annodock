@@ -11,6 +11,8 @@ export interface ProgressEstimateState {
   lastCompleted: number;
   lastSampleAtMs: number;
   lastProgressAtMs: number;
+  windowStartedCompleted: number;
+  windowStartedAtMs: number;
   smoothedRatePerSecond: number | null;
 }
 
@@ -19,7 +21,8 @@ export interface ProgressEstimate {
   remainingSeconds: number | null;
 }
 
-const RATE_SMOOTHING_WEIGHT = 0.35;
+const RATE_WINDOW_MS = 5_000;
+const RATE_SMOOTHING_WEIGHT = 0.2;
 const STALE_RATE_AFTER_MS = 15_000;
 
 function normalizedSample(sample: ProgressSample) {
@@ -39,6 +42,8 @@ function initialEstimate(sample: ProgressSample): ProgressEstimate {
       lastCompleted: sample.completed,
       lastSampleAtMs: sample.atMs,
       lastProgressAtMs: sample.atMs,
+      windowStartedCompleted: sample.completed,
+      windowStartedAtMs: sample.atMs,
       smoothedRatePerSecond: null,
     },
     remainingSeconds: sample.total > 0 && sample.completed >= sample.total
@@ -75,26 +80,33 @@ export function updateProgressEstimate(
   }
 
   const completedDelta = sample.completed - previous.lastCompleted;
-  const elapsedSeconds = (sample.atMs - previous.lastSampleAtMs) / 1000;
+  const windowDelta = sample.completed - previous.windowStartedCompleted;
+  const windowElapsedMs = sample.atMs - previous.windowStartedAtMs;
   let smoothedRate = previous.smoothedRatePerSecond;
   let lastProgressAtMs = previous.lastProgressAtMs;
-  let lastSampleAtMs = previous.lastSampleAtMs;
-  if (completedDelta > 0 && elapsedSeconds > 0) {
-    const currentRate = completedDelta / elapsedSeconds;
+  let windowStartedCompleted = previous.windowStartedCompleted;
+  let windowStartedAtMs = previous.windowStartedAtMs;
+  if (completedDelta > 0) {
+    lastProgressAtMs = sample.atMs;
+  }
+  if (windowDelta > 0 && windowElapsedMs >= RATE_WINDOW_MS) {
+    const currentRate = windowDelta / (windowElapsedMs / 1000);
     smoothedRate = smoothedRate === null
       ? currentRate
       : smoothedRate * (1 - RATE_SMOOTHING_WEIGHT)
         + currentRate * RATE_SMOOTHING_WEIGHT;
-    lastProgressAtMs = sample.atMs;
-    lastSampleAtMs = sample.atMs;
+    windowStartedCompleted = sample.completed;
+    windowStartedAtMs = sample.atMs;
   }
 
   const state: ProgressEstimateState = {
     key: sample.key,
     total: sample.total,
     lastCompleted: sample.completed,
-    lastSampleAtMs,
+    lastSampleAtMs: sample.atMs,
     lastProgressAtMs,
+    windowStartedCompleted,
+    windowStartedAtMs,
     smoothedRatePerSecond: smoothedRate,
   };
   if (

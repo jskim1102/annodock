@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from sqlalchemy import func, select
-from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy import Integer, any_, bindparam, delete, func, select
+from sqlalchemy.dialects.postgresql import ARRAY, insert as postgresql_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
@@ -279,32 +279,28 @@ async def plan_dataset_storage_release(
             ExportArtifact.dataset_id.in_(target_ids)
         )
     )
-    media_object_ids = list(
+    target_media_ids = (
+        select(Image.media_object_id.label("media_object_id"))
+        .where(
+            Image.dataset_id.in_(target_ids),
+            Image.media_object_id.is_not(None),
+        )
+        .distinct()
+        .subquery()
+    )
+    media_objects = list(
         (
             await session.scalars(
-                select(Image.media_object_id)
+                select(MediaObject)
                 .where(
-                    Image.dataset_id.in_(target_ids),
-                    Image.media_object_id.is_not(None),
+                    MediaObject.id.in_(
+                        select(target_media_ids.c.media_object_id)
+                    )
                 )
-                .distinct()
-                .order_by(Image.media_object_id)
+                .order_by(MediaObject.id)
+                .with_for_update()
             )
         ).all()
-    )
-    media_objects = (
-        list(
-            (
-                await session.scalars(
-                    select(MediaObject)
-                    .where(MediaObject.id.in_(media_object_ids))
-                    .order_by(MediaObject.id)
-                    .with_for_update()
-                )
-            ).all()
-        )
-        if media_object_ids
-        else []
     )
     survivor_rows = (
         (
@@ -313,14 +309,18 @@ async def plan_dataset_storage_release(
                     Image.media_object_id,
                     func.min(Image.dataset_id),
                 )
+                .join(
+                    target_media_ids,
+                    target_media_ids.c.media_object_id
+                    == Image.media_object_id,
+                )
                 .where(
-                    Image.media_object_id.in_(media_object_ids),
                     Image.dataset_id.not_in(target_ids),
                 )
                 .group_by(Image.media_object_id)
             )
         ).all()
-        if media_object_ids
+        if media_objects
         else []
     )
     surviving_dataset_by_object = {
@@ -358,8 +358,23 @@ async def apply_dataset_storage_release(
 ) -> None:
     """Remove object metadata after target image rows have been deleted."""
 
-    for media_object in plan.orphan_media_objects:
-        await session.delete(media_object)
+    orphan_ids = [media_object.id for media_object in plan.orphan_media_objects]
+    if not orphan_ids:
+        return
+    await session.execute(
+        delete(MediaObject)
+        .where(
+            MediaObject.id
+            == any_(
+                bindparam(
+                    "orphan_media_object_ids",
+                    value=orphan_ids,
+                    type_=ARRAY(Integer),
+                )
+            )
+        )
+        .execution_options(synchronize_session=False)
+    )
 
 
 def estimate_training_artifact_bytes(

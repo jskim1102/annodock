@@ -42,7 +42,7 @@ from app.services.storage import (
     restore_staged_deletions,
     stage_deletions_async,
 )
-from app.services.uploads import upload_directory
+from app.services.uploads import existing_upload_directories
 
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -868,8 +868,11 @@ async def delete_project(
         if dataset.storage_path:
             deletion_paths.append(dataset.storage_path)
     deletion_paths.extend(
-        upload_directory(request.app.state.settings, upload_id)
-        for upload_id in upload_ids
+        await asyncio.to_thread(
+            existing_upload_directories,
+            request.app.state.settings,
+            upload_ids,
+        )
     )
     for run in runs:
         accounted_bytes += await _run_accounted_bytes(request, run)
