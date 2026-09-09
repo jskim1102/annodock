@@ -200,9 +200,10 @@ async def test_extract_creates_visible_independent_filtered_snapshot(
         "annotation_count": 3,
         "class_count": 1,
         "created_at": extracted["created_at"],
-        "status": "ready",
-        "is_merged": False,
-    }
+            "status": "ready",
+            "is_merged": False,
+            "merge_purpose": None,
+        }
 
     classes = await client.get(f"/api/datasets/{extracted_id}/classes")
     assert classes.status_code == 200

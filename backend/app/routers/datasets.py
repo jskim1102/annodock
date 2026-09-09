@@ -38,6 +38,7 @@ from app.services.dataset_merge import (
     extend_merged_dataset,
     merge_datasets,
 )
+from app.services.jobs import enqueue_dataset_merge_job
 from app.services.quota import (
     apply_dataset_storage_release,
     decrease_bytes_used,
@@ -56,6 +57,7 @@ from app.services.uploads import upload_directory
 router = APIRouter(prefix="/api/datasets", tags=["datasets"])
 Session = Annotated[AsyncSession, Depends(get_session)]
 DatasetStatus = Literal["pending", "processing", "ready", "failed"]
+MergePurpose = Literal["merge", "train"]
 
 
 class DatasetName(BaseModel):
@@ -105,6 +107,7 @@ class DatasetRow(BaseModel):
     created_at: datetime
     status: DatasetStatus
     is_merged: bool
+    merge_purpose: MergePurpose | None
 
 
 class SplitRow(BaseModel):
@@ -154,6 +157,7 @@ class DatasetRenamed(BaseModel):
 
 class DatasetMergeRequest(DatasetName):
     dataset_ids: list[int] = Field(min_length=2, max_length=200)
+    purpose: MergePurpose = "merge"
 
     @field_validator("dataset_ids")
     @classmethod
@@ -167,6 +171,7 @@ class DatasetMergeRequest(DatasetName):
 
 class DatasetMergeSourcesRequest(BaseModel):
     dataset_ids: list[int] = Field(min_length=1, max_length=200)
+    purpose: MergePurpose = "merge"
 
     @field_validator("dataset_ids")
     @classmethod
@@ -463,6 +468,7 @@ async def create_merged_dataset(
             name=body.name,
             dataset_ids=body.dataset_ids,
             owner_id=current_user.id,
+            purpose=body.purpose,
         )
     except DatasetMergeNotFound as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
@@ -470,10 +476,21 @@ async def create_merged_dataset(
         raise HTTPException(status_code=409, detail=error.detail) from error
     except IntegrityError as error:
         raise _duplicate_name() from error
-    response.status_code = 200 if result.reused else 201
+    if (
+        result.job is not None
+        and result.job.state == "queued"
+        and request.app.state.auto_start_jobs
+    ):
+        enqueue_dataset_merge_job(request.app, result.job.id)
+    if result.reused:
+        response.status_code = 200
+    elif result.job is not None:
+        response.status_code = 202
+    else:
+        response.status_code = 201
     return DatasetListRow(
         **DatasetRow.model_validate(result.dataset).model_dump(),
-        active_job=None,
+        active_job=_active_job(result.job),
         source_datasets=[_source_row(source, None) for source in result.sources],
     )
 
@@ -528,6 +545,7 @@ async def add_merged_dataset_sources(
             merged_dataset_id=dataset_id,
             dataset_ids=body.dataset_ids,
             owner_id=current_user.id,
+            purpose=body.purpose,
         )
     except DatasetMergeNotFound as error:
         raise HTTPException(status_code=404, detail=str(error)) from error

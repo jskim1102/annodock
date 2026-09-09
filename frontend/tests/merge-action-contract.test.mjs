@@ -18,11 +18,14 @@ const appCss = await readFile(
 test("the API client merges every selected source dataset", () => {
   assert.match(client, /export interface DatasetMergeInput/);
   assert.match(client, /dataset_ids:\s*number\[\]/);
-  assert.match(client, /export function mergeDatasets/);
+  assert.match(client, /purpose:\s*"merge"\s*\|\s*"train"/);
+  assert.match(client, /merge_purpose:\s*"merge"\s*\|\s*"train"\s*\|\s*null/);
+  assert.match(client, /export async function mergeDatasets/);
   assert.match(
     client,
-    /requestJson<DatasetListItem>\("\/api\/datasets\/merge",\s*jsonInit\("POST", input\)\)/,
+    /requestJson<DatasetListItem>\(\s*"\/api\/datasets\/merge",\s*jsonInit\("POST", input\),\s*\)/,
   );
+  assert.match(client, /return waitForMergedDataset\(queued\)/);
   assert.match(client, /export function extendMergedDataset/);
   assert.match(
     client,
@@ -82,6 +85,14 @@ test("multiple merged datasets require an explicit target radio choice", () => {
 
 test("a merged result drives one train route or a plain merge", () => {
   assert.match(projectsPage, /await mergeDatasets/);
+  assert.match(
+    projectsPage,
+    /await extendMergedDataset\(targetDataset\.id, \{[\s\S]*?purpose:\s*target\.purpose/,
+  );
+  assert.match(
+    projectsPage,
+    /await mergeDatasets\(\{[\s\S]*?purpose:\s*target\.purpose/,
+  );
   assert.match(projectsPage, /continueMergedAction\(merged\.id, target\.purpose\)/);
   assert.match(projectsPage, /navigate\(`\/datasets\/\$\{datasetId\}\/train`\)/);
   assert.doesNotMatch(projectsPage, /startDatasetExport/);

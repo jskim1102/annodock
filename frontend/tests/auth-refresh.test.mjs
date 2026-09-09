@@ -519,9 +519,89 @@ test("apiFetch aborts an API request that never answers", async (t) => {
 
   assert.equal(outcome.state, "rejected");
   assert.match(outcome.error.message, /서버 응답.*시간/);
+  assert.doesNotMatch(outcome.error.message, /업로드/);
   assert.equal(requestSignal.aborted, true);
   assert.equal(harness.refreshCalls, 0);
   assert.equal(harness.clearCalls, 0);
+});
+
+test("dataset merge follows its durable job instead of extending one HTTP request", async (t) => {
+  const requestedDeadlines = [];
+  const requestedPaths = [];
+  installBrowserGlobals(t, {
+    fetchImpl: async (path) => {
+      requestedPaths.push(path);
+      const body = path === "/api/datasets/merge"
+        ? {
+            id: 391,
+            project_id: 113,
+            name: "forklift_training",
+            image_count: 0,
+            annotation_count: 0,
+            class_count: 0,
+            created_at: "2026-09-04T06:17:41Z",
+            status: "pending",
+            is_merged: true,
+            active_job: {
+              job_id: 77,
+              state: "queued",
+              phase: "queued",
+              total: 104_822,
+              processed: 0,
+              failed: 0,
+            },
+            source_datasets: [],
+          }
+        : {
+            job_id: 77,
+            state: "done",
+            phase: "done",
+            total: 104_822,
+            processed: 104_822,
+            failed: 0,
+            image_total: 104_822,
+            image_processed: 104_822,
+            datasets: [{
+              id: 391,
+              name: "forklift_training",
+              image_count: 104_822,
+              annotation_count: 108_464,
+              class_count: 2,
+              status: "ready",
+            }],
+          };
+      return new Response(JSON.stringify(body), {
+        status: path === "/api/datasets/merge" ? 202 : 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+    setTimeoutImpl: (callback, delay) => {
+      requestedDeadlines.push(delay);
+      return setTimeout(callback, delay);
+    },
+  });
+  const harness = {
+    snapshot: { accessToken: "access-old", refreshToken: "refresh-old", user: null },
+    clearCalls: 0,
+    refreshCalls: 0,
+    refreshAuthSession: async () => {
+      harness.refreshCalls += 1;
+      return "access-new";
+    },
+  };
+  const client = await loadApiClient(harness);
+
+  const merged = await client.mergeDatasets({
+    name: "forklift_training",
+    dataset_ids: Array.from({ length: 22 }, (_value, index) => index + 301),
+  });
+
+  assert.equal(merged.id, 391);
+  assert.equal(merged.status, "ready");
+  assert.equal(merged.image_count, 104_822);
+  assert.deepEqual(requestedPaths, ["/api/datasets/merge", "/api/jobs/77"]);
+  assert.deepEqual(requestedDeadlines, [120_000, 120_000]);
+  assert.equal(harness.refreshCalls, 0);
 });
 
 test("apiFetch preserves an explicit caller cancellation", async (t) => {

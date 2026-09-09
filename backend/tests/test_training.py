@@ -11,7 +11,7 @@ from uuid import uuid4
 import httpx
 import psycopg
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from app.inference.models_dir import PRESET_MODELS
 from app.models import Annotation, Dataset, DatasetClass, Image, RunImage, TrainingRun
@@ -313,6 +313,37 @@ async def test_train_validation_defaults_and_seed_are_persisted(
             ).all()
         )
         assert split_counts == {"train": 8, "valid": 2}
+
+
+async def test_train_rejects_one_temporal_group_instead_of_leaking_frames(
+    client: httpx.AsyncClient,
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _host_ready(monkeypatch)
+    dataset_id = await _dataset(client, app, count=20)
+    async with app.state.session_factory() as session:
+        await session.execute(
+            update(Image)
+            .where(Image.dataset_id == dataset_id)
+            .values(training_group_key="sequence:only-video")
+        )
+        await session.commit()
+
+    response = await client.post(
+        f"/api/datasets/{dataset_id}/train",
+        json=_body(),
+    )
+
+    assert response.status_code == 400
+    assert "서로 다른 영상이나 촬영 세션" in response.json()["detail"]
+    async with app.state.session_factory() as session:
+        run_count = await session.scalar(
+            select(func.count(TrainingRun.id)).where(
+                TrainingRun.dataset_id == dataset_id
+            )
+        )
+    assert run_count == 0
 
 
 async def test_train_custom_arguments_are_validated_and_persisted(

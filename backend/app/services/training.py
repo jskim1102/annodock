@@ -60,6 +60,10 @@ SMALL_DATASET_DETAIL = (
     "데이터가 너무 적어 이 비율로는 train 또는 valid 가 0장이 됩니다. "
     "분할 비율을 조정하거나 이미지를 더 추가하세요."
 )
+GROUPED_SPLIT_DETAIL = (
+    "연속 프레임을 분리하지 않고는 train과 valid를 모두 만들 수 없습니다. "
+    "서로 다른 영상이나 촬영 세션이 두 개 이상 필요합니다."
+)
 OFFLINE_DETAIL = (
     "preset 가중치를 내려받지 못했습니다. 첫 학습은 인터넷 연결이 필요합니다. "
     "네트워크를 확인하고 다시 시도하세요."
@@ -353,17 +357,22 @@ async def start_training(
         raise TrainingRequestError(400, OFFLINE_DETAIL)
 
     seed = config.seed if config.seed is not None else secrets.randbits(31)
-    split_result = allocate_splits(
-        images,
-        config.ratios,
-        seed=seed,
-        test_only_images=(
-            missing_label_images
-            if config.include_unlabeled_images_in_test
-            else ()
-        ),
-    )
+    try:
+        split_result = allocate_splits(
+            images,
+            config.ratios,
+            seed=seed,
+            test_only_images=(
+                missing_label_images
+                if config.include_unlabeled_images_in_test
+                else ()
+            ),
+        )
+    except ValueError as error:
+        raise TrainingRequestError(400, GROUPED_SPLIT_DETAIL) from error
     warnings = [*_vram_warnings(), *split_result.warnings]
+    if dataset.is_merged:
+        dataset.merge_purpose = "train"
     run = TrainingRun(
         owner_id=owner_id,
         dataset_id=dataset.id,

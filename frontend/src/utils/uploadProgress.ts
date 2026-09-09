@@ -14,6 +14,9 @@ export interface ProgressEstimateState {
   windowStartedCompleted: number;
   windowStartedAtMs: number;
   smoothedRatePerSecond: number | null;
+  stabilizedRemainingSeconds: number | null;
+  estimateUpdatedAtMs: number;
+  estimateCompleted: number;
 }
 
 export interface ProgressEstimate {
@@ -21,9 +24,17 @@ export interface ProgressEstimate {
   remainingSeconds: number | null;
 }
 
+export interface UploadJobProgressSample {
+  state: string;
+  image_total: number;
+  image_processed: number;
+}
+
 const RATE_WINDOW_MS = 5_000;
 const RATE_SMOOTHING_WEIGHT = 0.2;
-const STALE_RATE_AFTER_MS = 15_000;
+const ESTIMATE_UPDATE_INTERVAL_MS = 1_000;
+const ETA_CORRECTION_WEIGHT = 0.2;
+const MAX_CORRECTION_SECONDS_PER_SECOND = 2;
 
 function normalizedSample(sample: ProgressSample) {
   const total = Math.max(0, sample.total);
@@ -35,6 +46,7 @@ function normalizedSample(sample: ProgressSample) {
 }
 
 function initialEstimate(sample: ProgressSample): ProgressEstimate {
+  const isComplete = sample.total > 0 && sample.completed >= sample.total;
   return {
     state: {
       key: sample.key,
@@ -45,11 +57,24 @@ function initialEstimate(sample: ProgressSample): ProgressEstimate {
       windowStartedCompleted: sample.completed,
       windowStartedAtMs: sample.atMs,
       smoothedRatePerSecond: null,
+      stabilizedRemainingSeconds: isComplete ? 0 : null,
+      estimateUpdatedAtMs: sample.atMs,
+      estimateCompleted: sample.completed,
     },
-    remainingSeconds: sample.total > 0 && sample.completed >= sample.total
-      ? 0
-      : null,
+    remainingSeconds: isComplete ? 0 : null,
   };
+}
+
+function displayedRemaining(seconds: number | null): number | null {
+  return seconds === null ? null : Math.max(1, Math.ceil(seconds));
+}
+
+export function uploadJobProcessingRatio(
+  job: UploadJobProgressSample,
+): number {
+  if (job.state === "done") return 1;
+  if (job.image_total <= 0) return 0;
+  return Math.min(1, Math.max(0, job.image_processed / job.image_total));
 }
 
 export function updateProgressEstimate(
@@ -74,6 +99,9 @@ export function updateProgressEstimate(
         lastCompleted: sample.completed,
         lastSampleAtMs: sample.atMs,
         lastProgressAtMs: sample.atMs,
+        stabilizedRemainingSeconds: 0,
+        estimateUpdatedAtMs: sample.atMs,
+        estimateCompleted: sample.completed,
       },
       remainingSeconds: 0,
     };
@@ -108,20 +136,64 @@ export function updateProgressEstimate(
     windowStartedCompleted,
     windowStartedAtMs,
     smoothedRatePerSecond: smoothedRate,
+    stabilizedRemainingSeconds: previous.stabilizedRemainingSeconds,
+    estimateUpdatedAtMs: previous.estimateUpdatedAtMs,
+    estimateCompleted: previous.estimateCompleted,
   };
-  if (
-    smoothedRate === null
-    || smoothedRate <= 0
-    || sample.atMs - lastProgressAtMs >= STALE_RATE_AFTER_MS
-  ) {
-    return { state, remainingSeconds: null };
+  if (smoothedRate === null || smoothedRate <= 0) {
+    return {
+      state,
+      remainingSeconds: displayedRemaining(state.stabilizedRemainingSeconds),
+    };
   }
+
+  const estimateElapsedMs = sample.atMs - previous.estimateUpdatedAtMs;
+  if (
+    previous.stabilizedRemainingSeconds !== null
+    && estimateElapsedMs < ESTIMATE_UPDATE_INTERVAL_MS
+  ) {
+    return {
+      state,
+      remainingSeconds: displayedRemaining(previous.stabilizedRemainingSeconds),
+    };
+  }
+
+  const rawRemainingSeconds = (sample.total - sample.completed) / smoothedRate;
+  let stabilizedRemainingSeconds = rawRemainingSeconds;
+  if (previous.stabilizedRemainingSeconds !== null) {
+    const madeProgress = sample.completed > previous.estimateCompleted;
+    if (!madeProgress) {
+      // A quiet server poll is not evidence that the job sped up or finished.
+      // Keep the last useful answer instead of flickering back to "calculating".
+      stabilizedRemainingSeconds = previous.stabilizedRemainingSeconds;
+    } else {
+      const elapsedSeconds = estimateElapsedMs / 1000;
+      const countdown = Math.max(
+        1,
+        previous.stabilizedRemainingSeconds - elapsedSeconds,
+      );
+      const correction = (
+        rawRemainingSeconds - countdown
+      ) * ETA_CORRECTION_WEIGHT;
+      const correctionLimit = (
+        elapsedSeconds * MAX_CORRECTION_SECONDS_PER_SECOND
+      );
+      stabilizedRemainingSeconds = Math.max(
+        1,
+        countdown + Math.max(
+          -correctionLimit,
+          Math.min(correctionLimit, correction),
+        ),
+      );
+    }
+  }
+
+  state.stabilizedRemainingSeconds = stabilizedRemainingSeconds;
+  state.estimateUpdatedAtMs = sample.atMs;
+  state.estimateCompleted = sample.completed;
   return {
     state,
-    remainingSeconds: Math.max(
-      1,
-      Math.ceil((sample.total - sample.completed) / smoothedRate),
-    ),
+    remainingSeconds: displayedRemaining(stabilizedRemainingSeconds),
   };
 }
 

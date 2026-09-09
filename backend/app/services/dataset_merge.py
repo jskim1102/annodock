@@ -8,10 +8,10 @@ import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import func, select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.class_colors import class_color
@@ -42,11 +42,23 @@ from app.services.quota import (
 from app.services.storage import (
     contained_storage_path,
     create_dataset_storage,
+    dataset_storage_path,
     finalize_staged_deletions,
     restore_staged_deletions,
     stage_deletions_async,
     storage_relative_path,
 )
+from app.services.split import (
+    training_group_key as build_training_group_key,
+    training_source_key as build_training_source_key,
+)
+
+
+# Cloudflare closes proxied requests that do not produce a response within
+# roughly two minutes. Keep only predictably small snapshots inline; larger
+# work is persisted as a job and polled through /api/jobs/{id}.
+DATASET_MERGE_INLINE_WORK_LIMIT = 10_000
+MergePurpose = Literal["merge", "train"]
 
 
 class DatasetMergeConflict(ValueError):
@@ -64,6 +76,7 @@ class DatasetMergeResult:
     dataset: Dataset
     sources: list[Dataset]
     reused: bool = False
+    job: UploadJob | None = None
 
 
 @dataclass(frozen=True)
@@ -72,6 +85,20 @@ class _CopiedImages:
     annotation_count: int
     accounted_bytes: int
     created_files: list[Path]
+
+
+def _promote_merge_purpose(
+    dataset: Dataset,
+    requested_purpose: MergePurpose,
+) -> bool:
+    """Apply a purpose without ever downgrading a training-purpose snapshot."""
+
+    if dataset.merge_purpose == "train":
+        return False
+    if dataset.merge_purpose is None or requested_purpose == "train":
+        dataset.merge_purpose = requested_purpose
+        return True
+    return False
 
 
 def _link_or_copy(source: Path, target: Path) -> None:
@@ -161,6 +188,10 @@ def copy_source_images(
     recorded_files = created_files if created_files is not None else []
 
     for source in sources:
+        image_source_key = build_training_source_key(
+            source.id,
+            source.upload_group_id,
+        )
         for source_image in images_by_dataset[source.id]:
             annotations = []
             for annotation in source_image.annotations:
@@ -292,6 +323,16 @@ def copy_source_images(
                     stem=stem,
                     filename=merged_filename,
                     rel_path=f"images/{split_directory}/{merged_filename}",
+                    training_source_key=image_source_key,
+                    training_group_key=(
+                        source_image.training_group_key
+                        or build_training_group_key(
+                            image_source_key,
+                            filename=source_image.filename,
+                            rel_path=source_image.rel_path,
+                            media_object_id=source_image.media_object_id,
+                        )
+                    ),
                     split=source_image.split,
                     width=source_image.width,
                     height=source_image.height,
@@ -348,6 +389,8 @@ async def merge_datasets(
     name: str,
     dataset_ids: list[int],
     owner_id: int,
+    purpose: MergePurpose = "merge",
+    target_dataset_id: int | None = None,
 ) -> DatasetMergeResult:
     source_rows = (
         await session.scalars(
@@ -386,6 +429,7 @@ async def merge_datasets(
     if project is None:
         raise DatasetMergeNotFound("프로젝트를 찾을 수 없습니다.")
 
+    reserved_target: Dataset | None = None
     overlapping_merge_ids = list(
         (
             await session.scalars(
@@ -443,6 +487,44 @@ async def merge_datasets(
                 existing is not None
                 and set(existing_source_ids) == requested_source_ids
             ):
+                purpose_changed = _promote_merge_purpose(existing, purpose)
+                if existing.id == target_dataset_id:
+                    if existing.status == "ready":
+                        if purpose_changed:
+                            await session.commit()
+                            await session.refresh(existing)
+                        return DatasetMergeResult(
+                            dataset=existing,
+                            sources=[
+                                source_by_id[source_id]
+                                for source_id in existing_source_ids
+                            ],
+                            reused=True,
+                        )
+                    if existing.status != "pending":
+                        raise DatasetMergeConflict(
+                            "실패한 병합 작업은 삭제한 뒤 다시 시도해 주세요."
+                        )
+                    reserved_target = existing
+                    break
+                active_merge_job = await session.scalar(
+                    select(UploadJob)
+                    .where(
+                        UploadJob.dataset_id == existing.id,
+                        UploadJob.state.in_(
+                            (
+                                "queued",
+                                "running",
+                                "awaiting_class_resolution",
+                            )
+                        ),
+                    )
+                    .order_by(UploadJob.id.desc())
+                    .limit(1)
+                )
+                if purpose_changed:
+                    await session.commit()
+                    await session.refresh(existing)
                 return DatasetMergeResult(
                     dataset=existing,
                     sources=[
@@ -450,31 +532,38 @@ async def merge_datasets(
                         for source_id in existing_source_ids
                     ],
                     reused=True,
+                    job=active_merge_job,
                 )
 
-        conflict_id = next(
-            (
-                merged_dataset_id
-                for merged_dataset_id in overlapping_merge_ids
-                if merged_dataset_id in existing_merges
-            ),
-            None,
-        )
-        if conflict_id is not None:
-            existing = existing_merges[conflict_id]
-            raise DatasetMergeConflict(
-                {
-                    "code": "dataset_merge_source_overlap",
-                    "merged_dataset": {
-                        "id": existing.id,
-                        "name": existing.name,
-                        "source_dataset_ids": source_ids_by_merge[conflict_id],
-                    },
-                }
+        if reserved_target is None:
+            conflict_id = next(
+                (
+                    merged_dataset_id
+                    for merged_dataset_id in overlapping_merge_ids
+                    if merged_dataset_id in existing_merges
+                ),
+                None,
             )
-        raise DatasetMergeConflict(
-            "이미 다른 병합 데이터셋에 포함된 원본은 다시 합칠 수 없습니다."
-        )
+            if conflict_id is not None:
+                existing = existing_merges[conflict_id]
+                raise DatasetMergeConflict(
+                    {
+                        "code": "dataset_merge_source_overlap",
+                        "merged_dataset": {
+                            "id": existing.id,
+                            "name": existing.name,
+                            "source_dataset_ids": source_ids_by_merge[
+                                conflict_id
+                            ],
+                        },
+                    }
+                )
+            raise DatasetMergeConflict(
+                "이미 다른 병합 데이터셋에 포함된 원본은 다시 합칠 수 없습니다."
+            )
+
+    if target_dataset_id is not None and reserved_target is None:
+        raise DatasetMergeNotFound("병합 작업을 찾을 수 없습니다.")
 
     merged_membership = await session.scalar(
         select(DatasetMergeSource.merged_dataset_id)
@@ -499,6 +588,56 @@ async def merge_datasets(
     )
     if active_job is not None:
         raise DatasetMergeConflict("업로드 처리 중인 데이터셋은 합칠 수 없습니다.")
+
+    image_total = sum(dataset.image_count for dataset in sources)
+    work_total = image_total + sum(
+        dataset.annotation_count for dataset in sources
+    )
+    if (
+        target_dataset_id is None
+        and work_total > DATASET_MERGE_INLINE_WORK_LIMIT
+    ):
+        dataset = Dataset(
+            owner_id=owner_id,
+            project_id=project_id,
+            name=name,
+            status="pending",
+            storage_path="",
+            is_merged=True,
+            merge_purpose=purpose,
+        )
+        session.add(dataset)
+        await session.flush()
+        session.add_all(
+            [
+                DatasetMergeSource(
+                    merged_dataset_id=dataset.id,
+                    source_dataset_id=source.id,
+                    position=position,
+                )
+                for position, source in enumerate(sources)
+            ]
+        )
+        job = UploadJob(
+            dataset_id=dataset.id,
+            kind="dataset_merge",
+            state="queued",
+            phase="queued",
+            total=image_total,
+            processed=0,
+            image_total=image_total,
+            image_processed=0,
+            upload_ids=[],
+        )
+        session.add(job)
+        await session.commit()
+        await session.refresh(dataset)
+        await session.refresh(job)
+        return DatasetMergeResult(
+            dataset=dataset,
+            sources=sources,
+            job=job,
+        )
 
     class_rows = (
         await session.scalars(
@@ -584,18 +723,31 @@ async def merge_datasets(
         (image.split, image.stem) for image in image_rows
     }
     occupied_keys: set[PairKey] = set()
-    dataset = Dataset(
-        owner_id=owner_id,
-        project_id=sources[0].project_id,
-        name=name,
-        status="pending",
-        storage_path="",
-        is_merged=True,
-    )
-    session.add(dataset)
+    dataset = reserved_target
+    if dataset is None:
+        dataset = Dataset(
+            owner_id=owner_id,
+            project_id=sources[0].project_id,
+            name=name,
+            status="pending",
+            storage_path="",
+            is_merged=True,
+            merge_purpose=purpose,
+        )
+        session.add(dataset)
+    else:
+        dataset.status = "processing"
+        dataset.storage_path = ""
     storage_path: Path | None = None
     try:
         await session.flush()
+        if reserved_target is not None:
+            stale_storage = dataset_storage_path(
+                settings.storage_dir,
+                dataset.id,
+            )
+            if stale_storage.is_dir():
+                shutil.rmtree(stale_storage)
         storage_path = create_dataset_storage(settings.storage_dir, dataset.id)
         dataset.storage_path = storage_relative_path(
             settings.storage_dir,
@@ -624,16 +776,17 @@ async def merge_datasets(
             ]
         )
         session.add_all(copied.images)
-        session.add_all(
-            [
-                DatasetMergeSource(
-                    merged_dataset_id=dataset.id,
-                    source_dataset_id=source.id,
-                    position=position,
-                )
-                for position, source in enumerate(sources)
-            ]
-        )
+        if reserved_target is None:
+            session.add_all(
+                [
+                    DatasetMergeSource(
+                        merged_dataset_id=dataset.id,
+                        source_dataset_id=source.id,
+                        position=position,
+                    )
+                    for position, source in enumerate(sources)
+                ]
+            )
         dataset.image_count = len(copied.images)
         dataset.annotation_count = copied.annotation_count
         dataset.class_count = len(project_class_rows)
@@ -649,6 +802,79 @@ async def merge_datasets(
         raise
 
 
+async def run_dataset_merge_job(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    job_id: int,
+) -> None:
+    """Finish one persisted merge reservation outside the HTTP request."""
+
+    from app.services.jobs import claim_upload_job, fail_job, transition_job
+
+    try:
+        if not await claim_upload_job(session_factory, job_id):
+            return
+        async with session_factory() as lookup_session:
+            job = await lookup_session.get(UploadJob, job_id)
+            if job is None or job.kind != "dataset_merge":
+                raise LookupError("dataset merge job does not exist")
+            target = await lookup_session.get(Dataset, job.dataset_id)
+            if target is None:
+                raise LookupError("dataset merge target does not exist")
+            dataset_ids = list(
+                (
+                    await lookup_session.scalars(
+                        select(DatasetMergeSource.source_dataset_id)
+                        .where(
+                            DatasetMergeSource.merged_dataset_id == target.id
+                        )
+                        .order_by(DatasetMergeSource.position)
+                    )
+                ).all()
+            )
+            if len(dataset_ids) < 2:
+                raise LookupError("dataset merge sources do not exist")
+            target_dataset_id = target.id
+            owner_id = target.owner_id
+            name = target.name
+            purpose: MergePurpose = target.merge_purpose or "merge"
+
+        await transition_job(
+            session_factory,
+            job_id,
+            "merging",
+            state="running",
+        )
+        async with session_factory() as merge_session:
+            result = await merge_datasets(
+                settings,
+                merge_session,
+                name=name,
+                dataset_ids=dataset_ids,
+                owner_id=owner_id,
+                purpose=purpose,
+                target_dataset_id=target_dataset_id,
+            )
+        if result.dataset.status != "ready":
+            raise DatasetMergeConflict("병합할 이미지가 없습니다.")
+        await transition_job(
+            session_factory,
+            job_id,
+            "done",
+            state="done",
+            total=result.dataset.image_count,
+            processed=result.dataset.image_count,
+            image_total=result.dataset.image_count,
+            image_processed=result.dataset.image_count,
+        )
+    except asyncio.CancelledError:
+        # A running job is intentionally left durable. Startup recovery resets
+        # it to queued and removes any uncommitted filesystem leftovers.
+        raise
+    except Exception as error:
+        await fail_job(session_factory, job_id, str(error))
+
+
 async def extend_merged_dataset(
     settings: Settings,
     session: AsyncSession,
@@ -656,6 +882,7 @@ async def extend_merged_dataset(
     merged_dataset_id: int,
     dataset_ids: list[int],
     owner_id: int,
+    purpose: MergePurpose = "merge",
 ) -> DatasetMergeResult:
     requested_ids = [merged_dataset_id, *dataset_ids]
     dataset_rows = (
@@ -992,6 +1219,7 @@ async def extend_merged_dataset(
         target.image_count += len(copied.images)
         target.annotation_count += copied.annotation_count
         target.class_count = len(project_class_rows)
+        _promote_merge_purpose(target, purpose)
         project.updated_at = func.now()
         quota_delta = copied.accounted_bytes - release_plan.released_bytes
         if quota_delta > 0:

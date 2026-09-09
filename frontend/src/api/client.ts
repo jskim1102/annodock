@@ -73,6 +73,7 @@ export interface DatasetRow {
   class_count: number;
   created_at: string;
   is_merged: boolean;
+  merge_purpose: "merge" | "train" | null;
 }
 
 export interface DatasetListItem extends DatasetRow {
@@ -83,6 +84,7 @@ export interface DatasetListItem extends DatasetRow {
 export interface DatasetMergeInput {
   name: string;
   dataset_ids: number[];
+  purpose: "merge" | "train";
 }
 
 export interface DatasetClassExtractionInput {
@@ -93,6 +95,7 @@ export interface DatasetClassExtractionInput {
 
 export interface DatasetMergeSourcesInput {
   dataset_ids: number[];
+  purpose: "merge" | "train";
 }
 
 export interface DatasetMergeOverlap {
@@ -146,6 +149,26 @@ export interface ProjectRow {
 export interface ProjectCreateInput {
   name: string;
   classes: Array<{ name: string; color: string }>;
+}
+
+export interface ProjectMergeClassSource {
+  project_id: number;
+  class_id: number;
+}
+
+export interface ProjectMergeClass {
+  name: string;
+  color: string;
+  sources: ProjectMergeClassSource[];
+}
+
+export interface ProjectMergeInput {
+  name: string;
+  projects: Array<{
+    project_id: number;
+    expected_updated_at: string;
+  }>;
+  classes: ProjectMergeClass[];
 }
 
 export interface ProjectRenameResponse {
@@ -226,10 +249,10 @@ export class ApiError extends Error {
 }
 
 export class ApiRequestTimeoutError extends ApiError {
-  constructor() {
+  constructor(message = "서버 응답 제한 시간을 초과했습니다. 작업 상태를 확인한 뒤 다시 시도해 주세요.") {
     super(
       0,
-      "서버 응답 제한 시간을 초과했습니다. 업로드를 일시 중지했습니다. 이어 올리기를 다시 시도해 주세요.",
+      message,
     );
     this.name = "ApiRequestTimeoutError";
   }
@@ -415,6 +438,10 @@ export function createProject(project: ProjectCreateInput): Promise<ProjectRow> 
   return requestJson("/api/projects", jsonInit("POST", project));
 }
 
+export function mergeProjects(input: ProjectMergeInput): Promise<ProjectRow> {
+  return requestJson<ProjectRow>("/api/projects/merge", jsonInit("POST", input));
+}
+
 export function renameProject(
   projectId: number,
   name: string,
@@ -445,6 +472,17 @@ export function updateProjectClass(
   );
 }
 
+export function updateProjectClasses(
+  projectId: number,
+  expectedUpdatedAt: string,
+  classes: readonly ProjectClassRow[],
+): Promise<{ classes: ProjectClassRow[] }> {
+  return requestJson<{ classes: ProjectClassRow[] }>(
+    `/api/projects/${projectId}/classes`,
+    jsonInit("PUT", { expected_updated_at: expectedUpdatedAt, classes }),
+  );
+}
+
 export function renameDataset(
   datasetId: number,
   name: string,
@@ -455,8 +493,55 @@ export function renameDataset(
   );
 }
 
-export function mergeDatasets(input: DatasetMergeInput): Promise<DatasetListItem> {
-  return requestJson<DatasetListItem>("/api/datasets/merge", jsonInit("POST", input));
+function waitForNextJobPoll(): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, 500));
+}
+
+async function waitForMergedDataset(
+  queued: DatasetListItem,
+): Promise<DatasetListItem> {
+  const jobId = queued.active_job?.job_id;
+  if (jobId === undefined) return queued;
+
+  while (true) {
+    const job = await getJob(jobId);
+    if (job.state === "failed") {
+      let detail = "데이터셋 병합 작업에 실패했습니다.";
+      try {
+        const issues = await getAllIssues(queued.id);
+        detail = issues[0]?.detail || detail;
+      } catch {
+        // Preserve the terminal job failure when issue details are unavailable.
+      }
+      throw new ApiError(500, detail);
+    }
+    if (job.state === "done") {
+      const completed = job.datasets.find((dataset) => dataset.id === queued.id);
+      if (!completed || completed.status !== "ready") {
+        throw new ApiError(500, "병합 결과 데이터셋을 확인할 수 없습니다.");
+      }
+      return {
+        ...queued,
+        name: completed.name,
+        status: completed.status,
+        image_count: completed.image_count,
+        annotation_count: completed.annotation_count,
+        class_count: completed.class_count,
+        active_job: null,
+      };
+    }
+    await waitForNextJobPoll();
+  }
+}
+
+export async function mergeDatasets(
+  input: DatasetMergeInput,
+): Promise<DatasetListItem> {
+  const queued = await requestJson<DatasetListItem>(
+    "/api/datasets/merge",
+    jsonInit("POST", input),
+  );
+  return waitForMergedDataset(queued);
 }
 
 export function extractDatasetClasses(

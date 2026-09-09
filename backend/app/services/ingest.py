@@ -74,6 +74,10 @@ from app.services.storage import (
     storage_relative_path,
     storage_root,
 )
+from app.services.split import (
+    training_group_key as build_training_group_key,
+    training_source_key as build_training_source_key,
+)
 from app.services.uploads import (
     assemble_uploads,
     assembled_upload_path,
@@ -1271,6 +1275,11 @@ async def ingest_collected(
                     )
                     thumb_path = active_final_chunk / prepared.thumb_relative
                     work = result.work
+                    image_source_key = build_training_source_key(
+                        current_dataset.id,
+                        current_dataset.upload_group_id,
+                    )
+                    image_filename = Path(work.storage_item.rel_path).name
                     image = Image(
                         dataset_id=current_dataset.id,
                         media_object=MediaObject(
@@ -1281,8 +1290,14 @@ async def ingest_collected(
                             thumb_bytes=prepared.thumb_bytes,
                         ),
                         stem=work.storage_stem,
-                        filename=Path(work.storage_item.rel_path).name,
+                        filename=image_filename,
                         rel_path=work.storage_item.rel_path,
+                        training_source_key=image_source_key,
+                        training_group_key=build_training_group_key(
+                            image_source_key,
+                            filename=image_filename,
+                            rel_path=work.storage_item.rel_path,
+                        ),
                         split=work.storage_item.split,
                         width=prepared.width,
                         height=prepared.height,

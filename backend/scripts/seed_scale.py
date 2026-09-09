@@ -104,6 +104,8 @@ async def seed_scale_dataset(
                         stem,
                         filename,
                         rel_path,
+                        training_source_key,
+                        training_group_key,
                         split,
                         width,
                         height,
@@ -128,6 +130,9 @@ async def seed_scale_dataset(
                             END ||
                             '/image-' || lpad(series_no::text, 6, '0') ||
                             '.jpg',
+                        :training_source_key,
+                        'image:' || :training_source_key || ':' ||
+                            series_no::text,
                         CASE series_no % 3
                             WHEN 1 THEN 'train'
                             WHEN 2 THEN 'val'
@@ -147,6 +152,7 @@ async def seed_scale_dataset(
                 ),
                 {
                     "dataset_id": dataset_id,
+                    "training_source_key": f"dataset:{dataset_id}",
                     "media_object_id": media_object.id,
                     "file_path": str(original_path),
                     "thumb_path": str(thumb_path),

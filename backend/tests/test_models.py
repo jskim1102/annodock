@@ -1,4 +1,4 @@
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import CheckConstraint, UniqueConstraint
 
 from app.db import Base
 from app.models import (
@@ -64,6 +64,7 @@ EXPECTED_COLUMNS = {
         "annotation_count",
         "class_count",
         "is_merged",
+        "merge_purpose",
         "is_extracted",
         "is_placeholder",
         "upload_group_id",
@@ -93,6 +94,8 @@ EXPECTED_COLUMNS = {
         "stem",
         "filename",
         "rel_path",
+        "training_source_key",
+        "training_group_key",
         "split",
         "width",
         "height",
@@ -266,6 +269,16 @@ def test_dataset_uses_precomputed_counts_and_owner_scoped_unique_names() -> None
     assert ("name",) not in unique_constraints
     assert ("owner_id", "name") in unique_constraints
 
+    merge_purpose = columns["merge_purpose"]
+    assert merge_purpose.nullable is True
+    check_constraints = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in Dataset.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert "ck_datasets_merge_purpose" in check_constraints
+    assert "merge_purpose" in check_constraints["ck_datasets_merge_purpose"]
+
 
 def test_dataset_class_uses_the_required_composite_primary_key() -> None:
     primary_key = tuple(
@@ -289,6 +302,8 @@ def test_image_supports_display_derivatives_and_split_navigation() -> None:
     assert table.c.display_path.nullable is True
     assert table.c.split.nullable is True
     assert table.c.media_object_id.nullable is False
+    assert table.c.training_source_key.nullable is False
+    assert table.c.training_group_key.nullable is False
 
     unique_constraints = {
         tuple(column.name for column in constraint.columns): constraint

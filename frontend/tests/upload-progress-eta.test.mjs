@@ -35,7 +35,7 @@ const appCss = await readFile(
   "utf8",
 );
 
-test("ETA waits for a representative window and resets between upload phases", async () => {
+test("ETA waits for a representative window and keeps its last estimate through stalls", async () => {
   const { updateProgressEstimate } = await loadUploadProgress();
 
   const first = updateProgressEstimate(null, {
@@ -84,7 +84,7 @@ test("ETA waits for a representative window and resets between upload phases", a
     total: 100,
     atMs: 20_000,
   });
-  assert.equal(paused.remainingSeconds, null);
+  assert.equal(paused.remainingSeconds, stable.remainingSeconds);
   const resumed = updateProgressEstimate(paused.state, {
     key: "transfer:1",
     completed: 60,
@@ -95,6 +95,118 @@ test("ETA waits for a representative window and resets between upload phases", a
     resumed.remainingSeconds > 4,
     "a long stall must not be mistaken for a one-second transfer burst",
   );
+});
+
+test("one overall ETA survives several short ZIP phases without reporting completion early", async () => {
+  const { updateProgressEstimate } = await loadUploadProgress();
+  const samples = [
+    [0, 0],
+    [1_000, 50],
+    [2_000, 100],
+    [3_000, 150],
+    [4_000, 200],
+    [5_000, 250],
+    // The first ZIP ends at 300 work units. The same aggregate key and total
+    // continue through the next ZIP instead of restarting a phase-local ETA.
+    [6_000, 300],
+    [7_000, 350],
+    [8_000, 400],
+    [9_000, 450],
+    [10_000, 500],
+    [11_000, 550],
+    [12_000, 600],
+    [13_000, 650],
+    [14_000, 700],
+    [15_000, 750],
+    [16_000, 800],
+    [17_000, 850],
+  ];
+  let state = null;
+  const observed = [];
+
+  for (const [atMs, completed] of samples) {
+    const estimate = updateProgressEstimate(state, {
+      key: "overall-upload",
+      completed,
+      total: 900,
+      atMs,
+    });
+    state = estimate.state;
+    if (atMs >= 5_000) observed.push(estimate.remainingSeconds);
+  }
+
+  assert.ok(observed.every((remaining) => remaining !== null && remaining > 0));
+  const done = updateProgressEstimate(state, {
+    key: "overall-upload",
+    completed: 900,
+    total: 900,
+    atMs: 18_000,
+  });
+  assert.equal(done.remainingSeconds, 0);
+});
+
+test("server processing progress ignores phase-local counters that reset between backend phases", async () => {
+  const { uploadJobProcessingRatio } = await loadUploadProgress();
+
+  assert.equal(uploadJobProcessingRatio({
+    state: "running",
+    total: 1,
+    processed: 1,
+    image_total: 0,
+    image_processed: 0,
+  }), 0);
+  assert.equal(uploadJobProcessingRatio({
+    state: "running",
+    total: 200,
+    processed: 80,
+    image_total: 100,
+    image_processed: 40,
+  }), 0.4);
+  assert.equal(uploadJobProcessingRatio({
+    state: "done",
+    total: 1,
+    processed: 1,
+    image_total: 0,
+    image_processed: 0,
+  }), 1);
+});
+
+test("ETA corrections are gradual when work changes from a fast phase to a slow phase", async () => {
+  const { updateProgressEstimate } = await loadUploadProgress();
+  let estimate = updateProgressEstimate(null, {
+    key: "overall-upload",
+    completed: 0,
+    total: 3_000,
+    atMs: 0,
+  });
+  estimate = updateProgressEstimate(estimate.state, {
+    key: "overall-upload",
+    completed: 500,
+    total: 3_000,
+    atMs: 5_000,
+  });
+  const fastPhaseEta = estimate.remainingSeconds;
+  assert.equal(fastPhaseEta, 25);
+
+  estimate = updateProgressEstimate(estimate.state, {
+    key: "overall-upload",
+    completed: 510,
+    total: 3_000,
+    atMs: 10_000,
+  });
+  assert.ok(estimate.remainingSeconds !== null);
+  assert.ok(
+    estimate.remainingSeconds <= fastPhaseEta + 5,
+    "a phase boundary must not make the displayed ETA jump abruptly",
+  );
+
+  const stalled = updateProgressEstimate(estimate.state, {
+    key: "overall-upload",
+    completed: 510,
+    total: 3_000,
+    atMs: 30_000,
+  });
+  assert.equal(stalled.remainingSeconds, estimate.remainingSeconds);
 });
 
 test("ETA ignores alternating tiny labels and image completion bursts", async () => {
@@ -156,4 +268,18 @@ test("upload and ingestion expose image counts at sub-second polling cadence", (
   assert.match(uploadPage, /formatRemainingTime\(liveProgress\.etaSeconds\)/);
   assert.match(appCss, /\.upload-progress-detail/);
   assert.match(appCss, /transition:\s*width 500ms linear/);
+});
+
+test("the upload page feeds one aggregate ETA across preparation, transfer, and server jobs", () => {
+  assert.match(uploadPage, /const updateOverallEstimate = \(processedWork: number\) =>/);
+  assert.match(uploadPage, /key: "overall-upload"/);
+  assert.match(uploadPage, /updateOverallEstimate\(preparationWork\)/);
+  assert.match(uploadPage, /updateOverallEstimate\(transferStart \+ uploadedBytes\)/);
+  assert.match(
+    uploadPage,
+    /updateOverallEstimate\(\s*unitProcessStart \+ unitBytes \* ratio,?\s*\)/,
+  );
+  assert.doesNotMatch(uploadPage, /transferProgressKey/);
+  assert.doesNotMatch(uploadPage, /key: `processing:\$\{activeJobId\}`/);
+  assert.doesNotMatch(uploadPage, /job\.processed \/ job\.total/);
 });

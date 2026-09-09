@@ -5,8 +5,17 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from sqlalchemy import select
 
-from app.models import Annotation, Dataset, ExportArtifact, Image, UploadJob
+from app.models import (
+    Annotation,
+    Dataset,
+    DatasetClass,
+    ExportArtifact,
+    Image,
+    ProjectClass,
+    UploadJob,
+)
 from tests.factories import image_with_media
 
 
@@ -614,3 +623,247 @@ async def test_project_class_update_changes_name_color_and_propagates(
         f"/api/projects/{project_id}/classes/99", json={"name": "ghost"}
     )
     assert missing.status_code == 404
+
+
+async def test_project_class_bulk_update_reorders_ids_across_every_dataset(
+    client: httpx.AsyncClient,
+    app,
+) -> None:
+    project_response = await client.post(
+        "/api/projects",
+        json={
+            "name": unique_name("catalog-reorder"),
+            "classes": [
+                {"name": "person", "color": "#EF4444"},
+                {"name": "forklift", "color": "#F59E0B"},
+                {"name": "helmet", "color": "#84CC16"},
+            ],
+        },
+    )
+    project_id = project_response.json()["id"]
+    dataset_ids = []
+    async with app.state.session_factory() as session:
+        for suffix in ("first", "second"):
+            response = await client.post(
+                "/api/datasets",
+                json={
+                    "name": unique_name(f"catalog-reorder-{suffix}"),
+                    "project_id": project_id,
+                },
+            )
+            dataset_ids.append(response.json()["id"])
+
+        images = []
+        for index, dataset_id in enumerate(dataset_ids):
+            dataset = await session.get(Dataset, dataset_id)
+            assert dataset is not None
+            dataset.status = "ready"
+            image = image_with_media(
+                owner_id=dataset.owner_id,
+                dataset_id=dataset_id,
+                stem=f"reorder-{index}",
+                filename=f"reorder-{index}.jpg",
+                rel_path=f"images/reorder-{index}.jpg",
+                split=None,
+                width=32,
+                height=32,
+                file_path=f"reorder-{index}.jpg",
+                display_path=None,
+                thumb_path=f"reorder-{index}-thumb.jpg",
+                box_count=2 if index == 0 else 1,
+            )
+            session.add(image)
+            images.append(image)
+        await session.flush()
+        session.add_all(
+            [
+                Annotation(
+                    image_id=images[0].id,
+                    class_id=0,
+                    cx=0.2,
+                    cy=0.2,
+                    w=0.1,
+                    h=0.1,
+                ),
+                Annotation(
+                    image_id=images[0].id,
+                    class_id=1,
+                    cx=0.4,
+                    cy=0.4,
+                    w=0.1,
+                    h=0.1,
+                ),
+                Annotation(
+                    image_id=images[1].id,
+                    class_id=2,
+                    cx=0.6,
+                    cy=0.6,
+                    w=0.1,
+                    h=0.1,
+                ),
+            ]
+        )
+        await session.commit()
+
+    detail_before_reorder = await client.get(f"/api/projects/{project_id}")
+    reorder_request = {
+        "expected_updated_at": detail_before_reorder.json()["updated_at"],
+        "classes": [
+            {"class_id": 1, "name": "forklift", "color": "#f59e0b"},
+            {"class_id": 2, "name": "helmet", "color": "#84cc16"},
+            {"class_id": 0, "name": "human", "color": "#ef4444"},
+        ],
+    }
+    reordered = await client.put(
+        f"/api/projects/{project_id}/classes",
+        json=reorder_request,
+    )
+
+    assert reordered.status_code == 200, reordered.text
+    expected_classes = [
+        {"class_id": 0, "name": "forklift", "color": "#F59E0B"},
+        {"class_id": 1, "name": "helmet", "color": "#84CC16"},
+        {"class_id": 2, "name": "human", "color": "#EF4444"},
+    ]
+    assert reordered.json() == {"classes": expected_classes}
+    detail = await client.get(f"/api/projects/{project_id}")
+    assert detail.json()["classes"] == expected_classes
+    for dataset_id in dataset_ids:
+        classes = await client.get(f"/api/datasets/{dataset_id}/classes")
+        assert classes.json() == {
+            "classes": [
+                {"class_id": 0, "name": "forklift"},
+                {"class_id": 1, "name": "helmet"},
+                {"class_id": 2, "name": "human"},
+            ]
+        }
+
+    async with app.state.session_factory() as session:
+        annotation_ids = list(
+            await session.scalars(
+                select(Annotation.class_id)
+                .join(Image, Image.id == Annotation.image_id)
+                .where(Image.dataset_id.in_(dataset_ids))
+                .order_by(Annotation.id)
+            )
+        )
+        project_classes = list(
+            (
+                await session.scalars(
+                    select(ProjectClass)
+                    .where(ProjectClass.project_id == project_id)
+                    .order_by(ProjectClass.class_id)
+                )
+            ).all()
+        )
+        dataset_classes = list(
+            (
+                await session.scalars(
+                    select(DatasetClass)
+                    .where(DatasetClass.dataset_id.in_(dataset_ids))
+                )
+            ).all()
+        )
+    assert annotation_ids == [2, 0, 1]
+    assert [(row.class_id, row.name) for row in project_classes] == [
+        (0, "forklift"),
+        (1, "helmet"),
+        (2, "human"),
+    ]
+    assert len(dataset_classes) == 6
+
+    stale = await client.put(
+        f"/api/projects/{project_id}/classes",
+        json=reorder_request,
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"].startswith("프로젝트가 변경")
+
+
+async def test_project_class_reorder_is_atomic_and_blocked_during_upload(
+    client: httpx.AsyncClient,
+    app,
+) -> None:
+    project_response = await client.post(
+        "/api/projects",
+        json={
+            "name": unique_name("catalog-reorder-guard"),
+            "classes": [
+                {"name": "person", "color": "#EF4444"},
+                {"name": "forklift", "color": "#F59E0B"},
+            ],
+        },
+    )
+    project_id = project_response.json()["id"]
+    dataset_response = await client.post(
+        "/api/datasets",
+        json={
+            "name": unique_name("catalog-reorder-guard-child"),
+            "project_id": project_id,
+        },
+    )
+    async with app.state.session_factory() as session:
+        session.add(
+            UploadJob(
+                dataset_id=dataset_response.json()["id"],
+                kind="import",
+                state="running",
+                phase="deriving",
+            )
+        )
+        await session.commit()
+
+    detail_before_reorder = await client.get(f"/api/projects/{project_id}")
+    request = {
+        "expected_updated_at": detail_before_reorder.json()["updated_at"],
+        "classes": [
+            {"class_id": 1, "name": "forklift", "color": "#F59E0B"},
+            {"class_id": 0, "name": "person", "color": "#EF4444"},
+        ]
+    }
+    active = await client.put(
+        f"/api/projects/{project_id}/classes",
+        json=request,
+    )
+    assert active.status_code == 409
+
+    async with app.state.session_factory() as session:
+        job = await session.scalar(
+            select(UploadJob).where(
+                UploadJob.dataset_id == dataset_response.json()["id"]
+            )
+        )
+        assert job is not None
+        job.state = "done"
+        job.phase = "done"
+        await session.commit()
+
+    async with app.state.session_factory() as locked_session:
+        await locked_session.scalar(
+            select(Dataset)
+            .where(Dataset.id == dataset_response.json()["id"])
+            .with_for_update()
+        )
+        locked = await client.put(
+            f"/api/projects/{project_id}/classes",
+            json=request,
+        )
+        assert locked.status_code == 409
+        assert locked.json()["detail"].startswith("다른 데이터 작업")
+
+    duplicate = await client.put(
+        f"/api/projects/{project_id}/classes",
+        json={
+            "expected_updated_at": detail_before_reorder.json()["updated_at"],
+            "classes": [
+                {"class_id": 1, "name": "same", "color": "#F59E0B"},
+                {"class_id": 0, "name": "same", "color": "#EF4444"},
+            ]
+        },
+    )
+    assert duplicate.status_code == 409
+    detail = await client.get(f"/api/projects/{project_id}")
+    assert detail.json()["classes"] == [
+        {"class_id": 0, "name": "person", "color": "#EF4444"},
+        {"class_id": 1, "name": "forklift", "color": "#F59E0B"},
+    ]

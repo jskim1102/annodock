@@ -8,11 +8,11 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import case, delete, func, select, update
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import get_session, set_local_lock_timeout
+from app.db import get_session, is_lock_not_available, set_local_lock_timeout
 from app.deps import CurrentUserDep
 from app.models import (
     Annotation,
@@ -34,6 +34,13 @@ from app.services.quota import (
     decrease_bytes_used,
     path_tree_bytes,
     plan_dataset_storage_release,
+)
+from app.services.project_merge import (
+    ProjectMergeClassPlan,
+    ProjectMergeClassSource as ProjectMergeClassSourcePlan,
+    ProjectMergeConflict,
+    ProjectMergeNotFound,
+    merge_projects as merge_projects_service,
 )
 from app.services.storage import (
     StorageBoundaryError,
@@ -112,10 +119,71 @@ class ProjectName(BaseModel):
         return normalized
 
 
+class ProjectMergeClassSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: int = Field(gt=0)
+    class_id: int = Field(ge=0)
+
+
+class ProjectMergeClass(ProjectClassCreate):
+    sources: list[ProjectMergeClassSource] = Field(min_length=1, max_length=200)
+
+
+class ProjectMergeProject(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: int = Field(gt=0)
+    expected_updated_at: datetime
+
+
+class ProjectMergeRequest(ProjectName):
+    projects: list[ProjectMergeProject] = Field(min_length=2, max_length=50)
+    classes: list[ProjectMergeClass] = Field(default_factory=list, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_merge_plan(self) -> ProjectMergeRequest:
+        project_ids = [item.project_id for item in self.projects]
+        if len(project_ids) != len(set(project_ids)):
+            raise ValueError("projects must be unique")
+        selected_project_ids = set(project_ids)
+        class_names = [item.name for item in self.classes]
+        if len(class_names) != len(set(class_names)):
+            raise ValueError("class names must be unique")
+        source_keys = [
+            (source.project_id, source.class_id)
+            for item in self.classes
+            for source in item.sources
+        ]
+        if len(source_keys) != len(set(source_keys)):
+            raise ValueError("class sources must be unique")
+        if any(
+            source_project_id not in selected_project_ids
+            for source_project_id, _class_id in source_keys
+        ):
+            raise ValueError("class sources must belong to selected projects")
+        return self
+
+
 class ProjectClassRow(BaseModel):
     class_id: int
     name: str
     color: str
+
+
+class ProjectClassReplacement(ProjectClassCreate):
+    class_id: int = Field(ge=0)
+
+
+class ProjectClassBulkUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_updated_at: datetime
+    classes: list[ProjectClassReplacement] = Field(min_length=1, max_length=200)
+
+
+class ProjectClassList(BaseModel):
+    classes: list[ProjectClassRow]
 
 
 class ActiveJobRow(BaseModel):
@@ -142,6 +210,7 @@ class ProjectDatasetSourceRow(BaseModel):
     created_at: datetime
     status: DatasetStatus
     is_merged: bool
+    merge_purpose: Literal["merge", "train"] | None
     active_job: ActiveJobRow | None
 
 
@@ -459,6 +528,7 @@ async def _project_rows(
                 created_at=source_dataset.created_at,
                 status=source_dataset.status,
                 is_merged=source_dataset.is_merged,
+                merge_purpose=source_dataset.merge_purpose,
                 active_job=_active_job(source_job),
             )
         )
@@ -479,6 +549,7 @@ async def _project_rows(
                 created_at=dataset.created_at,
                 status=dataset.status,
                 is_merged=dataset.is_merged,
+                merge_purpose=dataset.merge_purpose,
                 active_job=_active_job(job),
                 source_datasets=sources_by_merged_id.get(dataset.id, []),
             )
@@ -523,13 +594,14 @@ async def _owned_project_or_404(
     owner_id: int,
     *,
     for_update: bool = False,
+    nowait: bool = False,
 ) -> Project:
     statement = select(Project).where(
         Project.id == project_id,
         Project.owner_id == owner_id,
     )
     if for_update:
-        statement = statement.with_for_update()
+        statement = statement.with_for_update(nowait=nowait)
     project = await session.scalar(statement)
     if project is None:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
@@ -588,6 +660,56 @@ async def create_project(
         current_user.id,
         project_id=project.id,
     )
+    return rows[0]
+
+
+@router.post("/merge", status_code=201, response_model=ProjectRow)
+async def create_merged_project(
+    body: ProjectMergeRequest,
+    session: Session,
+    current_user: CurrentUserDep,
+) -> ProjectRow:
+    try:
+        result = await merge_projects_service(
+            session,
+            name=body.name,
+            project_revisions={
+                item.project_id: item.expected_updated_at
+                for item in body.projects
+            },
+            classes=tuple(
+                ProjectMergeClassPlan(
+                    name=item.name,
+                    color=item.color,
+                    sources=tuple(
+                        ProjectMergeClassSourcePlan(
+                            project_id=source.project_id,
+                            class_id=source.class_id,
+                        )
+                        for source in item.sources
+                    ),
+                )
+                for item in body.classes
+            ),
+            owner_id=current_user.id,
+        )
+    except ProjectMergeNotFound as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ProjectMergeConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except IntegrityError as error:
+        raise HTTPException(
+            status_code=409,
+            detail="프로젝트가 변경되었거나 이미 있는 프로젝트 이름입니다.",
+        ) from error
+
+    rows = await _project_rows(
+        session,
+        current_user.id,
+        project_id=result.project_id,
+    )
+    if not rows:
+        raise HTTPException(status_code=500, detail="통합 프로젝트를 불러오지 못했습니다.")
     return rows[0]
 
 
@@ -756,6 +878,245 @@ async def update_project_class(
         class_id=class_id,
         name=project_class.name,
         color=project_class.color,
+    )
+
+
+@router.put(
+    "/{project_id}/classes",
+    response_model=ProjectClassList,
+)
+async def replace_project_classes(
+    project_id: int,
+    body: ProjectClassBulkUpdate,
+    session: Session,
+    current_user: CurrentUserDep,
+) -> ProjectClassList:
+    """Atomically reorder the catalog and every persisted class reference."""
+    active_job_statement = (
+        select(UploadJob.id)
+        .join(Dataset, Dataset.id == UploadJob.dataset_id)
+        .where(
+            Dataset.project_id == project_id,
+            Dataset.owner_id == current_user.id,
+            UploadJob.state.in_(
+                ("queued", "running", "awaiting_class_resolution")
+            ),
+        )
+        .limit(1)
+    )
+    # Ingestion can retain project and dataset locks while processing a chunk.
+    # Its durable active-job row lets this mutation fail before waiting on it.
+    if await session.scalar(active_job_statement) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="업로드 처리 중에는 클래스 순서를 변경할 수 없습니다.",
+        )
+    try:
+        project = await _owned_project_or_404(
+            session,
+            project_id,
+            current_user.id,
+            for_update=True,
+            nowait=True,
+        )
+    except DBAPIError as error:
+        await session.rollback()
+        if is_lock_not_available(error):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "다른 데이터 작업이 진행 중입니다. "
+                    "작업이 끝난 뒤 다시 시도해주세요."
+                ),
+            ) from error
+        raise
+    # Close the race where an upload was queued after the preflight read but
+    # before this transaction acquired the project lock.
+    if await session.scalar(active_job_statement) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="업로드 처리 중에는 클래스 순서를 변경할 수 없습니다.",
+        )
+    if project.updated_at != body.expected_updated_at:
+        raise HTTPException(
+            status_code=409,
+            detail="프로젝트가 변경되었습니다. 새로고침 후 다시 시도해주세요.",
+        )
+    current_classes = (
+        await session.execute(
+            select(
+                ProjectClass.class_id,
+                ProjectClass.name,
+                ProjectClass.color,
+            )
+            .where(ProjectClass.project_id == project_id)
+            .order_by(ProjectClass.class_id)
+            .with_for_update()
+        )
+    ).all()
+    current_class_ids = [row.class_id for row in current_classes]
+    requested_class_ids = [row.class_id for row in body.classes]
+    if (
+        len(requested_class_ids) != len(current_class_ids)
+        or set(requested_class_ids) != set(current_class_ids)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="클래스 목록이 변경되었습니다. 새로고침 후 다시 시도해주세요.",
+        )
+
+    requested_names = [row.name for row in body.classes]
+    if len(requested_names) != len(set(requested_names)):
+        raise HTTPException(
+            status_code=409,
+            detail="이미 있는 클래스 이름입니다.",
+        )
+
+    # A dataset row is the shared mutation lock for annotations and training
+    # snapshots. Lock every child in a stable order so neither can observe a
+    # half-old, half-new catalog while the IDs are remapped.
+    try:
+        dataset_ids = list(
+            await session.scalars(
+                select(Dataset.id)
+                .where(
+                    Dataset.project_id == project_id,
+                    Dataset.owner_id == current_user.id,
+                )
+                .order_by(Dataset.id)
+                .with_for_update(nowait=True)
+            )
+        )
+    except DBAPIError as error:
+        await session.rollback()
+        if is_lock_not_available(error):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "다른 데이터 작업이 진행 중입니다. "
+                    "작업이 끝난 뒤 다시 시도해주세요."
+                ),
+            ) from error
+        raise
+
+    dataset_classes = (
+        (
+            await session.execute(
+                select(DatasetClass.dataset_id, DatasetClass.class_id)
+                .where(DatasetClass.dataset_id.in_(dataset_ids))
+                .order_by(DatasetClass.dataset_id, DatasetClass.class_id)
+                .with_for_update()
+            )
+        ).all()
+        if dataset_ids
+        else []
+    )
+    current_class_id_set = set(current_class_ids)
+    if any(
+        row.class_id not in current_class_id_set for row in dataset_classes
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="데이터셋 클래스 정보가 프로젝트와 일치하지 않습니다.",
+        )
+
+    unknown_annotation_id = (
+        await session.scalar(
+            select(Annotation.id)
+            .join(Image, Image.id == Annotation.image_id)
+            .where(
+                Image.dataset_id.in_(dataset_ids),
+                Annotation.class_id.not_in(current_class_ids),
+            )
+            .limit(1)
+        )
+        if dataset_ids
+        else None
+    )
+    if unknown_annotation_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="어노테이션 클래스 정보가 프로젝트와 일치하지 않습니다.",
+        )
+
+    class_id_remap = {
+        row.class_id: new_class_id
+        for new_class_id, row in enumerate(body.classes)
+    }
+    class_name_by_old_id = {row.class_id: row.name for row in body.classes}
+    project_image_ids = select(Image.id).where(Image.dataset_id.in_(dataset_ids))
+
+    try:
+        if any(
+            old_class_id != new_class_id
+            for old_class_id, new_class_id in class_id_remap.items()
+        ):
+            await session.execute(
+                update(Annotation)
+                .where(
+                    Annotation.image_id.in_(project_image_ids),
+                    Annotation.class_id.in_(current_class_ids),
+                )
+                .values(
+                    class_id=case(
+                        *(
+                            (Annotation.class_id == old_class_id, new_class_id)
+                            for old_class_id, new_class_id in class_id_remap.items()
+                        ),
+                        else_=Annotation.class_id,
+                    ),
+                    updated_at=func.now(),
+                )
+                .execution_options(synchronize_session=False)
+            )
+        if dataset_ids:
+            await session.execute(
+                delete(DatasetClass).where(
+                    DatasetClass.dataset_id.in_(dataset_ids)
+                )
+            )
+        await session.execute(
+            delete(ProjectClass).where(ProjectClass.project_id == project_id)
+        )
+        session.add_all(
+            [
+                ProjectClass(
+                    project_id=project_id,
+                    class_id=new_class_id,
+                    name=row.name,
+                    color=row.color,
+                )
+                for new_class_id, row in enumerate(body.classes)
+            ]
+        )
+        session.add_all(
+            [
+                DatasetClass(
+                    dataset_id=row.dataset_id,
+                    class_id=class_id_remap[row.class_id],
+                    name=class_name_by_old_id[row.class_id],
+                )
+                for row in dataset_classes
+            ]
+        )
+        project.updated_at = func.now()
+        await session.commit()
+    except IntegrityError as error:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="클래스 순서를 저장하지 못했습니다.",
+        ) from error
+
+    return ProjectClassList(
+        classes=[
+            ProjectClassRow(
+                class_id=new_class_id,
+                name=row.name,
+                color=row.color,
+            )
+            for new_class_id, row in enumerate(body.classes)
+        ]
     )
 
 

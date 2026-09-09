@@ -17,6 +17,7 @@ from app.models import (
 )
 from app.services import dataset_merge as dataset_merge_service
 from app.services.quota import increase_bytes_used
+from app.services.split import training_group_key, training_source_key
 from app.services.storage import contained_storage_path, storage_relative_path
 
 
@@ -68,6 +69,12 @@ async def _create_shared_source(
             stem=suffix,
             filename=original.name,
             rel_path=f"images/train/{original.name}",
+            training_source_key=training_source_key(dataset_id, None),
+            training_group_key=training_group_key(
+                training_source_key(dataset_id, None),
+                filename=original.name,
+                rel_path=f"images/train/{original.name}",
+            ),
             split="train",
             width=64,
             height=32,

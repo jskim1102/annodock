@@ -52,7 +52,10 @@ test("expanded sources render in the row immediately after their merged dataset"
 });
 
 test("source details use a semantic nested table with selection, dataset, image, and label columns", () => {
-  assert.match(projectsPage, /merged-dataset-badge[^>]*>병합</);
+  assert.match(
+    projectsPage,
+    /merged-dataset-badge[^>]*>\{dataset\.merge_purpose === "train" \? "학습용" : "병합"\}</,
+  );
   assert.match(projectsPage, /<table[\s\S]*?className="merged-source-table"/);
   assert.match(projectsPage, /<caption className="sr-only">[^<]*원본 데이터셋[^<]*<\/caption>/);
   assert.doesNotMatch(projectsPage, /merged-source-table[\s\S]{0,400}?<thead>/);

@@ -426,6 +426,10 @@ test("the upload page chooses grouping automatically and uploads each source seq
   assert.match(uploadPage, /uploadPlan\.length > 200/);
   assert.match(uploadPage, /const merged = await mergeDatasets\(\{/);
   assert.match(uploadPage, /dataset_ids: completed\.map\(\(dataset\) => dataset\.id\)/);
+  assert.match(
+    uploadPage,
+    /const merged = await mergeDatasets\(\{[\s\S]*?purpose:\s*"merge"/,
+  );
   assert.match(uploadPage, /setFinalDataset\(\{ id: merged\.id, name: merged\.name \}\)/);
   assert.match(uploadPage, /setStats\(\{[\s\S]*images: merged\.image_count,[\s\S]*annotations: merged\.annotation_count,[\s\S]*classes: merged\.class_count/);
   assert.doesNotMatch(appCss, /\.upload-mode-options/);
@@ -445,6 +449,10 @@ test("uploads can append to one of the project's ready merged datasets", () => {
   assert.match(uploadPage, /const selectedMergedDataset = mergedUploadTargets\.find/);
   assert.match(uploadPage, /const merged = await extendMergedDataset\(selectedMergedDataset\.id, \{/);
   assert.match(uploadPage, /dataset_ids: completed\.map\(\(dataset\) => dataset\.id\)/);
+  assert.match(
+    uploadPage,
+    /const merged = await extendMergedDataset\(selectedMergedDataset\.id, \{[\s\S]*?purpose:\s*"merge"/,
+  );
   assert.match(uploadPage, /setFinalDataset\(\{ id: merged\.id, name: merged\.name \}\)/);
   assert.match(uploadPage, /기존 병합 데이터셋에 포함 완료/);
   assert.match(uploadPage, /\$\{selectedMergedDataset\.name\}에 포함합니다\./);

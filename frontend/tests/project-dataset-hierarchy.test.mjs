@@ -153,6 +153,30 @@ test("project toolbar keeps the sort menu fixed-width beside intrinsic controls"
   assert.match(scopedSortRule, /margin-left:\s*auto;/);
 });
 
+test("projects can be selected and consolidated with an explicit class plan", () => {
+  assert.match(projectsPage, /selectedProjectIds/);
+  assert.match(projectsPage, /aria-label=\{`\$\{project\.name\} 프로젝트 선택`\}/);
+  assert.match(
+    projectsPage,
+    /project-toolbar-end[\s\S]*project-merge-button[\s\S]*통합[\s\S]*className="sort-select"/,
+  );
+  assert.match(appCss, /\.project-toolbar-end\s*\{[^}]*margin-left:\s*auto;/);
+  assert.match(client, /export interface ProjectMergeInput/);
+  assert.match(client, /export function mergeProjects/);
+  assert.match(client, /"\/api\/projects\/merge"/);
+  assert.match(projectsPage, /expected_updated_at: project\.updated_at/);
+  assert.match(projectsPage, /function MergeProjectsDialog/);
+  assert.match(projectsPage, /동일한 이름끼리 통합/);
+  assert.match(projectsPage, /프로젝트별 분리/);
+  assert.match(projectsPage, /통합 프로젝트 이름/);
+  assert.match(projectsPage, /className="class-order-index mono"/);
+  assert.match(projectsPage, /draggable=\{!busy\}/);
+  assert.match(projectsPage, /결과 클래스 인덱스/);
+  assert.match(projectsPage, /이미지 파일은 복사하지 않습니다/);
+  assert.match(projectsPage, /원본 프로젝트는 사라집니다/);
+  assert.match(appCss, /\.project-merge-class-sources/);
+});
+
 test("new project creation sends class names and colors", () => {
   assert.match(newProjectDialog, /onCreate:\s*\(project:/);
   assert.match(newProjectDialog, /classes[\s\S]*color/);
@@ -175,6 +199,26 @@ test("a project can be created before any initial class or dataset exists", () =
   assert.doesNotMatch(newProjectDialog, /canReuseClasses/);
   assert.match(newProjectDialog, /classInputMode === "existing"[\s\S]*selectedSource[\s\S]*:\s*\[\]/);
   assert.match(newProjectDialog, /첫 데이터셋 업로드 시 클래스가 설정됩니다/);
+});
+
+test("project classes can be reordered by drag or keyboard and save atomically", () => {
+  assert.match(client, /export function updateProjectClasses/);
+  assert.match(client, /expected_updated_at: expectedUpdatedAt/);
+  assert.match(projectsPage, /const orderChanged = rows\.some/);
+  assert.match(projectsPage, /draggable=\{!busy\}/);
+  assert.match(projectsPage, /onDragStart=/);
+  assert.match(projectsPage, /onDragOver=/);
+  assert.match(projectsPage, /onDrop=/);
+  assert.match(projectsPage, /event\.key === "ArrowUp"/);
+  assert.match(projectsPage, /event\.key === "ArrowDown"/);
+  assert.match(projectsPage, /className="class-order-index mono"/);
+  assert.match(
+    projectsPage,
+    /await updateProjectClasses\(project\.id, project\.updated_at, rows\.map/,
+  );
+  assert.doesNotMatch(projectsPage, /for \(const row of changedRows\)/);
+  assert.match(appCss, /\.class-reorder-handle\s*\{[^}]*cursor:\s*grab/);
+  assert.match(appCss, /\.class-editor-row\.is-drag-over/);
 });
 
 test("dataset upload requires and submits the fixed project context", () => {

@@ -13,14 +13,16 @@ import {
   imageResourceUrl,
   invalidateStorageQuotaCache,
   mergeDatasets,
+  mergeProjects,
   renameDataset,
   renameProject,
-  updateProjectClass,
+  updateProjectClasses,
   type DatasetMergeOverlap,
   type ProjectDeleteConfirmation,
   type ProjectClassImageCount,
   type ProjectDatasetRow,
   type ProjectDatasetSourceRow,
+  type ProjectMergeInput,
   type ProjectRow,
 } from "../api/client";
 import { AppShell } from "../components/AppShell";
@@ -141,8 +143,94 @@ interface DeleteDialogState extends ProjectDeleteConfirmation {
   project: ProjectRow;
 }
 
+type ProjectClassMergePolicy = "same_name" | "separate";
+
+interface ProjectMergeDraftSource {
+  project_id: number;
+  project_name: string;
+  class_id: number;
+  class_name: string;
+}
+
+interface ProjectMergeDraftClass {
+  key: string;
+  name: string;
+  color: string;
+  sources: ProjectMergeDraftSource[];
+}
+
+function uniqueProjectMergeClassName(base: string, usedNames: Set<string>) {
+  const normalizedBase = base.slice(0, 255);
+  if (!usedNames.has(normalizedBase)) {
+    usedNames.add(normalizedBase);
+    return normalizedBase;
+  }
+  let suffix = 2;
+  while (suffix < 10_000) {
+    const ending = ` (${suffix})`;
+    const candidate = `${normalizedBase.slice(0, 255 - ending.length)}${ending}`;
+    if (!usedNames.has(candidate)) {
+      usedNames.add(candidate);
+      return candidate;
+    }
+    suffix += 1;
+  }
+  return `${normalizedBase.slice(0, 220)}-${crypto.randomUUID()}`.slice(0, 255);
+}
+
+function buildProjectMergeClasses(
+  projects: ProjectRow[],
+  policy: ProjectClassMergePolicy,
+): ProjectMergeDraftClass[] {
+  if (policy === "same_name") {
+    const rowsByName = new Map<string, ProjectMergeDraftClass>();
+    projects.forEach((project) => {
+      project.classes.forEach((projectClass) => {
+        const source = {
+          project_id: project.id,
+          project_name: project.name,
+          class_id: projectClass.class_id,
+          class_name: projectClass.name,
+        };
+        const existing = rowsByName.get(projectClass.name);
+        if (existing) {
+          existing.sources.push(source);
+          existing.key = existing.sources
+            .map((item) => `${item.project_id}:${item.class_id}`)
+            .join("|");
+        } else {
+          rowsByName.set(projectClass.name, {
+            key: `${project.id}:${projectClass.class_id}`,
+            name: projectClass.name,
+            color: projectClass.color,
+            sources: [source],
+          });
+        }
+      });
+    });
+    return [...rowsByName.values()];
+  }
+
+  const usedNames = new Set<string>();
+  return projects.flatMap((project) => project.classes.map((projectClass) => ({
+    key: `${project.id}:${projectClass.class_id}`,
+    name: uniqueProjectMergeClassName(
+      `${projectClass.name} · ${project.name}`,
+      usedNames,
+    ),
+    color: projectClass.color,
+    sources: [{
+      project_id: project.id,
+      project_name: project.name,
+      class_id: projectClass.class_id,
+      class_name: projectClass.name,
+    }],
+  })));
+}
+
 export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?: boolean }) {
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [selectedProjectIds, setSelectedProjectIds] = useState<Set<number>>(new Set());
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [search, setSearch] = useState("");
   const [filterOn, setFilterOn] = useState(false);
@@ -158,6 +246,9 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
   const [mergeBusy, setMergeBusy] = useState(false);
   const [mergeError, setMergeError] = useState<string | null>(null);
   const [mergeConflict, setMergeConflict] = useState<DatasetMergeOverlap | null>(null);
+  const [projectMergeTarget, setProjectMergeTarget] = useState<ProjectRow[] | null>(null);
+  const [projectMergeBusy, setProjectMergeBusy] = useState(false);
+  const [projectMergeError, setProjectMergeError] = useState<string | null>(null);
   const [classExtractionTarget, setClassExtractionTarget] = useState<ClassExtractionDialogTarget | null>(null);
   const [classExtractionBusy, setClassExtractionBusy] = useState(false);
   const [classExtractionError, setClassExtractionError] = useState<string | null>(null);
@@ -185,6 +276,10 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
         const response = await getProjects();
         if (!active) return;
         setProjects(response.items);
+        const liveProjectIds = new Set(response.items.map((project) => project.id));
+        setSelectedProjectIds((current) => new Set(
+          [...current].filter((projectId) => liveProjectIds.has(projectId)),
+        ));
         setError(null);
         const datasets = response.items.flatMap((project) => project.datasets);
         const thumbnailEntries = await loadThumbnailEntries(datasets);
@@ -252,6 +347,15 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
     setSelected((current) => toggleDatasetSelection(current, id, mutuallyExclusiveIds));
   };
 
+  const updateSelectedProjects = (projectId: number) => {
+    setSelectedProjectIds((current) => {
+      const next = new Set(current);
+      if (next.has(projectId)) next.delete(projectId);
+      else if (next.size < 50) next.add(projectId);
+      return next;
+    });
+  };
+
   const toggleProject = (projectId: number) => {
     setExpanded((current) => {
       if (current.has(projectId)) return new Set();
@@ -309,6 +413,39 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
     if (purpose === "train") navigate(`/datasets/${datasetId}/train`);
   };
 
+  const openProjectMergeDialog = () => {
+    const targets = projects.filter((project) => selectedProjectIds.has(project.id));
+    if (targets.length < 2) return;
+    setProjectMergeError(null);
+    setProjectMergeTarget(targets);
+  };
+
+  const submitProjectMerge = async (input: ProjectMergeInput) => {
+    const targets = projectMergeTarget;
+    if (!targets || projectMergeBusy) return;
+    setProjectMergeBusy(true);
+    setProjectMergeError(null);
+    try {
+      const merged = await mergeProjects(input);
+      const sourceIds = new Set(targets.map((project) => project.id));
+      setProjects((current) => [
+        merged,
+        ...current.filter((project) => !sourceIds.has(project.id)),
+      ]);
+      setSelectedProjectIds(new Set());
+      setSelected(new Set());
+      setExpanded(new Set([merged.id]));
+      setCreatedProject(merged.name);
+      setProjectMergeTarget(null);
+    } catch (reason: unknown) {
+      setProjectMergeError(
+        reason instanceof Error ? reason.message : "프로젝트를 통합하지 못했습니다.",
+      );
+    } finally {
+      setProjectMergeBusy(false);
+    }
+  };
+
   const submitMerge = async (name: string, targetDatasetId: number | null) => {
     const target = mergeTarget;
     if (!target || mergeBusy) return;
@@ -325,10 +462,12 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
             dataset_ids: target.datasets
               .filter((dataset) => dataset.id !== targetDataset.id)
               .map((dataset) => dataset.id),
+            purpose: target.purpose,
           })
         : await mergeDatasets({
             name,
             dataset_ids: target.datasets.map((dataset) => dataset.id),
+            purpose: target.purpose,
           });
       invalidateStorageQuotaCache();
       await continueMergedAction(merged.id, target.purpose);
@@ -398,6 +537,11 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
       getProjectSelectionRows(project.datasets).map((dataset) => dataset.id),
     );
     setProjects((current) => current.filter((candidate) => candidate.id !== project.id));
+    setSelectedProjectIds((current) => {
+      const next = new Set(current);
+      next.delete(project.id);
+      return next;
+    });
     setExpanded((current) => {
       const next = new Set(current);
       next.delete(project.id);
@@ -558,6 +702,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
 
   const anyDialogOpen = dialogOpen
     || mergeTarget !== null
+    || projectMergeTarget !== null
     || classExtractionTarget !== null
     || renameTarget !== null
     || deleteConfirmation !== null
@@ -614,7 +759,16 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
               <div className="project-toolbar">
                 <label className="search-field"><Icon name="search" size={15} /><span className="sr-only">프로젝트 또는 데이터셋 이름 검색</span><input value={search} placeholder="이름 검색" onChange={(event) => setSearch(event.target.value)} /></label>
                 <button className={`btn btn-secondary btn-sm${filterOn ? " is-active" : ""}`} type="button" aria-pressed={filterOn} onClick={() => setFilterOn((current) => !current)}><Icon name="filter" size={14} /> 필터</button>
-                <SelectMenu className="sort-select" value={sortOrder} onChange={(value) => setSortOrder(value as ProjectSortOrder)} ariaLabel="정렬" options={[{ value: "recent", label: "최근 생성순" }, { value: "name", label: "이름순" }]} />
+                <div className="project-toolbar-end">
+                  <button
+                    className="btn btn-secondary btn-sm project-merge-button"
+                    type="button"
+                    disabled={selectedProjectIds.size < 2}
+                    aria-label={`선택한 프로젝트 ${selectedProjectIds.size}개 통합`}
+                    onClick={openProjectMergeDialog}
+                  ><Icon name="layers" size={14} /> 통합</button>
+                  <SelectMenu className="sort-select" value={sortOrder} onChange={(value) => setSortOrder(value as ProjectSortOrder)} ariaLabel="정렬" options={[{ value: "recent", label: "최근 생성순" }, { value: "name", label: "이름순" }]} />
+                </div>
               </div>
               <div className="project-card-list">
                 {visibleProjects.map((project) => {
@@ -626,11 +780,13 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
                       key={project.id}
                       project={project}
                       expanded={isExpanded}
+                      projectSelected={selectedProjectIds.has(project.id)}
                       selected={selected}
                       selectedRows={selectedRows}
                       thumbs={thumbs}
                       busy={mutatingProjectId === project.id}
                       onToggle={() => toggleProject(project.id)}
+                      onSelectProject={() => updateSelectedProjects(project.id)}
                       onSelect={updateSelected}
                       onSelectAll={(datasetIds, shouldSelect) => {
                         setSelected((current) => {
@@ -683,6 +839,19 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
           setDialogOpen(false);
         }).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "생성하지 못했습니다."));
       }} /> : null}
+      {projectMergeTarget ? (
+        <MergeProjectsDialog
+          projects={projectMergeTarget}
+          busy={projectMergeBusy}
+          error={projectMergeError}
+          onClose={() => {
+            if (projectMergeBusy) return;
+            setProjectMergeTarget(null);
+            setProjectMergeError(null);
+          }}
+          onSubmit={(input) => void submitProjectMerge(input)}
+        />
+      ) : null}
       {mergeTarget ? (
         <MergeDatasetsDialog
           target={mergeTarget}
@@ -780,11 +949,13 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
 interface ProjectRowsProps {
   project: ProjectRow;
   expanded: boolean;
+  projectSelected: boolean;
   selected: Set<number>;
   selectedRows: ProjectDatasetRow[];
   thumbs: Map<number, string>;
   busy: boolean;
   onToggle: () => void;
+  onSelectProject: () => void;
   onSelect: (datasetId: number, mutuallyExclusiveIds?: readonly number[]) => void;
   onSelectAll: (datasetIds: number[], shouldSelect: boolean) => void;
   onMergeAction: (purpose: MergeActionPurpose) => void;
@@ -806,11 +977,13 @@ interface ClassImageCountResult {
 function ProjectRows({
   project,
   expanded: isExpanded,
+  projectSelected,
   selected,
   selectedRows,
   thumbs,
   busy,
   onToggle,
+  onSelectProject,
   onSelect,
   onSelectAll,
   onMergeAction,
@@ -888,11 +1061,21 @@ function ProjectRows({
 
   return (
     <article
-      className={`project-card${isExpanded ? " is-expanded" : ""}`}
+      className={`project-card${isExpanded ? " is-expanded" : ""}${projectSelected ? " is-selected" : ""}`}
       aria-labelledby={`project-title-${project.id}`}
     >
       <header className="project-card-header">
         <div className="project-title-lockup">
+          <button
+            className={`checkbox project-select-checkbox${projectSelected ? " is-on" : ""}`}
+            type="button"
+            role="checkbox"
+            aria-checked={projectSelected}
+            aria-label={`${project.name} 프로젝트 선택`}
+            onClick={onSelectProject}
+          >
+            {projectSelected ? <Icon name="check" size={10} /> : null}
+          </button>
           <button
             className="project-expand"
             type="button"
@@ -1086,7 +1269,7 @@ function ProjectRows({
                               </button>
                             ) : <span className="merged-dataset-toggle-spacer" aria-hidden="true">−</span>}
                             {ready ? <a className="dataset-thumb" href={appHref(`/datasets/${dataset.id}/viewer`)}>{thumbs.get(dataset.id) ? <AuthenticatedImage resourcePath={thumbs.get(dataset.id)} alt="" /> : null}</a> : <span className="dataset-thumb" />}
-                            {ready ? <a className="dataset-name" href={appHref(`/datasets/${dataset.id}/viewer`)}><strong>{dataset.name}{dataset.is_merged ? <span className="merged-dataset-badge">병합</span> : null}</strong><span>이미지 {dataset.image_count.toLocaleString()} · 라벨 {dataset.annotation_count.toLocaleString()}</span></a> : <span className="dataset-name"><strong>{dataset.name}{dataset.is_merged ? <span className="merged-dataset-badge">병합</span> : null}</strong><span>이미지 {dataset.image_count.toLocaleString()} · 라벨 {dataset.annotation_count.toLocaleString()}</span></span>}
+                            {ready ? <a className="dataset-name" href={appHref(`/datasets/${dataset.id}/viewer`)}><strong>{dataset.name}{dataset.is_merged ? <span className="merged-dataset-badge">{dataset.merge_purpose === "train" ? "학습용" : "병합"}</span> : null}</strong><span>이미지 {dataset.image_count.toLocaleString()} · 라벨 {dataset.annotation_count.toLocaleString()}</span></a> : <span className="dataset-name"><strong>{dataset.name}{dataset.is_merged ? <span className="merged-dataset-badge">{dataset.merge_purpose === "train" ? "학습용" : "병합"}</span> : null}</strong><span>이미지 {dataset.image_count.toLocaleString()} · 라벨 {dataset.annotation_count.toLocaleString()}</span></span>}
                           </div>
                         </td>
                         <td>
@@ -1735,6 +1918,345 @@ function ClassExtractionDialog({
   );
 }
 
+interface MergeProjectsDialogProps {
+  projects: ProjectRow[];
+  busy: boolean;
+  error: string | null;
+  onClose: () => void;
+  onSubmit: (input: ProjectMergeInput) => void;
+}
+
+function MergeProjectsDialog({
+  projects,
+  busy,
+  error,
+  onClose,
+  onSubmit,
+}: MergeProjectsDialogProps) {
+  const [name, setName] = useState(
+    `${projects[0]?.name ?? "새 프로젝트"} 통합`.slice(0, 255),
+  );
+  const [policy, setPolicy] = useState<ProjectClassMergePolicy>("same_name");
+  const [rows, setRows] = useState(() => buildProjectMergeClasses(projects, "same_name"));
+  const [colorClassKey, setColorClassKey] = useState<string | null>(null);
+  const [draggedClassKey, setDraggedClassKey] = useState<string | null>(null);
+  const [dragOverClassKey, setDragOverClassKey] = useState<string | null>(null);
+  const draggedClassKeyRef = useRef<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [busy, onClose]);
+
+  const setMergePolicy = (nextPolicy: ProjectClassMergePolicy) => {
+    setPolicy(nextPolicy);
+    setRows(buildProjectMergeClasses(projects, nextPolicy));
+    setColorClassKey(null);
+    setDraggedClassKey(null);
+    setDragOverClassKey(null);
+    draggedClassKeyRef.current = null;
+  };
+
+  const moveClassToIndex = (classKey: string, targetIndex: number) => {
+    setRows((current) => {
+      const sourceIndex = current.findIndex((row) => row.key === classKey);
+      const boundedTargetIndex = Math.max(0, Math.min(current.length - 1, targetIndex));
+      if (sourceIndex < 0 || sourceIndex === boundedTargetIndex) return current;
+      const next = [...current];
+      const [moved] = next.splice(sourceIndex, 1);
+      next.splice(boundedTargetIndex, 0, moved);
+      return next;
+    });
+    setColorClassKey(null);
+  };
+
+  const normalizedName = name.trim();
+  const normalizedClassNames = rows.map((row) => row.name.trim());
+  const hasBlankClassName = normalizedClassNames.some((className) => !className);
+  const hasDuplicateClassName = (
+    new Set(normalizedClassNames).size !== normalizedClassNames.length
+  );
+  const hasActiveUpload = projects.some((project) => (
+    project.datasets.some((dataset) => dataset.active_job !== null)
+  ));
+  const overlapCount = rows.filter((row) => row.sources.length > 1).length;
+  const validationMessage = projects.length > 50
+    ? "한 번에 최대 50개 프로젝트를 통합할 수 있습니다."
+    : rows.length > 200
+      ? "결과 클래스는 최대 200개까지 만들 수 있습니다. 통합 방식을 바꾸거나 프로젝트 수를 줄여주세요."
+      : hasBlankClassName
+        ? "결과 클래스 이름을 모두 입력해주세요."
+        : hasDuplicateClassName
+          ? "결과 클래스 이름은 서로 달라야 합니다."
+          : hasActiveUpload
+            ? "업로드 처리 중인 프로젝트가 있습니다. 완료된 뒤 통합해주세요."
+            : null;
+  const canSubmit = (
+    normalizedName.length > 0
+    && validationMessage === null
+    && projects.length >= 2
+  );
+
+  return (
+    <div
+      className="dialog-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !busy) onClose();
+      }}
+    >
+      <section
+        className="dialog project-action-dialog project-merge-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="project-merge-title"
+        aria-describedby="project-merge-description"
+      >
+        <button
+          className="btn btn-ghost btn-sm dialog-close"
+          type="button"
+          aria-label="닫기"
+          disabled={busy}
+          onClick={onClose}
+        ><Icon name="x" size={16} /></button>
+        <h2 className="dialog-title" id="project-merge-title">프로젝트 통합</h2>
+        <p className="merge-dataset-copy" id="project-merge-description">
+          선택한 프로젝트의 데이터셋과 학습 기록을 하나의 프로젝트로 옮깁니다.
+          클래스 순서는 위에서부터 결과 클래스 인덱스 0, 1, 2…가 됩니다.
+        </p>
+
+        <div className="project-merge-warning">
+          <Icon name="warning" size={18} />
+          <div>
+            <strong>이미지 파일은 복사하지 않습니다.</strong>
+            <p>통합이 완료되면 원본 프로젝트는 사라집니다. 데이터셋과 기존 학습 기록은 그대로 유지됩니다.</p>
+          </div>
+        </div>
+
+        <ul className="project-merge-source-list" aria-label="통합할 프로젝트">
+          {projects.map((project) => (
+            <li key={project.id}>
+              <span>{project.name}</span>
+              <span className="mono">
+                데이터셋 {project.dataset_count.toLocaleString()} · 클래스 {project.class_count.toLocaleString()}
+              </span>
+            </li>
+          ))}
+        </ul>
+
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!canSubmit) return;
+            onSubmit({
+              name: normalizedName,
+              projects: projects.map((project) => ({
+                project_id: project.id,
+                expected_updated_at: project.updated_at,
+              })),
+              classes: rows.map((row) => ({
+                name: row.name.trim(),
+                color: row.color,
+                sources: row.sources.map((source) => ({
+                  project_id: source.project_id,
+                  class_id: source.class_id,
+                })),
+              })),
+            });
+          }}
+        >
+          <div className="field project-merge-name-field">
+            <label htmlFor="project-merge-name">통합 프로젝트 이름</label>
+            <input
+              className={`input${error ? " is-error" : ""}`}
+              id="project-merge-name"
+              ref={inputRef}
+              value={name}
+              maxLength={255}
+              disabled={busy}
+              onChange={(event) => setName(event.target.value)}
+            />
+          </div>
+
+          <fieldset className="project-merge-policy" disabled={busy}>
+            <legend>겹치는 클래스 처리</legend>
+            <div className="project-merge-policy-options">
+              <label className="class-input-option">
+                <input
+                  type="radio"
+                  name="project-class-merge-policy"
+                  checked={policy === "same_name"}
+                  onChange={() => setMergePolicy("same_name")}
+                />
+                <span>
+                  <strong>동일한 이름끼리 통합</strong>
+                  <small>이름이 정확히 같은 클래스는 하나로 합치고, 겹치지 않는 클래스는 그대로 둡니다.</small>
+                </span>
+              </label>
+              <label className="class-input-option">
+                <input
+                  type="radio"
+                  name="project-class-merge-policy"
+                  checked={policy === "separate"}
+                  onChange={() => setMergePolicy("separate")}
+                />
+                <span>
+                  <strong>프로젝트별 분리</strong>
+                  <small>같은 이름이어도 원본 프로젝트별로 별도 클래스를 만듭니다.</small>
+                </span>
+              </label>
+            </div>
+            <span className="project-merge-policy-summary" role="status">
+              결과 클래스 {rows.length.toLocaleString()}개
+              {policy === "same_name" && overlapCount > 0
+                ? ` · 겹치는 클래스 ${overlapCount.toLocaleString()}개 통합`
+                : ""}
+            </span>
+          </fieldset>
+
+          <div className="project-merge-class-heading">
+            <strong>결과 클래스</strong>
+            <span>이름·색상을 수정하고 드래그해 인덱스를 정하세요.</span>
+          </div>
+          {rows.length === 0 ? (
+            <div className="project-merge-empty-classes">
+              선택한 프로젝트에 클래스가 없습니다. 클래스 없는 프로젝트로 통합됩니다.
+            </div>
+          ) : (
+            <div className="class-editor-list project-merge-class-list">
+              {rows.map((row, index) => (
+                <div
+                  className={`class-editor-row project-merge-class-row${
+                    dragOverClassKey === row.key && draggedClassKey !== row.key
+                      ? " is-drag-over"
+                      : ""
+                  }`}
+                  key={row.key}
+                  onDragOver={(event) => {
+                    const activeClassKey = draggedClassKeyRef.current;
+                    if (activeClassKey === null || activeClassKey === row.key) return;
+                    event.preventDefault();
+                    event.dataTransfer.dropEffect = "move";
+                    setDragOverClassKey(row.key);
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    const activeClassKey = draggedClassKeyRef.current;
+                    if (activeClassKey !== null) moveClassToIndex(activeClassKey, index);
+                    draggedClassKeyRef.current = null;
+                    setDraggedClassKey(null);
+                    setDragOverClassKey(null);
+                  }}
+                >
+                  <span
+                    className="class-order-index mono"
+                    aria-label={`결과 클래스 인덱스 ${index}`}
+                  >{index}</span>
+                  <div className="class-color-cell">
+                    <button
+                      className="class-swatch"
+                      style={{ background: row.color }}
+                      type="button"
+                      aria-label={`${row.name || `${index}번`} 클래스 색 변경`}
+                      aria-haspopup="dialog"
+                      aria-expanded={colorClassKey === row.key}
+                      disabled={busy}
+                      onClick={() => setColorClassKey((current) => current === row.key ? null : row.key)}
+                    />
+                    {colorClassKey === row.key ? (
+                      <ClassColorPicker
+                        className={row.name || `${index}번 클래스`}
+                        color={row.color}
+                        top={34}
+                        placement="start"
+                        onChange={(color) => setRows((current) => current.map((candidate) => (
+                          candidate.key === row.key ? { ...candidate, color } : candidate
+                        )))}
+                        onClose={() => setColorClassKey(null)}
+                      />
+                    ) : null}
+                  </div>
+                  <div className="project-merge-class-content">
+                    <input
+                      className="input"
+                      value={row.name}
+                      maxLength={255}
+                      disabled={busy}
+                      aria-label={`${index}번 결과 클래스 이름`}
+                      onChange={(event) => setRows((current) => current.map((candidate) => (
+                        candidate.key === row.key
+                          ? { ...candidate, name: event.target.value }
+                          : candidate
+                      )))}
+                    />
+                    <span className="project-merge-class-sources">
+                      {row.sources.map((source) => (
+                        <span key={`${source.project_id}:${source.class_id}`}>
+                          {source.project_name} · {source.class_name} #{source.class_id}
+                        </span>
+                      ))}
+                    </span>
+                  </div>
+                  <button
+                    className="btn btn-ghost btn-sm class-reorder-handle"
+                    type="button"
+                    draggable={!busy}
+                    disabled={busy}
+                    aria-label={`${row.name || `${index}번 클래스`} 순서 이동. 현재 인덱스 ${index}`}
+                    title="드래그하거나 위아래 방향키로 이동"
+                    onDragStart={(event) => {
+                      draggedClassKeyRef.current = row.key;
+                      setDraggedClassKey(row.key);
+                      setDragOverClassKey(null);
+                      event.dataTransfer.effectAllowed = "move";
+                      event.dataTransfer.setData("text/plain", row.key);
+                    }}
+                    onDragEnd={() => {
+                      draggedClassKeyRef.current = null;
+                      setDraggedClassKey(null);
+                      setDragOverClassKey(null);
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "ArrowUp") {
+                        event.preventDefault();
+                        moveClassToIndex(row.key, index - 1);
+                      }
+                      if (event.key === "ArrowDown") {
+                        event.preventDefault();
+                        moveClassToIndex(row.key, index + 1);
+                      }
+                    }}
+                  ><Icon name="list" size={16} /></button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {validationMessage ? (
+            <div className="error-text project-dialog-error" role="alert">{validationMessage}</div>
+          ) : null}
+          {error ? <div className="error-text project-dialog-error" role="alert">{error}</div> : null}
+          <div className="dialog-actions">
+            <button className="btn btn-secondary" type="button" disabled={busy} onClick={onClose}>취소</button>
+            <button className="btn btn-primary" type="submit" disabled={busy || !canSubmit}>
+              {busy ? "통합 중…" : `${projects.length}개 프로젝트 통합`}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
 interface RenameProjectDialogProps {
   project: ProjectRow;
   busy: boolean;
@@ -1758,6 +2280,9 @@ function EditProjectClassesDialog({
     project.classes.map((item) => ({ ...item })),
   );
   const [colorClassId, setColorClassId] = useState<number | null>(null);
+  const [draggedClassId, setDraggedClassId] = useState<number | null>(null);
+  const [dragOverClassId, setDragOverClassId] = useState<number | null>(null);
+  const draggedClassIdRef = useRef<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -1776,20 +2301,38 @@ function EditProjectClassesDialog({
     if (!original) return false;
     return original.name !== row.name.trim() || original.color !== row.color;
   });
+  const orderChanged = rows.some(
+    (row, index) => project.classes[index]?.class_id !== row.class_id,
+  );
+  const hasChanges = orderChanged || changedRows.length > 0;
   const hasBlankName = rows.some((row) => row.name.trim().length === 0);
 
+  const moveClassToIndex = (classId: number, targetIndex: number) => {
+    setRows((current) => {
+      const sourceIndex = current.findIndex((row) => row.class_id === classId);
+      const boundedTargetIndex = Math.max(
+        0,
+        Math.min(current.length - 1, targetIndex),
+      );
+      if (sourceIndex < 0 || sourceIndex === boundedTargetIndex) return current;
+      const next = [...current];
+      const [moved] = next.splice(sourceIndex, 1);
+      next.splice(boundedTargetIndex, 0, moved);
+      return next;
+    });
+    setColorClassId(null);
+  };
+
   const save = async () => {
-    if (busy || changedRows.length === 0 || hasBlankName) return;
+    if (busy || !hasChanges || hasBlankName) return;
     setBusy(true);
     setError(null);
     try {
-      for (const row of changedRows) {
-        const original = findOriginal(row.class_id);
-        await updateProjectClass(project.id, row.class_id, {
-          ...(original && original.name !== row.name.trim() ? { name: row.name.trim() } : {}),
-          ...(original && original.color !== row.color ? { color: row.color } : {}),
-        });
-      }
+      await updateProjectClasses(project.id, project.updated_at, rows.map((row) => ({
+        class_id: row.class_id,
+        name: row.name.trim(),
+        color: row.color,
+      })));
       onSaved();
     } catch (reason: unknown) {
       setError(reason instanceof Error ? reason.message : "클래스를 저장하지 못했습니다.");
@@ -1821,17 +2364,46 @@ function EditProjectClassesDialog({
         ><Icon name="x" size={16} /></button>
         <h2 className="dialog-title" id="edit-project-classes-title">클래스 수정</h2>
         <p className="project-delete-copy">
-          이름을 바꾸면 프로젝트의 모든 데이터셋에 함께 적용됩니다.
+          드래그하거나 이동 버튼에서 위아래 방향키를 눌러 순서를 바꿀 수 있습니다.
+          저장하면 새 순서대로 인덱스가 바뀌고 모든 데이터셋에 함께 적용됩니다.
         </p>
         <div className="class-editor-list">
-          {rows.map((row) => (
-            <div className="class-editor-row" key={row.class_id}>
+          {rows.map((row, index) => (
+            <div
+              className={`class-editor-row${
+                dragOverClassId === row.class_id && draggedClassId !== row.class_id
+                  ? " is-drag-over"
+                  : ""
+              }`}
+              key={row.class_id}
+              onDragOver={(event) => {
+                const activeClassId = draggedClassIdRef.current;
+                if (activeClassId === null || activeClassId === row.class_id) return;
+                event.preventDefault();
+                event.dataTransfer.dropEffect = "move";
+                setDragOverClassId(row.class_id);
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                const activeClassId = draggedClassIdRef.current;
+                if (activeClassId !== null) {
+                  moveClassToIndex(activeClassId, index);
+                }
+                draggedClassIdRef.current = null;
+                setDraggedClassId(null);
+                setDragOverClassId(null);
+              }}
+            >
+              <span
+                className="class-order-index mono"
+                aria-label={`현재 클래스 인덱스 ${index}`}
+              >{index}</span>
               <div className="class-color-cell">
                 <button
                   className="class-swatch"
                   style={{ background: row.color }}
                   type="button"
-                  aria-label={`${row.name || `${row.class_id}번`} 클래스 색 변경`}
+                  aria-label={`${row.name || `${index}번`} 클래스 색 변경`}
                   aria-haspopup="dialog"
                   aria-expanded={colorClassId === row.class_id}
                   disabled={busy}
@@ -1859,7 +2431,7 @@ function EditProjectClassesDialog({
                 value={row.name}
                 maxLength={255}
                 disabled={busy}
-                aria-label={`${row.class_id}번 클래스 이름`}
+                aria-label={`${index}번 클래스 이름`}
                 onChange={(event) =>
                   setRows((current) =>
                     current.map((candidate) =>
@@ -1870,6 +2442,36 @@ function EditProjectClassesDialog({
                   )
                 }
               />
+              <button
+                className="btn btn-ghost btn-sm class-reorder-handle"
+                type="button"
+                draggable={!busy}
+                disabled={busy}
+                aria-label={`${row.name || `${index}번 클래스`} 순서 이동. 현재 인덱스 ${index}`}
+                title="드래그하거나 위아래 방향키로 이동"
+                onDragStart={(event) => {
+                  draggedClassIdRef.current = row.class_id;
+                  setDraggedClassId(row.class_id);
+                  setDragOverClassId(null);
+                  event.dataTransfer.effectAllowed = "move";
+                  event.dataTransfer.setData("text/plain", String(row.class_id));
+                }}
+                onDragEnd={() => {
+                  draggedClassIdRef.current = null;
+                  setDraggedClassId(null);
+                  setDragOverClassId(null);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "ArrowUp") {
+                    event.preventDefault();
+                    moveClassToIndex(row.class_id, index - 1);
+                  }
+                  if (event.key === "ArrowDown") {
+                    event.preventDefault();
+                    moveClassToIndex(row.class_id, index + 1);
+                  }
+                }}
+              ><Icon name="list" size={16} /></button>
             </div>
           ))}
         </div>
@@ -1879,7 +2481,7 @@ function EditProjectClassesDialog({
           <button
             className="btn btn-primary"
             type="button"
-            disabled={busy || changedRows.length === 0 || hasBlankName}
+            disabled={busy || !hasChanges || hasBlankName}
             onClick={() => void save()}
           >{busy ? "저장 중…" : "저장"}</button>
         </div>

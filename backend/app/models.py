@@ -91,6 +91,11 @@ class Dataset(Base):
             "AND upload_part_index <= upload_part_count)",
             name="ck_datasets_upload_partition_fields",
         ),
+        CheckConstraint(
+            "merge_purpose IS NULL OR "
+            "(is_merged AND merge_purpose IN ('merge', 'train'))",
+            name="ck_datasets_merge_purpose",
+        ),
         UniqueConstraint(
             "owner_id",
             "upload_group_id",
@@ -124,6 +129,7 @@ class Dataset(Base):
     is_merged: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    merge_purpose: Mapped[str | None] = mapped_column(String(16), nullable=True)
     is_extracted: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
@@ -269,6 +275,11 @@ class Image(Base):
     stem: Mapped[str] = mapped_column(String(1024), nullable=False)
     filename: Mapped[str] = mapped_column(String(1024), nullable=False)
     rel_path: Mapped[str] = mapped_column(Text, nullable=False)
+    # The balancing key tracks the logical uploaded source (automatic upload
+    # partitions share one key). The group key is the atomic leakage boundary
+    # copied through merge/extract snapshots.
+    training_source_key: Mapped[str] = mapped_column(Text, nullable=False)
+    training_group_key: Mapped[str] = mapped_column(Text, nullable=False)
     split: Mapped[str | None] = mapped_column(String(64), nullable=True)
     width: Mapped[int] = mapped_column(Integer, nullable=False)
     height: Mapped[int] = mapped_column(Integer, nullable=False)

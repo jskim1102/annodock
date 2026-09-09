@@ -149,6 +149,27 @@ def enqueue_upload_batch_job(
     task.add_done_callback(application.state.job_tasks.discard)
 
 
+def enqueue_dataset_merge_job(application: FastAPI, job_id: int) -> None:
+    from app.services.dataset_merge import run_dataset_merge_job
+
+    task_name = f"dataset-merge-{job_id}"
+    if any(
+        not task.done() and task.get_name() == task_name
+        for task in application.state.job_tasks
+    ):
+        return
+    task = asyncio.create_task(
+        run_dataset_merge_job(
+            application.state.settings,
+            application.state.session_factory,
+            job_id,
+        ),
+        name=task_name,
+    )
+    application.state.job_tasks.add(task)
+    task.add_done_callback(application.state.job_tasks.discard)
+
+
 async def recover_upload_jobs(application: FastAPI) -> list[int]:
     """Requeue durable upload work left queued or running by a restart."""
 
@@ -163,15 +184,26 @@ async def recover_upload_jobs(application: FastAPI) -> list[int]:
                 )
             ).all()
         )
-        recoverable: list[tuple[int, list[int]]] = []
+        recoverable_uploads: list[tuple[int, list[int]]] = []
+        recoverable_merges: list[int] = []
         for job in jobs:
+            if job.kind == "dataset_merge":
+                job.state = "queued"
+                job.phase = "queued"
+                recoverable_merges.append(job.id)
+                continue
             upload_ids = list(job.upload_ids or [])
             if not upload_ids:
                 continue
             job.state = "queued"
-            recoverable.append((job.id, upload_ids))
+            recoverable_uploads.append((job.id, upload_ids))
         await session.commit()
 
-    for job_id, upload_ids in recoverable:
+    for job_id, upload_ids in recoverable_uploads:
         enqueue_upload_batch_job(application, job_id, upload_ids)
-    return [job_id for job_id, _upload_ids in recoverable]
+    for job_id in recoverable_merges:
+        enqueue_dataset_merge_job(application, job_id)
+    return [
+        *[job_id for job_id, _upload_ids in recoverable_uploads],
+        *recoverable_merges,
+    ]

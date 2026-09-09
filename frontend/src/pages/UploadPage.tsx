@@ -52,6 +52,7 @@ import {
 } from "../utils/dropCollection";
 import {
   formatRemainingTime,
+  uploadJobProcessingRatio,
   updateProgressEstimate,
   type ProgressEstimateState,
 } from "../utils/uploadProgress";
@@ -101,7 +102,7 @@ interface UnitTransferState {
   };
 }
 
-type LiveProgressStage = "idle" | "transferring" | "processing" | "finishing" | "done";
+type LiveProgressStage = "idle" | "preparing" | "transferring" | "processing" | "finishing" | "done";
 
 interface LiveProgress {
   stage: LiveProgressStage;
@@ -390,9 +391,29 @@ export function UploadPage() {
       ),
       0,
     );
+    // The backend owns durable, monotonic progress for each submitted job.
+    // This page alone also knows every not-yet-submitted ZIP, so the ETA clock
+    // must stay here and consume both browser and server progress as one job.
+    const updateOverallEstimate = (processedWork: number) => {
+      const estimate = updateProgressEstimate(progressEstimateRef.current, {
+        key: "overall-upload",
+        completed: processedWork,
+        total: totalWork,
+        atMs: performance.now(),
+      });
+      progressEstimateRef.current = estimate.state;
+      return estimate.remainingSeconds;
+    };
+    const initialEtaSeconds = updateOverallEstimate(completedWork);
     if (!isResumingPreparedBatch) {
       setProgress({ processed: completedWork, total: totalWork, current: "" });
     }
+    setLiveProgress({
+      stage: "preparing",
+      imageProcessed: 0,
+      imageTotal: 0,
+      etaSeconds: initialEtaSeconds,
+    });
 
     try {
       for (const unit of uploadPlan) {
@@ -498,29 +519,32 @@ export function UploadPage() {
                 preparedFiles,
                 totalFiles,
               }) => {
+                const preparationWork = (
+                  batchStart + batchBytes * preparedFiles / totalFiles
+                );
+                const etaSeconds = updateOverallEstimate(preparationWork);
                 setProgress({
-                  processed: batchStart + batchBytes * preparedFiles / totalFiles,
+                  processed: preparationWork,
                   total: totalWork,
                   current: `${unit.name} · ${preparedFiles.toLocaleString()} / ${totalFiles.toLocaleString()} 준비 중`,
+                });
+                setLiveProgress({
+                  stage: "preparing",
+                  imageProcessed: 0,
+                  imageTotal: 0,
+                  etaSeconds,
                 });
               });
               transferState.pendingBatch = { index: batchIndex, batch };
             }
             const transferStart = batchStart + batch.totalBytes;
-            const transferProgressKey = `transfer:${unit.key}:${batchCounts[unit.key] ?? 0}`;
             const transferred = await transferUploadBatch(batch, ({
               uploadedBytes,
               uploadedImages,
               totalImages,
               currentPath,
             }) => {
-              const estimate = updateProgressEstimate(progressEstimateRef.current, {
-                key: transferProgressKey,
-                completed: uploadedBytes,
-                total: batch.totalBytes,
-                atMs: performance.now(),
-              });
-              progressEstimateRef.current = estimate.state;
+              const etaSeconds = updateOverallEstimate(transferStart + uploadedBytes);
               setProgress({
                 processed: transferStart + uploadedBytes,
                 total: totalWork,
@@ -530,7 +554,7 @@ export function UploadPage() {
                 stage: "transferring",
                 imageProcessed: uploadedImages,
                 imageTotal: totalImages,
-                etaSeconds: estimate.remainingSeconds,
+                etaSeconds,
               });
             });
             if (
@@ -539,6 +563,7 @@ export function UploadPage() {
             ) transferState.knownJobId = transferred.knownJobId;
             transferState.pendingBatch = undefined;
             completedWork += batch.totalBytes * 2;
+            const etaSeconds = updateOverallEstimate(completedWork);
             completedBatches += 1;
             batchCounts[unit.key] = (batchCounts[unit.key] ?? 0) + 1;
             setCompletedBatchCounts({ ...batchCounts });
@@ -547,6 +572,10 @@ export function UploadPage() {
               total: totalWork,
               current: `${unit.name} · 전송 완료`,
             });
+            setLiveProgress((current) => ({
+              ...current,
+              etaSeconds,
+            }));
           }
         }
 
@@ -565,25 +594,11 @@ export function UploadPage() {
             const activeJobId = jobId;
             const unitProcessStart = completedWork;
             const updateJobProgress = (job: Job) => {
-              const ratio = job.image_total > 0
-                ? Math.min(1, job.image_processed / job.image_total)
-                : job.total > 0
-                  ? Math.min(1, job.processed / job.total)
-                  : 0;
+              const ratio = uploadJobProcessingRatio(job);
               const processingImages = job.phase === "storing" || job.phase === "deriving";
-              let etaSeconds: number | null = null;
-              if (processingImages && job.image_total > 0) {
-                const estimate = updateProgressEstimate(progressEstimateRef.current, {
-                  key: `processing:${activeJobId}`,
-                  completed: job.image_processed,
-                  total: job.image_total,
-                  atMs: performance.now(),
-                });
-                progressEstimateRef.current = estimate.state;
-                etaSeconds = estimate.remainingSeconds;
-              } else {
-                progressEstimateRef.current = null;
-              }
+              const etaSeconds = updateOverallEstimate(
+                unitProcessStart + unitBytes * ratio,
+              );
               setLiveProgress({
                 stage: processingImages ? "processing" : "finishing",
                 imageProcessed: job.image_processed,
@@ -654,11 +669,17 @@ export function UploadPage() {
             setUploadDatasetResults({ ...datasetResultsByUnit });
           }
           completedWork += unitBytes;
+          const etaSeconds = updateOverallEstimate(completedWork);
           setProgress({
             processed: completedWork,
             total: totalWork,
             current: `${unit.name} · 처리 완료`,
           });
+          setLiveProgress((current) => ({
+            ...current,
+            stage: "finishing",
+            etaSeconds,
+          }));
         }
 
         const datasetResults = unitDatasetResults ?? [{
@@ -715,6 +736,7 @@ export function UploadPage() {
         });
         const merged = await extendMergedDataset(selectedMergedDataset.id, {
           dataset_ids: completed.map((dataset) => dataset.id),
+          purpose: "merge",
         });
         setFinalDataset({ id: merged.id, name: merged.name });
         setStats({
@@ -742,6 +764,7 @@ export function UploadPage() {
         const merged = await mergeDatasets({
           name: datasetName.trim(),
           dataset_ids: completed.map((dataset) => dataset.id),
+          purpose: "merge",
         });
         setFinalDataset({ id: merged.id, name: merged.name });
         setStats({
@@ -848,7 +871,10 @@ export function UploadPage() {
       ? "서버에서 이미지 수 확인 중…"
       : null;
   const etaLabel = (
-    liveProgress.stage === "transferring" || liveProgress.stage === "processing"
+    liveProgress.stage === "preparing"
+    || liveProgress.stage === "transferring"
+    || liveProgress.stage === "processing"
+    || (liveProgress.stage === "finishing" && liveProgress.etaSeconds !== null)
   )
     ? `예상 남은 시간 ${formatRemainingTime(liveProgress.etaSeconds)}`
     : null;
