@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { AuthApiError } from "../api/auth";
+import { ApiError } from "../api/client";
+
 export interface EditorBox {
   id: number;
   classId: number;
@@ -10,7 +13,7 @@ export interface EditorBox {
   height: number;
 }
 
-export type AnnotationSaveState = "saving" | "saved" | "error";
+export type AnnotationSaveState = "saving" | "saved" | "error" | "rejected";
 
 interface UseAnnotationEdit {
   boxes: EditorBox[];
@@ -18,6 +21,7 @@ interface UseAnnotationEdit {
   undo: () => void;
   undoDepth: number;
   saveState: AnnotationSaveState;
+  saveError: string | null;
   retry: () => void;
   flush: () => Promise<boolean>;
   reset: (next: EditorBox[]) => void;
@@ -41,6 +45,7 @@ export function useAnnotationEdit(
   const [boxes, setBoxes] = useState(initialBoxes);
   const [undoStack, setUndoStack] = useState<EditorBox[][]>([]);
   const [saveState, setSaveState] = useState<AnnotationSaveState>("saved");
+  const [saveError, setSaveError] = useState<string | null>(null);
   const boxesRef = useRef(initialBoxes);
   const undoStackRef = useRef<EditorBox[][]>([]);
   const saveRef = useRef(save);
@@ -52,12 +57,22 @@ export function useAnnotationEdit(
     saveRef.current = save;
   }, [save]);
 
+  useEffect(() => {
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!pendingRef.current && inFlightRef.current === null) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, []);
+
   const flush = useCallback(async (): Promise<boolean> => {
     while (true) {
       const existing = inFlightRef.current;
       if (existing) {
-        const succeeded = await existing;
-        if (!succeeded) return false;
+        const canContinue = await existing;
+        if (!canContinue) return false;
         continue;
       }
 
@@ -67,25 +82,33 @@ export function useAnnotationEdit(
       const generation = generationRef.current;
       const payload = boxesRef.current;
       setSaveState("saving");
+      setSaveError(null);
 
       const operation = (async () => {
         try {
           await saveRef.current(payload);
           if (generation === generationRef.current) setSaveState("saved");
           return true;
-        } catch {
+        } catch (reason: unknown) {
+          const rejected = (reason instanceof ApiError || reason instanceof AuthApiError)
+            && reason.status >= 400 && reason.status < 500;
           if (generation === generationRef.current) {
-            pendingRef.current = true;
-            setSaveState("error");
+            // A rejected payload cannot be saved by retrying. Leave any newer
+            // queued edit intact, but do not requeue this rejected snapshot.
+            if (!rejected) pendingRef.current = true;
+            setSaveState(rejected ? "rejected" : "error");
+            setSaveError(reason instanceof Error ? reason.message : "저장하지 못했습니다.");
           }
-          return false;
+          // flush controls navigation: a 4xx releases it without claiming the
+          // edit was saved; network/5xx errors keep unsaved edits protected.
+          return rejected;
         }
       })();
 
       inFlightRef.current = operation;
-      const succeeded = await operation;
+      const canContinue = await operation;
       if (inFlightRef.current === operation) inFlightRef.current = null;
-      if (!succeeded) return false;
+      if (!canContinue) return false;
     }
   }, []);
 
@@ -124,6 +147,7 @@ export function useAnnotationEdit(
     setBoxes(next);
     setUndoStack([]);
     setSaveState("saved");
+    setSaveError(null);
   }, []);
 
   const retry = useCallback(() => {
@@ -153,6 +177,7 @@ export function useAnnotationEdit(
     undo,
     undoDepth: undoStack.length,
     saveState,
+    saveError,
     retry,
     flush,
     reset,

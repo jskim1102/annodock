@@ -122,8 +122,10 @@ def build_run_directory(
         _mkdir(label_dir)
         target_stems = _target_stems(images, stem_counts)
         for image in images:
-            filename = _safe_segment(image.filename, field="image filename")
-            suffix = Path(filename).suffix
+            _safe_segment(image.filename, field="image filename")
+            # Snapshot metadata keeps the uploaded name; the selected training
+            # file may instead be its JPEG derivative.
+            suffix = image.file_path.suffix
             target_stem = target_stems[image.id]
             _link_or_copy(image.file_path, image_dir / f"{target_stem}{suffix}")
             (label_dir / f"{target_stem}.txt").write_text(

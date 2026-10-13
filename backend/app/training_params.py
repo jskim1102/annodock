@@ -49,7 +49,9 @@ LEGACY_TRAINING_ARGS: dict[str, object] = {
     "warmup_epochs": 3.0,
     "cos_lr": False,
     "patience": 100,
-    "augment": False,
+    # Legacy detection training used augmentation; its old augment=False
+    # Ultralytics default controlled prediction TTA only.
+    "augment": True,
     "mosaic": 1.0,
     "mixup": 0.0,
     "copy_paste": 0.0,
@@ -73,6 +75,17 @@ TRAINING_ARGUMENT_KEYS = tuple(RTX_3090_TRAINING_ARGS)
 APP_ONLY_TRAINING_ARGUMENT_KEYS = (
     "exclude_unlabeled_images",
     "include_unlabeled_images_in_test",
+    "augment",
+)
+
+# Ultralytics' `augment` argument controls prediction TTA. Detection training
+# always constructs an augmentation pipeline, so its individual transforms
+# must be neutralized when the application's training toggle is off.
+DETECTION_AUGMENTATION_KEYS = (
+    "mosaic", "mixup", "cutmix", "copy_paste",
+    "hsv_h", "hsv_s", "hsv_v",
+    "degrees", "translate", "scale", "shear", "perspective",
+    "flipud", "fliplr", "bgr", "multi_scale",
 )
 
 
@@ -93,8 +106,13 @@ def ultralytics_training_args(
 ) -> dict[str, object]:
     """Translate stored UI values to arguments accepted by model.train()."""
     arguments = normalize_training_args(persisted)
+    augment = arguments["augment"]
     for key in APP_ONLY_TRAINING_ARGUMENT_KEYS:
         arguments.pop(key, None)
+    if not augment:
+        arguments.update({key: 0.0 for key in DETECTION_AUGMENTATION_KEYS})
+        # Also suppress the optional library's default Blur/CLAHE transforms.
+        arguments["augmentations"] = []
     if arguments["cache"] == "none":
         arguments["cache"] = False
     return arguments

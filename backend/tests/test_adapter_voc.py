@@ -6,7 +6,7 @@ import pytest
 from PIL import Image as PillowImage
 
 from app.services.adapter_voc import adapt_voc
-from app.services.collect import CollectedFile
+from app.services.collect import CollectedFile, collect_directory
 
 
 pytestmark = pytest.mark.asyncio
@@ -129,3 +129,42 @@ async def test_voc_adapter_reports_missing_filename_image(
     assert len(result.issues) == 1
     assert result.issues[0].kind == "label_without_image"
     assert "missing.jpg" in result.issues[0].detail
+
+
+async def test_voc_adapter_keeps_sibling_image_directories_within_each_split(
+    tmp_path: Path,
+) -> None:
+    documents: set[str] = set()
+    for split in ("train", "valid"):
+        image_root = tmp_path / split / "JPEGImages"
+        image_root.mkdir(parents=True)
+        PillowImage.new("RGB", (20, 20)).save(image_root / "frame.jpg", "JPEG")
+        annotation_root = tmp_path / split / "Annotations"
+        annotation_root.mkdir()
+        annotation = annotation_root / "frame.xml"
+        annotation.write_text(
+            """
+            <annotation>
+              <filename>frame.jpg</filename>
+              <size><width>20</width><height>20</height></size>
+              <object><name>person</name><bndbox>
+                <xmin>2</xmin><ymin>2</ymin>
+                <xmax>6</xmax><ymax>6</ymax>
+              </bndbox></object>
+            </annotation>
+            """,
+            encoding="utf-8",
+        )
+        documents.add(annotation.relative_to(tmp_path).as_posix())
+
+    result = await adapt_voc(
+        collect_directory(tmp_path, ("jpg",)),
+        voc_paths=documents,
+    )
+
+    assert result.issues == ()
+    assert result.source_by_image == {
+        f"{split}/JPEGImages/frame.jpg": f"{split}/Annotations/frame.xml"
+        for split in ("train", "valid")
+    }
+    assert [len(image.boxes) for image in result.ir.images] == [1, 1]

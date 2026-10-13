@@ -207,16 +207,23 @@ function parseUploadTargetResume(value: unknown): UploadTargetResumeRecord | nul
 
 export function resumeUploadDatasetTarget(
   projectId: number,
-  datasetName: string,
+  datasetName: string | null,
   collected: readonly CollectedFile[],
+  claimedDatasetIds: readonly number[] = [],
 ): number | null {
   const { fingerprint, storageKey } = uploadTargetResumeKey(projectId, collected);
   const record = parseUploadTargetResume(readStoredJson(storageKey));
   if (
     record === null
     || record.projectId !== projectId
-    || record.datasetName !== datasetName.trim()
+    // Multi-source names are generated again from the current project list.
+    // A completed source can therefore acquire a suffix after a reload; its
+    // project and file fingerprint remain the stable resume identity.
+    || (datasetName !== null && record.datasetName !== datasetName.trim())
     || record.fingerprint !== fingerprint
+    // Identical ZIPs can be separate selected sources. One resumed dataset
+    // must never be assigned to two units of the same merge operation.
+    || claimedDatasetIds.includes(record.datasetId)
   ) return null;
   return record.datasetId;
 }
@@ -238,7 +245,7 @@ export function rememberUploadDatasetTarget(
 
 export function clearUploadDatasetTarget(
   projectId: number,
-  datasetName: string,
+  datasetName: string | null,
   datasetId: number,
   collected: readonly CollectedFile[],
 ): void {
@@ -246,7 +253,7 @@ export function clearUploadDatasetTarget(
   const record = parseUploadTargetResume(readStoredJson(storageKey));
   if (
     record?.datasetId === datasetId
-    && record.datasetName === datasetName.trim()
+    && (datasetName === null || record.datasetName === datasetName.trim())
   ) removeStoredValue(storageKey);
 }
 
@@ -668,7 +675,7 @@ async function prepareManifestUploadBatch(
   if (operation.datasetId !== datasetId) {
     throw new UploadError(409, "업로드 배치의 데이터셋이 일치하지 않습니다.");
   }
-  const accepted = collected.filter((item) => item.kind !== "other");
+  const accepted = uniqueManifestFiles(collected);
   if (accepted.length === 0) throw new UploadError(422, "업로드할 파일이 없습니다.");
   onPreparationProgress?.({ preparedFiles: 0, totalFiles: accepted.length });
   const uploads: PreparedUpload[] = [];

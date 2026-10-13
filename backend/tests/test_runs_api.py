@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import event
 
 from app.models import Dataset, Project, RunImage, RunMetric, TrainingRun
-from app.training_params import LEGACY_TRAINING_ARGS
+from app.training_params import LEGACY_TRAINING_ARGS, ultralytics_training_args
 
 
 pytestmark = pytest.mark.asyncio
@@ -244,6 +244,43 @@ async def test_runs_api_detail_counts_three_way_run_images(
         "valid": 1,
         "test": 2,
     }
+
+
+@pytest.mark.parametrize(
+    ("persisted", "expected_augment"),
+    [
+        (None, True),
+        ({}, True),
+        ({"cache": "none"}, True),
+        ({"augment": True, "fliplr": 0.75}, True),
+        ({"augment": False, "fliplr": 0.75}, False),
+    ],
+)
+async def test_runs_api_reports_effective_training_augmentation(
+    client,
+    app,
+    tmp_path: Path,
+    persisted: dict[str, object] | None,
+    expected_augment: bool,
+) -> None:
+    run = _run(tmp_path / "augmentation-contract")
+    run.training_args = persisted
+    run_id = await _persist_run(app, run)
+
+    response = await client.get(f"/api/runs/{run_id}")
+
+    assert response.status_code == 200
+    reported = response.json()["training_args"]
+    assert reported["augment"] is expected_augment
+    for key, value in (persisted or {}).items():
+        assert reported[key] == value
+    runtime = ultralytics_training_args(persisted)
+    assert ultralytics_training_args(reported) == runtime
+    assert runtime["fliplr"] == (reported["fliplr"] if expected_augment else 0.0)
+    async with app.state.session_factory() as session:
+        stored = await session.get(TrainingRun, run_id)
+        assert stored is not None
+        assert stored.training_args == persisted
 
 
 async def test_runs_api_log_missing_is_empty_200_and_tail_is_bounded(

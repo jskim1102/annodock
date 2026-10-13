@@ -133,7 +133,9 @@ async def adapt_coco(
                 continue
             reference = safe_image_reference(metadata.get("file_name"))
             matched = (
-                match_image_reference(reference, image_files)
+                match_image_reference(
+                    reference, image_files, source_path=source_path
+                )
                 if reference is not None
                 else None
             )

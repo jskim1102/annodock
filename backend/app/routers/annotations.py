@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.deps import CurrentUserDep
-from app.models import Annotation, Dataset, Image
+from app.models import Annotation, Dataset, DatasetClass, Image
 
 
 router = APIRouter(prefix="/api/images", tags=["annotations"])
@@ -115,6 +115,26 @@ async def replace_annotations(
         raise HTTPException(status_code=404, detail="이미지를 찾을 수 없습니다.")
     dataset, image = locked
     old_count = image.box_count
+
+    requested_class_ids = {box.class_id for box in body.boxes}
+    if requested_class_ids:
+        known_class_ids = set(
+            await session.scalars(
+                select(DatasetClass.class_id).where(
+                    DatasetClass.dataset_id == dataset.id
+                )
+            )
+        )
+        unknown_class_ids = requested_class_ids - known_class_ids
+        if unknown_class_ids:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "unknown_annotation_class",
+                    "message": "데이터셋에 없는 클래스는 저장할 수 없습니다.",
+                    "class_ids": sorted(unknown_class_ids),
+                },
+            )
 
     await session.execute(
         delete(Annotation).where(Annotation.image_id == image_id)

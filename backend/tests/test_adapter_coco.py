@@ -7,7 +7,7 @@ import pytest
 from PIL import Image as PillowImage
 
 from app.services.adapter_coco import adapt_coco
-from app.services.collect import CollectedFile
+from app.services.collect import CollectedFile, collect_directory
 
 
 pytestmark = pytest.mark.asyncio
@@ -157,3 +157,52 @@ async def test_coco_adapter_reports_missing_image_reference(
     assert len(result.issues) == 1
     assert result.issues[0].kind == "label_without_image"
     assert "missing.jpg" in result.issues[0].detail
+
+
+@pytest.mark.parametrize("nested_directories", [False, True])
+async def test_coco_adapter_resolves_repeated_filenames_in_each_split(
+    tmp_path: Path,
+    nested_directories: bool,
+) -> None:
+    documents: set[str] = set()
+    expected_sources: dict[str, str] = {}
+    for split, box_width in (("train", 4), ("valid", 8)):
+        split_root = tmp_path / split
+        image_root = split_root / "images" if nested_directories else split_root
+        annotation_root = (
+            split_root / "annotations" if nested_directories else split_root
+        )
+        image_root.mkdir(parents=True, exist_ok=True)
+        annotation_root.mkdir(parents=True, exist_ok=True)
+        image = image_root / "frame.jpg"
+        PillowImage.new("RGB", (20, 20)).save(image, "JPEG")
+        document = annotation_root / "_annotations.coco.json"
+        document.write_text(
+            json.dumps({
+                "images": [{
+                    "id": 1, "file_name": "frame.jpg", "width": 20, "height": 20,
+                }],
+                "categories": [{"id": 0, "name": "person"}],
+                "annotations": [{
+                    "id": 1, "image_id": 1, "category_id": 0,
+                    "bbox": [2, 2, box_width, 4],
+                }],
+            }),
+            encoding="utf-8",
+        )
+        document_path = document.relative_to(tmp_path).as_posix()
+        documents.add(document_path)
+        expected_sources[image.relative_to(tmp_path).as_posix()] = document_path
+
+    result = await adapt_coco(
+        collect_directory(tmp_path, ("jpg",)),
+        coco_paths=documents,
+    )
+
+    assert result.issues == ()
+    assert result.source_by_image == expected_sources
+    assert len(result.ir.images) == 2
+    assert [len(image.boxes) for image in result.ir.images] == [1, 1]
+    assert [image.boxes[0].w for image in result.ir.images] == pytest.approx(
+        [0.2, 0.4]
+    )

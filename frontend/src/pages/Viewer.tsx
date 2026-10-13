@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   getDataset,
@@ -316,6 +316,12 @@ export function ViewerPage({ datasetId }: ViewerPageProps) {
     void navigate(imageIndex + offset);
   }, [imageIndex, navigate]);
 
+  const leaveViewer = async (event: MouseEvent<HTMLAnchorElement>) => {
+    if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    if (await flush()) window.location.assign(appHref("/projects"));
+  };
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (isTypingTarget(event.target) || event.ctrlKey || event.metaKey || event.altKey) return;
@@ -369,7 +375,7 @@ export function ViewerPage({ datasetId }: ViewerPageProps) {
   return (
     <main className="viewer-screen" data-screen-label="07 라벨링 에디터">
       <header className="viewer-header">
-        <a className="viewer-brand" href={appHref("/projects")}><Brand /></a>
+        <a className="viewer-brand" href={appHref("/projects")} onClick={(event) => void leaveViewer(event)}><Brand /></a>
         <div className="breadcrumbs"><span>{projectName ?? ""}</span><span>/</span><strong>{dataset?.name ?? `데이터셋 ${datasetId}`}</strong></div>
         <div className="viewer-filters">
           <button className="chip" type="button" aria-pressed={split === null} onClick={() => void changeSplit(null)}>전체 <b>{dataset?.image_count ?? 0}</b></button>
@@ -399,6 +405,7 @@ export function ViewerPage({ datasetId }: ViewerPageProps) {
       )}
 
       {error && currentImage ? <div className="viewer-inline-error" role="alert">{error}</div> : null}
+      {annotation.saveError ? <div className="viewer-inline-error" role="alert">{annotation.saveError}</div> : null}
       <ThumbStrip
         total={total}
         currentIndex={imageIndex}

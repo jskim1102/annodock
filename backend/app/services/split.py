@@ -634,7 +634,12 @@ async def load_dataset_images(
             stem=image.stem,
             filename=image.filename,
             rel_path=image.rel_path,
-            file_path=contained_storage_path(storage_dir, image.file_path),
+            # Non-browser formats already have an orientation-correct JPEG
+            # derivative. Train on the same pixels shown in the annotator;
+            # some originals (notably HEIF) cannot be decoded by the trainer.
+            file_path=contained_storage_path(
+                storage_dir, image.display_path or image.file_path,
+            ),
             annotations=tuple(annotations[image.id]),
             training_source_key=image.training_source_key,
             training_group_key=image.training_group_key,

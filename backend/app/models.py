@@ -425,7 +425,7 @@ class UploadSession(Base):
     )
     file_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     filename: Mapped[str] = mapped_column(String(1024), nullable=False)
-    size: Mapped[int] = mapped_column(Integer, nullable=False)
+    size: Mapped[int] = mapped_column(BigInteger, nullable=False)
     chunk_size: Mapped[int] = mapped_column(Integer, nullable=False)
     received_chunks: Mapped[list[int]] = mapped_column(
         JSON, nullable=False, default=list, server_default="[]"

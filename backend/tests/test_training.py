@@ -1159,6 +1159,7 @@ async def test_worker_spawn_training_uses_absolute_paths_and_exact_save_dir(
         if key not in {
             "exclude_unlabeled_images",
             "include_unlabeled_images_in_test",
+            "augment",
         }
     }
     assert kwargs == {

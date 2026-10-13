@@ -181,6 +181,7 @@ async def test_get_and_put_annotations_replace_boxes_and_update_counts(
     "box",
     [
         {"class_id": -1, "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2},
+        {"class_id": 999, "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2},
         {"class_id": 0, "cx": -0.1, "cy": 0.5, "w": 0.2, "h": 0.2},
         {"class_id": 0, "cx": 0.5, "cy": 1.1, "w": 0.2, "h": 0.2},
         {"class_id": 0, "cx": 0.5, "cy": 0.5, "w": -0.1, "h": 0.2},
@@ -245,3 +246,30 @@ async def test_classes_are_sorted_and_missing_images_return_404(
             json={"boxes": []},
         )
     ).status_code == 404
+
+
+async def test_put_unknown_class_rejects_the_entire_annotation_replacement(
+    client: httpx.AsyncClient,
+    app,
+    tmp_path: Path,
+) -> None:
+    dataset_id, image_id, _label = await create_image_with_annotation(
+        client, app, tmp_path
+    )
+    before = await client.get(f"/api/images/{image_id}/annotations")
+    valid_box = {"class_id": 1, "cx": 0.4, "cy": 0.4, "w": 0.1, "h": 0.1}
+    response = await client.put(
+        f"/api/images/{image_id}/annotations",
+        json={"boxes": [valid_box, {**valid_box, "class_id": 999}]},
+    )
+    after = await client.get(f"/api/images/{image_id}/annotations")
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["class_ids"] == [999]
+    assert after.json() == before.json()
+    async with app.state.session_factory() as session:
+        image = await session.get(Image, image_id)
+        dataset = await session.get(Dataset, dataset_id)
+        assert image is not None and dataset is not None
+        assert image.box_count == dataset.annotation_count == 1
+        assert image.is_modified is False

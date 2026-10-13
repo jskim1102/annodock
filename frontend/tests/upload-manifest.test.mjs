@@ -58,6 +58,16 @@ async function loadUploadApi(overrides = {}) {
   return { api, calls, storage };
 }
 
+async function loadUploadGrouping() {
+  const source = await readFile(
+    new URL("../src/utils/uploadGrouping.ts", import.meta.url),
+    "utf8",
+  );
+  return import(moduleUrl(ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+  }).outputText));
+}
+
 
 function item(index, kind = "image", size = 1) {
   const content = new Blob([new Uint8Array(size)]);
@@ -202,6 +212,105 @@ test("reselecting the same files after a reload recovers the draft dataset", asy
   assert.equal(storage.size, 1);
   api.clearUploadDatasetTarget(9, "dataset", 123, files);
   assert.equal(storage.size, 0);
+});
+
+test("multi-source resume survives a completed source changing the generated name", async () => {
+  const grouping = await loadUploadGrouping();
+  const sources = ["A", "B"].map((name, index) => ({
+    key: `folder:${index}`,
+    kind: "folder",
+    name,
+    files: [item(index)],
+  }));
+  const original = grouping.createUploadPlan(sources, "combined", []);
+  const first = await loadUploadApi();
+  first.api.rememberUploadDatasetTarget(9, original[0].name, 123, sources[0].files);
+
+  // Only storage survives the reload. The completed A now appears in the
+  // canonical project list, so the same selected source is proposed as A (2).
+  const reloaded = await loadUploadApi({ storage: first.storage });
+  const resumed = grouping.createUploadPlan(sources, "combined", ["A"]);
+  assert.equal(resumed[0].name, "A (2)");
+  assert.equal(reloaded.api.resumeUploadDatasetTarget(9, null, sources[0].files), 123);
+  assert.equal(reloaded.api.resumeUploadDatasetTarget(10, null, sources[0].files), null);
+  assert.equal(reloaded.api.resumeUploadDatasetTarget(9, null, [item(99)]), null);
+
+  reloaded.api.clearUploadDatasetTarget(9, null, 999, sources[0].files);
+  assert.equal(reloaded.api.resumeUploadDatasetTarget(9, null, sources[0].files), 123);
+  reloaded.api.clearUploadDatasetTarget(9, null, 123, sources[0].files);
+  assert.equal(reloaded.api.resumeUploadDatasetTarget(9, null, sources[0].files), null);
+});
+
+test("selecting the same ZIP twice never assigns one resumed dataset to both merge sources", async () => {
+  const { createUploadPlan } = await loadUploadGrouping();
+  const files = [item(1, "zip")];
+  const plan = createUploadPlan([
+    { key: "zip:1", name: "archive", kind: "zip", files },
+    { key: "zip:2", name: "archive", kind: "zip", files },
+  ], "combined", []);
+  let nextId = 124;
+  const { api, calls } = await loadUploadApi({
+    requestJson: async (path, options) => {
+      assert.equal(path, "/api/datasets");
+      return { id: nextId++, name: JSON.parse(options.body).name };
+    },
+  });
+  // A prior attempt already saved a checkpoint for the identical selection.
+  api.rememberUploadDatasetTarget(9, "archive", 123, files);
+  const targets = {};
+  for (const unit of plan) {
+    const resumed = api.resumeUploadDatasetTarget(9, null, unit.batches.flat(), Object.values(targets));
+    const targetId = resumed ?? (await api.createDatasetForUpload(unit.name, 9)).id;
+    api.rememberUploadDatasetTarget(9, unit.name, targetId, unit.batches.flat());
+    targets[unit.key] = targetId;
+  }
+
+  assert.deepEqual(plan.map((unit) => unit.name), ["archive", "archive (2)"]);
+  assert.deepEqual(Object.values(targets), [123, 124]);
+  assert.equal(calls.length, 1, "the second distinct source creates its own target");
+});
+
+test("selecting the same files repeatedly produces one manifest and one session per path", async () => {
+  let declaredCount;
+  const sessionPaths = [];
+  const { api } = await loadUploadApi({
+    requestJson: async (path, options) => {
+      const body = JSON.parse(options.body);
+      if (options.method === "PUT") {
+        declaredCount = body.file_count;
+        return { batch_id: path.split("/").at(-1), state: "open", job_id: null };
+      }
+      const paths = body.files.map((file) => file.filename);
+      assert.equal(new Set(paths).size, paths.length, "the server rejects repeated paths with 422");
+      sessionPaths.push(...paths);
+      return {
+        uploads: body.files.map((file, index) => ({
+          upload_id: sessionPaths.length - paths.length + index + 1,
+          chunk_size: file.chunk_size,
+          received: [],
+          size: file.size,
+          state: "open",
+        })),
+      };
+    },
+  });
+  const unique = Array.from({ length: 1_001 }, (_, index) => item(index));
+  const selected = [...unique, ...unique];
+  const manifest = await api.beginUploadBatch(51, selected);
+  const prepared = await api.prepareUploadBatch(51, selected, manifest);
+
+  assert.equal(declaredCount, unique.length);
+  assert.equal(prepared.uploads.length, unique.length);
+  assert.equal(prepared.totalBytes, unique.length);
+  assert.deepEqual(sessionPaths, unique.map((file) => file.relPath));
+});
+
+test("different files sharing a path remain a validation error before session creation", async () => {
+  const { api, calls } = await loadUploadApi();
+  const first = item(1);
+  const changed = item(1, "image", 2);
+  await assert.rejects(api.beginUploadBatch(51, [first, changed]), /같은 경로/);
+  assert.equal(calls.length, 0);
 });
 
 

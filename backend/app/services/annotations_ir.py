@@ -144,7 +144,38 @@ def safe_image_reference(value: Any) -> str | None:
 def match_image_reference(
     reference: str,
     images: list[CollectedFile],
+    *,
+    source_path: str | None = None,
 ) -> CollectedFile | None:
+    if source_path is not None:
+        parent = PurePosixPath(source_path).parent
+        relative_path = (parent / reference).as_posix()
+        relative = [item for item in images if item.rel_path == relative_path]
+        if len(relative) == 1:
+            return relative[0]
+
+        # Respect an explicitly upload-relative path before searching the
+        # document's surrounding directories for a suffix match.
+        rooted = [item for item in images if item.rel_path == reference]
+        if len(rooted) == 1:
+            return rooted[0]
+
+        # COCO/VOC documents may sit beside images or in a sibling annotation
+        # directory inside a split. Keep duplicate basenames in other splits
+        # from making those references ambiguous.
+        for directory in (parent, *parent.parents):
+            if directory == PurePosixPath("."):
+                break
+            prefix = directory.as_posix() + "/"
+            scoped = [
+                item
+                for item in images
+                if item.rel_path.startswith(prefix)
+                and item.rel_path.endswith(f"/{reference}")
+            ]
+            if scoped:
+                return scoped[0] if len(scoped) == 1 else None
+
     exact = [
         item
         for item in images

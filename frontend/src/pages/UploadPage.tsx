@@ -419,6 +419,7 @@ export function UploadPage() {
       for (const unit of uploadPlan) {
         let unitDatasetResults = datasetResultsByUnit[unit.key] ?? null;
         const unitFiles = unit.batches.flat();
+        const resumeDatasetName = uploadPlan.length > 1 ? null : unit.name;
         let targetId = targetIds[unit.key];
         let targetWasResumed = false;
         const createTarget = async () => {
@@ -457,8 +458,9 @@ export function UploadPage() {
         if (targetId === undefined) {
           const resumedTargetId = resumeUploadDatasetTarget(
             project.id,
-            unit.name,
+            resumeDatasetName,
             unitFiles,
+            Object.values(targetIds),
           );
           if (resumedTargetId !== null) {
             targetId = resumedTargetId;
@@ -488,7 +490,7 @@ export function UploadPage() {
               )) throw reason;
               clearUploadDatasetTarget(
                 project.id,
-                unit.name,
+                resumeDatasetName,
                 targetId,
                 unitFiles,
               );
@@ -784,7 +786,7 @@ export function UploadPage() {
         if (targetId !== undefined) {
           clearUploadDatasetTarget(
             project.id,
-            unit.name,
+            uploadPlan.length > 1 ? null : unit.name,
             targetId,
             unit.batches.flat(),
           );

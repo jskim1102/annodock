@@ -705,7 +705,7 @@ export function BboxCanvas({
         </section>
         <footer className="inspector-footer">
           <button
-            className={`${saveState === "saved" ? "save-ok" : "save-pending"}${saveState === "error" ? " save-error" : ""}`}
+            className={`${saveState === "saved" ? "save-ok" : "save-pending"}${saveState === "error" || saveState === "rejected" ? " save-error" : ""}`}
             type="button"
             disabled={saveState !== "error"}
             onClick={onRetrySave}

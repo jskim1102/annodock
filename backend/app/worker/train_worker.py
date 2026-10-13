@@ -22,7 +22,7 @@ from app.services.storage import (
     restore_staged_deletion,
 )
 from app.services.training import WEIGHTS_DIR
-from app.training_params import normalize_training_args, ultralytics_training_args
+from app.training_params import ultralytics_training_args
 from app.worker.callbacks import make_epoch_callback
 from app.worker.failure import (
     FailureReport,
@@ -87,7 +87,9 @@ def load_run_config(run_id: int, owner_id: int, dsn: str) -> RunConfig:
         epochs=row["epochs"],
         imgsz=row["imgsz"],
         batch=row["batch"],
-        training_args=normalize_training_args(row["training_args"]),
+        # Preserve absent legacy keys until runtime translation can distinguish
+        # them from an explicitly disabled application augmentation toggle.
+        training_args=dict(row["training_args"] or {}),
         out_dir=contained_storage_path(
             get_settings().storage_dir,
             row["out_dir"],

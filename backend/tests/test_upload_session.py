@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import httpx
@@ -11,6 +12,7 @@ from sqlalchemy import func, select
 from app.models import UploadJob, UploadSession
 from app.routers import uploads as uploads_router
 from app.services import uploads as uploads_service
+from app.services import validate as upload_validation
 
 
 pytestmark = pytest.mark.asyncio
@@ -35,6 +37,73 @@ async def create_dataset(client: httpx.AsyncClient) -> int:
     )
     assert response.status_code == 201
     return response.json()["id"]
+
+
+@pytest.mark.parametrize("size", [2**31, 20 * 1024**3])
+@pytest.mark.parametrize("mode", ["single", "batch", "manifest"])
+async def test_large_zip_session_preserves_size_without_allocating_file_contents(
+    client: httpx.AsyncClient,
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+    size: int,
+    mode: str,
+) -> None:
+    app.state.settings = app.state.settings.model_copy(update={
+        "max_zip_bytes": 20 * 1024**3,
+        "max_extracted_bytes": 100 * 1024**3,
+        "quota_bytes_per_user": 100 * 1024**3,
+    })
+    monkeypatch.setattr(
+        upload_validation.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=200 * 1024**3),
+    )
+    dataset_id = await create_dataset(client)
+    file_body = {
+        "filename": "large.zip",
+        "size": size,
+        "chunk_size": 8 * 1024**2,
+        "kind": "zip",
+    }
+    url = f"/api/datasets/{dataset_id}/uploads"
+    if mode == "single":
+        response = await client.post(url, json=file_body)
+    else:
+        body = {"files": [file_body]}
+        if mode == "manifest":
+            batch_id = str(uuid4())
+            started = await client.put(
+                f"/api/datasets/{dataset_id}/upload-batches/{batch_id}",
+                json={
+                    "file_count": 1,
+                    "total_size": size,
+                    "largest_file_size": size,
+                    "expected_extracted_size": size,
+                },
+            )
+            assert started.status_code == 200, started.text
+            body["batch_id"] = batch_id
+        response = await client.post(f"{url}/batch", json=body)
+
+    assert response.status_code == 201, response.text
+    created = (
+        response.json() if mode == "single" else response.json()["uploads"][0]
+    )
+    assert created["size"] == size
+    fetched = await client.get(f"/api/uploads/{created['upload_id']}")
+    assert fetched.status_code == 200
+    assert fetched.json()["size"] == size
+    async with app.state.session_factory() as session:
+        upload = await session.get(UploadSession, created["upload_id"])
+        assert upload is not None
+        assert upload.size == size
+        assert uploads_service.expected_chunk_count(upload) == (
+            size // file_body["chunk_size"]
+        )
+    directory = uploads_service.upload_directory(
+        app.state.settings, created["upload_id"]
+    )
+    assert list(directory.iterdir()) == []
 
 
 async def upload_file(

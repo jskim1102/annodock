@@ -132,7 +132,9 @@ async def adapt_voc(
     for source_path, root in roots:
         reference = safe_image_reference(root.findtext("filename"))
         matched = (
-            match_image_reference(reference, image_files)
+            match_image_reference(
+                reference, image_files, source_path=source_path
+            )
             if reference is not None
             else None
         )
@@ -236,4 +238,3 @@ async def adapt_voc(
         source_by_image=source_by_image,
         documents=documents,
     )
-
