@@ -11,7 +11,11 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
-from app.deps import CurrentUserDep
+from app.deps import (
+    AdminWorkspaceDep,
+    CurrentUserDep,
+    CurrentWorkspaceDep,
+)
 from app.inference.models_dir import is_preset
 from app.models import Annotation, Dataset, Image
 from app.services.cancel import (
@@ -194,7 +198,7 @@ class CancelResponse(BaseModel):
 )
 async def training_recommendation(
     dataset_id: int,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
     session: Session,
     weights: str = Query(),
     imgsz: int = Query(default=640, ge=1),
@@ -208,7 +212,7 @@ async def training_recommendation(
     dataset = await session.scalar(
         select(Dataset).where(
             Dataset.id == dataset_id,
-            Dataset.owner_id == current_user.id,
+            Dataset.workspace_id == current_workspace.id,
         )
     )
     if dataset is None:
@@ -281,6 +285,7 @@ async def submit_training(
     body: TrainRequest,
     request: Request,
     session: Session,
+    current_workspace: AdminWorkspaceDep,
     current_user: CurrentUserDep,
 ) -> TrainResponse:
     assert body.ratios is not None
@@ -289,7 +294,7 @@ async def submit_training(
             session,
             request.app.state.settings,
             dataset_id,
-            current_user.id,
+            current_workspace.id,
             TrainingConfig(
                 weights=body.weights,
                 epochs=body.epochs,
@@ -304,6 +309,7 @@ async def submit_training(
                 ),
                 training_args=body.training_args(),
             ),
+            created_by=current_user.id,
         )
     except TrainingRequestError as error:
         raise HTTPException(
@@ -321,13 +327,13 @@ async def submit_training(
 async def cancel_training(
     run_id: int,
     request: Request,
-    current_user: CurrentUserDep,
+    current_workspace: AdminWorkspaceDep,
 ) -> CancelResponse:
     try:
         result = await cancel_training_run(
             request.app.state.session_factory,
             run_id,
-            current_user.id,
+            current_workspace.id,
             storage_dir=request.app.state.settings.storage_dir,
         )
     except TrainingRunNotFoundError as error:

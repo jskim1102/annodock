@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import select
 
+from app.deps import ensure_personal_workspace
 from app.models import (
     Annotation,
     Dataset,
@@ -29,14 +30,14 @@ USER_B = 202
 async def _create_dataset(
     client,
     auth_headers,
-    owner_id: int,
+    user_id: int,
     name: str,
     *,
     project_id: int | None = None,
 ) -> int:
     response = await client.post(
         "/api/datasets",
-        headers=auth_headers(owner_id),
+        headers=auth_headers(user_id),
         json={
             "name": name,
             **({"project_id": project_id} if project_id is not None else {}),
@@ -46,10 +47,10 @@ async def _create_dataset(
     return int(response.json()["id"])
 
 
-async def _create_project(client, auth_headers, owner_id: int) -> int:
+async def _create_project(client, auth_headers, user_id: int) -> int:
     response = await client.post(
         "/api/projects",
-        headers=auth_headers(owner_id),
+        headers=auth_headers(user_id),
         json={
             "name": f"test-merge-project-{uuid4().hex}",
             "classes": [],
@@ -82,14 +83,15 @@ async def _seed_owned_resource_graph(app, tmp_path: Path) -> dict[str, int]:
     thumb.write_bytes(b"owned-thumb")
 
     async with app.state.session_factory() as session:
+        workspace = await ensure_personal_workspace(session, USER_A)
         project = Project(
-            owner_id=USER_A,
+            workspace_id=workspace.id,
             name=f"test-ownership-project-{uuid4().hex}",
         )
         session.add(project)
         await session.flush()
         dataset = Dataset(
-            owner_id=USER_A,
+            workspace_id=workspace.id,
             project_id=project.id,
             name=f"test-ownership-graph-{uuid4().hex}",
             status="ready",
@@ -102,7 +104,7 @@ async def _seed_owned_resource_graph(app, tmp_path: Path) -> dict[str, int]:
         await session.flush()
         session.add(DatasetClass(dataset_id=dataset.id, class_id=0, name="box"))
         image = image_with_media(
-            owner_id=dataset.owner_id,
+            workspace_id=dataset.workspace_id,
             dataset_id=dataset.id,
             stem="original",
             filename="original.jpg",
@@ -202,6 +204,8 @@ async def test_foreign_dataset_resource_graph_is_hidden_as_404(
     image_id = resource["image_id"]
     upload_id = resource["upload_id"]
     job_id = resource["job_id"]
+    current = await client.get(f"/api/images/{image_id}/annotations", headers=auth_headers(USER_A))
+    assert current.status_code == 200, current.text
 
     requests = [
         ("GET", f"/api/datasets/{dataset_id}", {}),
@@ -219,7 +223,8 @@ async def test_foreign_dataset_resource_graph_is_hidden_as_404(
         (
             "PUT",
             f"/api/images/{image_id}/annotations",
-            {"json": {"boxes": []}},
+            {"json": {"boxes": [], "expected_version": current.json()["version"],
+                      "expected_catalog_version": current.json()["catalog_version"]}},
         ),
         (
             "POST",
@@ -314,7 +319,7 @@ async def test_merge_hides_foreign_sources_and_assigns_verified_owner(
     )
     assert hidden.status_code == 404
 
-    # A may use B's dataset name because the unique key is owner-scoped.
+    # A may use B's dataset name because the unique key is workspace-scoped.
     merged = await client.post(
         "/api/datasets/merge",
         headers=auth_headers(USER_A),
@@ -325,5 +330,7 @@ async def test_merge_hides_foreign_sources_and_assigns_verified_owner(
 
     async with app.state.session_factory() as session:
         row = await session.get(Dataset, merged_id)
+        source = await session.get(Dataset, source_a1)
         assert row is not None
-        assert row.owner_id == USER_A
+        assert source is not None
+        assert row.workspace_id == source.workspace_id

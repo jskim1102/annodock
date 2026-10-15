@@ -44,7 +44,7 @@ async def create_image_with_annotation(
         image_path.write_bytes(b"image")
         thumb_path.write_bytes(b"thumb")
         image = image_with_media(
-            owner_id=dataset.owner_id,
+            workspace_id=dataset.workspace_id,
             dataset_id=dataset_id,
             stem="sample",
             filename="sample.jpg",
@@ -103,9 +103,12 @@ async def test_get_and_put_annotations_replace_boxes_and_update_counts(
     original_mtime = original_label.stat().st_mtime_ns
 
     fetched = await client.get(f"/api/images/{image_id}/annotations")
+    assert fetched.status_code == 200
     replaced = await client.put(
         f"/api/images/{image_id}/annotations",
         json={
+            "expected_version": fetched.json()["version"],
+            "expected_catalog_version": fetched.json()["catalog_version"],
             "boxes": [
                 {
                     "class_id": 1,
@@ -125,7 +128,6 @@ async def test_get_and_put_annotations_replace_boxes_and_update_counts(
         },
     )
 
-    assert fetched.status_code == 200
     assert fetched.json()["image_id"] == image_id
     assert (fetched.json()["width"], fetched.json()["height"]) == (800, 600)
     assert len(fetched.json()["boxes"]) == 1
@@ -158,7 +160,8 @@ async def test_get_and_put_annotations_replace_boxes_and_update_counts(
 
     cleared = await client.put(
         f"/api/images/{image_id}/annotations",
-        json={"boxes": []},
+        json={"boxes": [], "expected_version": replaced.json()["version"],
+              "expected_catalog_version": replaced.json()["catalog_version"]},
     )
     assert cleared.status_code == 200
     assert cleared.json()["boxes"] == []
@@ -198,9 +201,12 @@ async def test_put_rejects_invalid_box_values_without_mutation(
         await create_image_with_annotation(client, app, tmp_path)
     )
 
+    current = await client.get(f"/api/images/{image_id}/annotations")
+    assert current.status_code == 200
     response = await client.put(
         f"/api/images/{image_id}/annotations",
-        json={"boxes": [box]},
+        json={"boxes": [box], "expected_version": current.json()["version"],
+              "expected_catalog_version": current.json()["catalog_version"]},
     )
 
     assert response.status_code == 422
@@ -231,7 +237,12 @@ async def test_classes_are_sorted_and_missing_images_return_404(
     classes = await client.get(f"/api/datasets/{dataset_id}/classes")
 
     assert classes.status_code == 200
+    async with app.state.session_factory() as session:
+        catalog_version = await session.scalar(select(Dataset.class_catalog_version).where(
+            Dataset.id == dataset_id,
+        ))
     assert classes.json() == {
+        "catalog_version": catalog_version,
         "classes": [
             {"class_id": 0, "name": "person"},
             {"class_id": 1, "name": "vehicle"},
@@ -243,7 +254,8 @@ async def test_classes_are_sorted_and_missing_images_return_404(
     assert (
         await client.put(
             "/api/images/999999999/annotations",
-            json={"boxes": []},
+            json={"boxes": [], "expected_version": 0,
+                  "expected_catalog_version": classes.json()["catalog_version"]},
         )
     ).status_code == 404
 
@@ -257,10 +269,13 @@ async def test_put_unknown_class_rejects_the_entire_annotation_replacement(
         client, app, tmp_path
     )
     before = await client.get(f"/api/images/{image_id}/annotations")
+    assert before.status_code == 200
     valid_box = {"class_id": 1, "cx": 0.4, "cy": 0.4, "w": 0.1, "h": 0.1}
     response = await client.put(
         f"/api/images/{image_id}/annotations",
-        json={"boxes": [valid_box, {**valid_box, "class_id": 999}]},
+        json={"boxes": [valid_box, {**valid_box, "class_id": 999}],
+              "expected_version": before.json()["version"],
+              "expected_catalog_version": before.json()["catalog_version"]},
     )
     after = await client.get(f"/api/images/{image_id}/annotations")
 

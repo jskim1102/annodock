@@ -18,7 +18,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from dotenv import dotenv_values
 from jwt.algorithms import RSAAlgorithm
-from sqlalchemy import delete
+from sqlalchemy import delete, select, text
+from sqlalchemy.dialects.postgresql import insert
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -40,7 +41,10 @@ from app.models import (  # noqa: E402
     MediaObject,
     Project,
     TrainingRun,
-    UserStorage,
+    WorkspaceStorage,
+    Workspace,
+    WorkspaceMember,
+    WorkspaceInvite,
 )
 
 
@@ -164,10 +168,48 @@ async def cleanup_test_datasets() -> AsyncIterator[None]:
             await session.execute(
                 delete(MediaObject).where(~MediaObject.images.any())
             )
-            await session.execute(delete(UserStorage))
+            await session.execute(delete(WorkspaceStorage))
+            await session.execute(delete(WorkspaceInvite))
+            await session.execute(delete(WorkspaceMember))
+            await session.execute(delete(Workspace).where(
+                ~Workspace.id.in_(select(Project.workspace_id)),
+                ~Workspace.id.in_(select(Dataset.workspace_id)),
+                ~Workspace.id.in_(select(MediaObject.workspace_id)),
+                ~Workspace.id.in_(select(TrainingRun.workspace_id)),
+            ))
             await session.commit()
 
     await cleanup()
     yield
     await cleanup()
     await engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def legacy_personal_workspaces(cleanup_test_datasets):
+    """Explicit migrated personal fixtures for historical ORM tests.
+
+    These two IDs preserve the old fixtures; new workspace tests use other
+    users and exercise lazy allocation without assuming matching IDs.
+    """
+    from app.db import create_engine, create_session_factory
+
+    engine = create_engine(TEST_DATABASE_URL)
+    try:
+        async with create_session_factory(engine)() as session:
+            for user_id in (1, 2):
+                await session.execute(insert(Workspace).values(
+                    id=user_id, kind="personal", name="개인", created_by=user_id,
+                ).on_conflict_do_nothing())
+                await session.execute(insert(WorkspaceMember).values(
+                    workspace_id=user_id, user_id=user_id, role="owner",
+                ).on_conflict_do_nothing())
+            await session.execute(text(
+                "SELECT setval(pg_get_serial_sequence('workspaces', 'id'), "
+                "GREATEST((SELECT max(id) FROM workspaces), "
+                "(SELECT last_value FROM workspaces_id_seq)), true)"
+            ))
+            await session.commit()
+        yield
+    finally:
+        await engine.dispose()

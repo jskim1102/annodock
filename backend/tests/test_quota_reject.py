@@ -8,6 +8,7 @@ import httpx
 import pytest
 from sqlalchemy import func, select
 
+from app.deps import ensure_personal_workspace
 from app.models import (
     Annotation,
     Dataset,
@@ -15,7 +16,7 @@ from app.models import (
     Image,
     TrainingRun,
     UploadJob,
-    UserStorage,
+    WorkspaceStorage,
 )
 from app.services import training
 from app.services.storage import contained_storage_path, storage_relative_path
@@ -37,17 +38,18 @@ def _quota_settings(app, *, limit: int = QUOTA_BYTES) -> None:
 
 async def _set_usage(
     app,
-    owner_id: int,
+    user_id: int,
     bytes_used: int,
     *,
     quota_limit_bytes: int | None = None,
 ) -> None:
     async with app.state.session_factory() as session:
-        storage = await session.get(UserStorage, owner_id)
+        workspace = await ensure_personal_workspace(session, user_id)
+        storage = await session.get(WorkspaceStorage, workspace.id)
         if storage is None:
             session.add(
-                UserStorage(
-                    owner_id=owner_id,
+                WorkspaceStorage(
+                    workspace_id=workspace.id,
                     bytes_used=bytes_used,
                     quota_limit_bytes=quota_limit_bytes,
                 )
@@ -62,14 +64,14 @@ async def _create_dataset(
     client: httpx.AsyncClient,
     app,
     auth_headers,
-    owner_id: int,
+    user_id: int,
     *,
     ready_images: int = 0,
 ) -> int:
     response = await client.post(
         "/api/datasets",
-        headers=auth_headers(owner_id),
-        json={"name": f"test-quota-reject-{owner_id}-{uuid4().hex}"},
+        headers=auth_headers(user_id),
+        json={"name": f"test-quota-reject-{user_id}-{uuid4().hex}"},
     )
     assert response.status_code == 201, response.text
     dataset_id = int(response.json()["id"])
@@ -91,7 +93,7 @@ async def _create_dataset(
             source = dataset_root / f"quota-{index}.jpg"
             source.write_bytes(f"quota-image-{index}".encode())
             image = image_with_media(
-                owner_id=dataset.owner_id,
+                workspace_id=dataset.workspace_id,
                 dataset_id=dataset_id,
                 stem=f"quota-{index}",
                 filename=source.name,
@@ -163,7 +165,7 @@ def _host_ready(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         training,
         "spawn_worker",
-        lambda _run_id, _owner_id, _out_dir, _database_url: training.SpawnedWorker(
+        lambda _run_id, _workspace_id, _out_dir, _database_url: training.SpawnedWorker(
             pid=4242,
             pid_started_at="123456",
             boot_id="test-boot-id",

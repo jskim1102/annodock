@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
-from app.deps import CurrentUserDep
+from app.deps import CurrentWorkspaceDep
 from app.services.quota import get_referenced_bytes, quota_status
 
 
@@ -25,17 +25,17 @@ class StorageQuotaResponse(BaseModel):
 @router.get("", response_model=StorageQuotaResponse)
 async def storage_quota(
     request: Request,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> StorageQuotaResponse:
     status = await quota_status(
         session,
-        current_user.id,
+        current_workspace.id,
         limit_bytes=request.app.state.settings.quota_bytes_per_user,
         required_bytes=0,
     )
     return StorageQuotaResponse(
         used_bytes=status.used_bytes,
-        referenced_bytes=await get_referenced_bytes(session, current_user.id),
+        referenced_bytes=await get_referenced_bytes(session, current_workspace.id),
         limit_bytes=status.limit_bytes,
     )

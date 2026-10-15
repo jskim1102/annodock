@@ -5,6 +5,7 @@ import { AuthenticatedImage } from "./AuthenticatedImage";
 import { Icon } from "./Icon";
 
 interface ThumbStripProps {
+  statusLabel?: (image: ImageRow) => string;
   total: number;
   currentIndex: number;
   items: Map<number, ImageRow>;
@@ -23,6 +24,7 @@ function clamp(value: number, minimum: number, maximum: number) {
 }
 
 export function ThumbStrip({
+  statusLabel,
   total,
   currentIndex,
   items,
@@ -117,6 +119,7 @@ export function ThumbStrip({
             onClick={() => onSelect(index)}
           >
             {image ? <AuthenticatedImage resourcePath={imageResourceUrl(image.id, "thumb")} alt="" draggable="false" /> : null}
+            {image && statusLabel ? <span className="thumb-status">{statusLabel(image)}</span> : null}
             {image?.is_modified ? <span className="thumb-warning">●</span> : null}
           </button>
           );

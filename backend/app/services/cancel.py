@@ -99,7 +99,7 @@ async def _wait_for_group_exit(
 async def _finish_canceled(
     session_factory: async_sessionmaker[AsyncSession],
     run_id: int,
-    owner_id: int,
+    workspace_id: int,
     *,
     storage_dir: Path | None = None,
 ) -> CancelResult:
@@ -108,7 +108,7 @@ async def _finish_canceled(
             select(TrainingRun)
             .where(
                 TrainingRun.id == run_id,
-                TrainingRun.owner_id == owner_id,
+                TrainingRun.workspace_id == workspace_id,
                 TrainingRun.state == "canceling",
             )
             .with_for_update()
@@ -144,7 +144,7 @@ async def _finish_canceled(
         if run.finished_at is None:
             run.finished_at = datetime.now(timezone.utc)
         run.artifact_bytes = artifact_bytes
-        await increase_bytes_used(session, owner_id, artifact_bytes)
+        await increase_bytes_used(session, workspace_id, artifact_bytes)
         try:
             await session.commit()
         except BaseException as error:
@@ -164,14 +164,14 @@ async def _finish_canceled(
 async def _claim_cancel(
     session_factory: async_sessionmaker[AsyncSession],
     run_id: int,
-    owner_id: int,
+    workspace_id: int,
 ):
     async with session_factory() as session:
         result = await session.execute(
             update(TrainingRun)
             .where(
                 TrainingRun.id == run_id,
-                TrainingRun.owner_id == owner_id,
+                TrainingRun.workspace_id == workspace_id,
                 TrainingRun.state.in_(("queued", "running")),
             )
             .values(state="canceling")
@@ -186,7 +186,7 @@ async def _claim_cancel(
             exists = await session.scalar(
                 select(TrainingRun.id).where(
                     TrainingRun.id == run_id,
-                    TrainingRun.owner_id == owner_id,
+                    TrainingRun.workspace_id == workspace_id,
                 )
             )
             await session.rollback()
@@ -200,7 +200,7 @@ async def _claim_cancel(
 async def cancel_training_run(
     session_factory: async_sessionmaker[AsyncSession],
     run_id: int,
-    owner_id: int,
+    workspace_id: int,
     *,
     term_grace_seconds: float = CANCEL_TERM_GRACE_SECONDS,
     kill_wait_seconds: float = CANCEL_KILL_WAIT_SECONDS,
@@ -210,13 +210,13 @@ async def cancel_training_run(
     """Cancel one active run, writing terminal state only after group death."""
     _LOCAL_CANCELS_IN_PROGRESS.add(run_id)
     try:
-        claimed = await _claim_cancel(session_factory, run_id, owner_id)
+        claimed = await _claim_cancel(session_factory, run_id, workspace_id)
         pid, pid_started_at, boot_id = claimed
         if pid is None:
             return await _finish_canceled(
                 session_factory,
                 run_id,
-                owner_id,
+                workspace_id,
                 storage_dir=storage_dir,
             )
 
@@ -224,7 +224,7 @@ async def cancel_training_run(
             return await _finish_canceled(
                 session_factory,
                 run_id,
-                owner_id,
+                workspace_id,
                 storage_dir=storage_dir,
             )
         try:
@@ -233,7 +233,7 @@ async def cancel_training_run(
             return await _finish_canceled(
                 session_factory,
                 run_id,
-                owner_id,
+                workspace_id,
                 storage_dir=storage_dir,
             )
         if pgid != pid:
@@ -249,7 +249,7 @@ async def cancel_training_run(
             return await _finish_canceled(
                 session_factory,
                 run_id,
-                owner_id,
+                workspace_id,
                 storage_dir=storage_dir,
             )
         if await _wait_for_group_exit(
@@ -261,7 +261,7 @@ async def cancel_training_run(
             return await _finish_canceled(
                 session_factory,
                 run_id,
-                owner_id,
+                workspace_id,
                 storage_dir=storage_dir,
             )
 
@@ -277,7 +277,7 @@ async def cancel_training_run(
             return await _finish_canceled(
                 session_factory,
                 run_id,
-                owner_id,
+                workspace_id,
                 storage_dir=storage_dir,
             )
         try:
@@ -286,7 +286,7 @@ async def cancel_training_run(
             return await _finish_canceled(
                 session_factory,
                 run_id,
-                owner_id,
+                workspace_id,
                 storage_dir=storage_dir,
             )
         if not await _wait_for_group_exit(
@@ -301,7 +301,7 @@ async def cancel_training_run(
         return await _finish_canceled(
             session_factory,
             run_id,
-            owner_id,
+            workspace_id,
             storage_dir=storage_dir,
         )
     finally:

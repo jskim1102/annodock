@@ -63,6 +63,7 @@ async def test_scale_acceptance_thresholds_and_indexed_queries(
     async with app.state.session_factory() as session:
         dataset = await session.get(Dataset, dataset_id)
         assert dataset is not None
+        catalog_version = dataset.class_catalog_version
         assert (
             dataset.image_count,
             dataset.annotation_count,
@@ -105,6 +106,7 @@ async def test_scale_acceptance_thresholds_and_indexed_queries(
     assert first_page.json()["total"] == IMAGE_COUNT
     assert len(first_page.json()["items"]) == 200
     image_id = first_page.json()["items"][0]["id"]
+    image_version = first_page.json()["items"][0]["version"]
 
     statements: list[str] = []
 
@@ -135,6 +137,23 @@ async def test_scale_acceptance_thresholds_and_indexed_queries(
     assert not any("annotations" in statement for statement in statements)
     assert any("image_count" in statement for statement in statements)
 
+    async def save_annotations() -> httpx.Response:
+        nonlocal image_version, catalog_version
+        response = await client.put(
+            f"/api/images/{image_id}/annotations",
+            json={
+                "expected_version": image_version,
+                "expected_catalog_version": catalog_version,
+                "boxes": [{"class_id": 0, "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}],
+            },
+        )
+        if response.status_code == 200:
+            # Carry the warmup and each timed write forward without adding a
+            # version-fetch request to the save latency being measured.
+            image_version = response.json()["version"]
+            catalog_version = response.json()["catalog_version"]
+        return response
+
     metrics = {
         "images": await p95_ms(
             lambda: client.get(
@@ -156,22 +175,7 @@ async def test_scale_acceptance_thresholds_and_indexed_queries(
         "thumbnail": await p95_ms(
             lambda: client.get(f"/api/images/{image_id}/thumb")
         ),
-        "annotation_save": await p95_ms(
-            lambda: client.put(
-                f"/api/images/{image_id}/annotations",
-                json={
-                    "boxes": [
-                        {
-                            "class_id": 0,
-                            "cx": 0.5,
-                            "cy": 0.5,
-                            "w": 0.2,
-                            "h": 0.2,
-                        }
-                    ]
-                },
-            )
-        ),
+        "annotation_save": await p95_ms(save_annotations),
     }
     print(f"scale p95 ms: {metrics}")
 

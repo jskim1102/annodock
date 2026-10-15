@@ -50,20 +50,20 @@ async def _resolve_user_id(auth_database_url: str, email: str) -> int:
     return int(row.id)
 
 
-async def _apply(owner_id: int, revoke: bool) -> str:
+async def _apply(user_id: int, revoke: bool) -> str:
     settings = get_settings()
     engine = create_async_engine(settings.database_url, pool_pre_ping=True)
     try:
         async with engine.begin() as connection:
             if revoke:
                 result = await connection.execute(
-                    delete(AdminUser).where(AdminUser.owner_id == owner_id)
+                    delete(AdminUser).where(AdminUser.user_id == user_id)
                 )
                 return "회수" if result.rowcount else "회수 (이미 admin 아님 — 변경 없음)"
             result = await connection.execute(
                 pg_insert(AdminUser)
-                .values(owner_id=owner_id)
-                .on_conflict_do_nothing(index_elements=["owner_id"])
+                .values(user_id=user_id)
+                .on_conflict_do_nothing(index_elements=["user_id"])
             )
             return "부여" if result.rowcount else "부여 (이미 admin — 변경 없음)"
     finally:
@@ -82,9 +82,9 @@ async def main() -> None:
     if not settings.auth_database_url:
         raise SystemExit("AUTH_DATABASE_URL 이 설정돼 있지 않습니다 (.env)")
 
-    owner_id = await _resolve_user_id(settings.auth_database_url, args.email)
-    action = await _apply(owner_id, args.revoke)
-    print(f"admin {action} 완료: {args.email} (user id {owner_id})")
+    user_id = await _resolve_user_id(settings.auth_database_url, args.email)
+    action = await _apply(user_id, args.revoke)
+    print(f"admin {action} 완료: {args.email} (user id {user_id})")
 
 
 if __name__ == "__main__":

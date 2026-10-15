@@ -291,13 +291,13 @@ async def test_split_persists_run_images_without_modifying_image_split(app) -> N
     dataset_root.mkdir(parents=True)
     async with app.state.session_factory() as session:
         project = Project(
-            owner_id=1,
+            workspace_id=1,
             name=f"test-split-project-{uuid4().hex}",
         )
         session.add(project)
         await session.flush()
         dataset = Dataset(
-            owner_id=1,
+            workspace_id=1,
             project_id=project.id,
             name=name,
             status="ready",
@@ -316,7 +316,7 @@ async def test_split_persists_run_images_without_modifying_image_split(app) -> N
             source.write_bytes(b"image")
             session.add(
                 image_with_media(
-                    owner_id=dataset.owner_id,
+                    workspace_id=dataset.workspace_id,
                     dataset_id=dataset.id,
                     stem=f"persist-{index}",
                     filename=f"persist-{index}.jpg",
@@ -337,7 +337,8 @@ async def test_split_persists_run_images_without_modifying_image_split(app) -> N
                 )
             )
         run = TrainingRun(
-            owner_id=1,
+            workspace_id=1,
+            created_by=1,
             dataset_id=dataset.id,
             dataset_name=name,
             weights="yolo26n.pt",

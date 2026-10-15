@@ -110,6 +110,7 @@ async function loadApiClient(harness) {
   `);
   const javascript = transpile(source)
     .replace('from "./auth"', `from "${authModule}"`)
+    .replace('from "../store/workspace"', `from "${moduleUrl("export const getActiveWorkspaceId = () => null;")}"`)
     .replace('from "../store/auth"', `from "${storeModule}"`);
   return import(`${moduleUrl(javascript)}#${Math.random()}`);
 }

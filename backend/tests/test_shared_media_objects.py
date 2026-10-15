@@ -13,7 +13,7 @@ from app.models import (
     Dataset,
     Image,
     MediaObject,
-    UserStorage,
+    WorkspaceStorage,
 )
 from app.services import dataset_merge as dataset_merge_service
 from app.services.quota import increase_bytes_used
@@ -57,7 +57,7 @@ async def _create_shared_source(
         physical_bytes = original.stat().st_size + thumbnail.stat().st_size
 
         media_object = MediaObject(
-            owner_id=1,
+            workspace_id=1,
             created_by_dataset_id=dataset_id,
             original_bytes=original.stat().st_size,
             display_bytes=0,
@@ -173,7 +173,7 @@ async def test_merge_reuses_media_objects_and_releases_only_the_last_reference(
                 )
             ).all()
         )
-        usage = await session.get(UserStorage, 1)
+        usage = await session.get(WorkspaceStorage, 1)
 
     assert [image.media_object_id for image in source_images] == [
         first_object_id,
@@ -213,9 +213,13 @@ async def test_merge_reuses_media_objects_and_releases_only_the_last_reference(
 
     # Annotation rows remain dataset-local even though both image rows share
     # the same immutable media object.
+    current = await client.get(f"/api/images/{merged_images[0].id}/annotations")
+    assert current.status_code == 200, current.text
     edited = await client.put(
         f"/api/images/{merged_images[0].id}/annotations",
         json={
+            "expected_version": current.json()["version"],
+            "expected_catalog_version": current.json()["catalog_version"],
             "boxes": [
                 {
                     "class_id": 0,
@@ -242,7 +246,7 @@ async def test_merge_reuses_media_objects_and_releases_only_the_last_reference(
     assert surviving_file.status_code == 200
     async with app.state.session_factory() as session:
         first_object = await session.get(MediaObject, first_object_id)
-        usage = await session.get(UserStorage, 1)
+        usage = await session.get(WorkspaceStorage, 1)
         assert first_object is not None
         assert first_object.created_by_dataset_id == merged_id
         assert usage is not None and usage.bytes_used == physical_bytes
@@ -254,7 +258,7 @@ async def test_merge_reuses_media_objects_and_releases_only_the_last_reference(
     async with app.state.session_factory() as session:
         assert await session.get(MediaObject, first_object_id) is None
         assert await session.get(MediaObject, second_object_id) is not None
-        usage = await session.get(UserStorage, 1)
+        usage = await session.get(WorkspaceStorage, 1)
         assert usage is not None and usage.bytes_used == second_bytes
     second_detail = await client.get(f"/api/datasets/{second_id}")
     assert second_detail.status_code == 200
@@ -263,7 +267,7 @@ async def test_merge_reuses_media_objects_and_releases_only_the_last_reference(
     assert deleted_second.status_code == 204
     async with app.state.session_factory() as session:
         assert await session.scalar(select(func.count(MediaObject.id))) == 0
-        usage = await session.get(UserStorage, 1)
+        usage = await session.get(WorkspaceStorage, 1)
         assert usage is not None and usage.bytes_used == 0
 
 
@@ -312,7 +316,7 @@ async def test_cross_device_fallback_creates_and_accounts_a_distinct_object(
         source = await session.scalar(
             select(Image).where(Image.dataset_id == source_id)
         )
-        usage = await session.get(UserStorage, 1)
+        usage = await session.get(WorkspaceStorage, 1)
         assert copied is not None and source is not None
         assert copied.media_object_id != source_object_id
         assert copied.media_object_id != source.media_object_id

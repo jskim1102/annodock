@@ -32,13 +32,14 @@ test("the API client exposes the authenticated storage quota endpoint", () => {
   assert.match(client, /used_bytes:\s*number/);
   assert.match(client, /limit_bytes:\s*number/);
   assert.match(client, /export function getStorageQuota\(/);
-  assert.match(client, /requestJson<StorageQuota>\("\/api\/storage"\)/);
+  assert.match(client, /requestJson<StorageQuota>\("\/api\/storage", \{ workspaceId \}\)/);
 });
 
-test("one quota request is cached per access token and rejected requests are evicted", () => {
+test("one quota request is cached per token and workspace and rejected requests are evicted", () => {
   assert.match(client, /storageQuotaCache\?\.tokenKey === tokenKey/);
   assert.match(client, /return storageQuotaCache\.request/);
-  assert.match(client, /storageQuotaCache = \{ tokenKey, request \}/);
+  assert.match(client, /storageQuotaCache\.workspaceId === workspaceId/);
+  assert.match(client, /storageQuotaCache = \{ tokenKey, workspaceId, request \}/);
   assert.match(
     client,
     /void request\.catch\(\(\) => \{[\s\S]*?storageQuotaCache\?\.request === request[\s\S]*?storageQuotaCache = null/,
@@ -69,8 +70,9 @@ test("every started upload attempt invalidates quota from finally", () => {
   assert.match(client, /export const STORAGE_QUOTA_INVALIDATED_EVENT/);
   assert.match(client, /export function invalidateStorageQuotaCache\(\)/);
   assert.match(client, /dispatchEvent\(new Event\(STORAGE_QUOTA_INVALIDATED_EVENT\)\)/);
-  assert.match(appShell, /addEventListener\(STORAGE_QUOTA_INVALIDATED_EVENT, loadStorageQuota\)/);
-  assert.match(appShell, /removeEventListener\(STORAGE_QUOTA_INVALIDATED_EVENT, loadStorageQuota\)/);
+  assert.match(appShell, /const invalidate = \(\) => \{\s*setStorageQuota\(null\);\s*loadStorageQuota\(\);\s*\}/);
+  assert.match(appShell, /addEventListener\(STORAGE_QUOTA_INVALIDATED_EVENT, invalidate\)/);
+  assert.match(appShell, /removeEventListener\(STORAGE_QUOTA_INVALIDATED_EVENT, invalidate\)/);
 
   const handlerStart = uploadPage.indexOf("const startUpload = async () => {");
   const handlerEnd = uploadPage.indexOf("const continueUploadAfterClassResolution", handlerStart);

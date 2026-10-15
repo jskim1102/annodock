@@ -62,7 +62,7 @@ async def add_image(
         dataset = await session.get(Dataset, dataset_id)
         assert dataset is not None
         image = image_with_media(
-            owner_id=dataset.owner_id,
+            workspace_id=dataset.workspace_id,
             dataset_id=dataset_id,
             stem=stem,
             filename=filename,
@@ -142,6 +142,11 @@ async def test_image_list_is_stable_paginated_and_split_filtered(
         "height": 480,
         "box_count": 1,
         "is_modified": True,
+        "label_status": "unlabeled",
+        "assignee_id": None,
+        "version": 0,
+        "labeled_by": None,
+        "labeled_at": None,
     }
     assert last_page.status_code == 200
     assert [

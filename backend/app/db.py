@@ -38,13 +38,13 @@ def create_engine(database_url: str | None = None) -> AsyncEngine:
     )
 
 
-async def set_local_lock_timeout(session: AsyncSession) -> None:
+async def set_local_lock_timeout(session: AsyncSession, *, timeout_ms: int | None = None) -> None:
     """Bound lock waits only inside one deliberately short transaction."""
 
     bind = session.get_bind()
     if bind.dialect.name != "postgresql":
         return
-    timeout_ms = int(SHORT_LOCK_TIMEOUT_MS)
+    timeout_ms = int(SHORT_LOCK_TIMEOUT_MS if timeout_ms is None else timeout_ms)
     if timeout_ms <= 0:
         raise ValueError("SHORT_LOCK_TIMEOUT_MS must be positive")
     await session.execute(
@@ -55,6 +55,16 @@ async def set_local_lock_timeout(session: AsyncSession) -> None:
 def is_lock_not_available(error: BaseException) -> bool:
     """Return whether an exception chain contains PostgreSQL SQLSTATE 55P03."""
 
+    return _has_sqlstate(error, {"55P03"})
+
+
+def is_retryable_lock_error(error: BaseException) -> bool:
+    """Upload input survives both lock contention and deadlock victims."""
+
+    return _has_sqlstate(error, {"55P03", "40P01"})
+
+
+def _has_sqlstate(error: BaseException, codes: set[str]) -> bool:
     pending: list[object] = [error]
     seen: set[int] = set()
     while pending:
@@ -63,8 +73,8 @@ def is_lock_not_available(error: BaseException) -> bool:
             continue
         seen.add(id(current))
         if (
-            getattr(current, "sqlstate", None) == "55P03"
-            or getattr(current, "pgcode", None) == "55P03"
+            getattr(current, "sqlstate", None) in codes
+            or getattr(current, "pgcode", None) in codes
         ):
             return True
         if isinstance(current, BaseExceptionGroup):

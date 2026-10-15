@@ -14,6 +14,7 @@ import {
 import { Brand } from "../components/AppShell";
 import { appHref, navigate } from "../navigation";
 import { useTheme } from "../theme";
+import { adminHomePath, resetAdminProbe } from "../utils/adminAccess";
 
 const providers = [
   { id: "naver", label: "Naver", supported: true },
@@ -46,15 +47,58 @@ function authErrorMessage(error: unknown, fallback: string): string {
   return error instanceof Error && error.message ? error.message : fallback;
 }
 
-function pathAfterLogin(): string {
-  const candidate = new URLSearchParams(window.location.search).get("next");
+function pathAfterLogin(
+  candidate: string | null = new URLSearchParams(window.location.search).get("next"),
+  fallback = "/projects",
+): string {
   if (!candidate || !candidate.startsWith("/") || candidate.startsWith("//")) {
-    return "/projects";
+    return fallback;
   }
-  const target = new URL(candidate, window.location.origin);
-  return target.origin === window.location.origin
-    ? `${target.pathname}${target.search}${target.hash}`
-    : "/projects";
+  try {
+    const target = new URL(candidate, window.location.origin);
+    return target.origin === window.location.origin
+      ? `${target.pathname}${target.search}${target.hash}`
+      : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+// Admin accounts land on the admin page unless an explicit same-origin path
+// was requested (phase15). The probe is reset because the completed login may
+// belong to a different account than a cached probe.
+async function destinationAfterLogin(candidate?: string | null): Promise<string> {
+  const path = pathAfterLogin(candidate, "");
+  if (path) return path;
+  resetAdminProbe();
+  return adminHomePath();
+}
+
+function authPathWithNext(
+  path: string,
+  candidate: string | null = new URLSearchParams(window.location.search).get("next"),
+): string {
+  const target = new URL(path, window.location.origin);
+  if (candidate !== null) target.searchParams.set("next", pathAfterLogin(candidate));
+  return `${target.pathname}${target.search}${target.hash}`;
+}
+
+const OAUTH_RETURN_KEY = "annodock:oauth-return";
+
+function storedOAuthReturnPath(): string | null {
+  try {
+    return window.sessionStorage.getItem(OAUTH_RETURN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function clearStoredOAuthReturnPath(): void {
+  try {
+    window.sessionStorage.removeItem(OAUTH_RETURN_KEY);
+  } catch {
+    // Browser storage restrictions must not block authentication.
+  }
 }
 
 export function LoginPage() {
@@ -62,6 +106,8 @@ export function LoginPage() {
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const registered = new URLSearchParams(window.location.search).has("registered");
+
+  useEffect(() => { clearStoredOAuthReturnPath(); }, []);
 
   const submitLogin = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -72,7 +118,7 @@ export function LoginPage() {
     try {
       const tokens = await login(identifier, password);
       await establishAuthSession(tokens);
-      navigate(pathAfterLogin());
+      navigate(await destinationAfterLogin());
     } catch (reason: unknown) {
       setError(reason instanceof AuthApiError && reason.status === 401
         ? "아이디 또는 비밀번호가 올바르지 않습니다."
@@ -112,6 +158,11 @@ export function LoginPage() {
                 title={provider.supported ? undefined : "아직 지원하지 않습니다"}
                 onClick={() => {
                   if (provider.supported) {
+                    try {
+                      window.sessionStorage.setItem(OAUTH_RETURN_KEY, pathAfterLogin());
+                    } catch {
+                      // Authentication still works when browser storage is unavailable.
+                    }
                     window.location.assign(oauthAuthorizeUrl(provider.id as OAuthProvider));
                   }
                 }}
@@ -156,7 +207,7 @@ export function LoginPage() {
           {error ? <div className="banner-danger auth-banner" role="alert">{error}</div> : null}
 
           <div className="auth-links">
-            <span>계정이 없으신가요? <a href={appHref("/signup")}>회원가입</a></span>
+            <span>계정이 없으신가요? <a href={appHref(authPathWithNext("/signup"))}>회원가입</a></span>
             <a href={appHref("/password-reset")}>비밀번호를 잊으셨나요?</a>
           </div>
         </div>
@@ -191,7 +242,7 @@ export function SignupPage() {
     setError(null);
     try {
       await signup(username, email, password);
-      navigate("/login?registered=1");
+      navigate(authPathWithNext("/login?registered=1"));
     } catch (reason: unknown) {
       setError(reason instanceof AuthApiError && reason.status === 409
         ? "이미 사용 중인 username 또는 email입니다."
@@ -263,7 +314,7 @@ export function SignupPage() {
         <button className="btn btn-primary auth-submit" type="submit" disabled={submitting}>{submitting ? "가입 중…" : "회원가입"}</button>
       </form>
       {error ? <div className="banner-danger auth-banner" role="alert">{error}</div> : null}
-      <p className="auth-card-link">이미 계정이 있으신가요? <a href={appHref("/login")}>로그인</a></p>
+      <p className="auth-card-link">이미 계정이 있으신가요? <a href={appHref(authPathWithNext("/login"))}>로그인</a></p>
     </AuthCard>
   );
 }
@@ -360,22 +411,31 @@ export function PasswordResetPage() {
 export function OAuthCallbackPage() {
   const [error, setError] = useState<string | null>(null);
   const code = new URLSearchParams(window.location.search).get("code");
+  const [returnPath] = useState(() => pathAfterLogin(
+    new URLSearchParams(window.location.search).get("next") ?? storedOAuthReturnPath(),
+    "",
+  ));
 
   useEffect(() => {
+    // Keep the captured path in state; render-time consumption would lose it
+    // when StrictMode calls the initializer again before committing effects.
+    clearStoredOAuthReturnPath();
     if (!code) {
       setError("OAuth 인증 코드가 없습니다. 다시 로그인해 주세요.");
       return;
     }
     let active = true;
     void exchangeOAuthCodeOnce(code)
-      .then(() => {
-        if (active) navigate("/projects");
+      .then(async () => {
+        if (!active) return;
+        const destination = await destinationAfterLogin(returnPath);
+        if (active) navigate(destination);
       })
       .catch((reason: unknown) => {
         if (active) setError(authErrorMessage(reason, "OAuth 로그인을 완료하지 못했습니다."));
       });
     return () => { active = false; };
-  }, [code]);
+  }, [code, returnPath]);
 
   return (
     <AuthCard>
@@ -384,7 +444,7 @@ export function OAuthCallbackPage() {
       {error
         ? <div className="banner-danger auth-banner" role="alert">{error}</div>
         : <div className="banner-info auth-banner" role="status">로그인을 완료하는 중입니다…</div>}
-      <p className="auth-card-link"><a href={appHref("/login")}>로그인으로 돌아가기</a></p>
+      <p className="auth-card-link"><a href={appHref(authPathWithNext("/login", returnPath))}>로그인으로 돌아가기</a></p>
     </AuthCard>
   );
 }

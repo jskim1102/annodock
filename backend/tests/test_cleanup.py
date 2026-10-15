@@ -1,15 +1,20 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Dataset, RunImage, TrainingRun
+from app.models import Dataset, RunImage, TrainingRun, UploadBatch, UploadSession
+from app.services.cleanup import sweep_upload_storage
 from app.services.storage import contained_storage_path
+from app.services.uploads import upload_directory
 from app.worker import train_worker
 
 
@@ -27,7 +32,8 @@ def _run(
     dataset_id: int | None = None,
 ) -> TrainingRun:
     return TrainingRun(
-        owner_id=1,
+        workspace_id=1,
+        created_by=1,
         dataset_id=dataset_id,
         dataset_name=_run_name("run"),
         weights="yolo26n.pt",
@@ -198,3 +204,198 @@ async def test_dataset_delete_restricts_active_run_but_allows_inactive_run(
         persisted = await session.get(TrainingRun, run_id)
         assert persisted is not None
         assert persisted.dataset_id is None
+
+
+async def _cleanup_dataset(client: httpx.AsyncClient) -> int:
+    created = await client.post(
+        "/api/datasets",
+        json={"name": _run_name("upload-batch")},
+    )
+    assert created.status_code == 201
+    return created.json()["id"]
+
+
+async def _manifest_uploads(
+    client: httpx.AsyncClient,
+    dataset_id: int,
+    filenames: tuple[str, ...] = ("images/a.jpg",),
+) -> tuple[UUID, list[int]]:
+    batch_id = uuid4()
+    started = await client.put(
+        f"/api/datasets/{dataset_id}/upload-batches/{batch_id}",
+        json={
+            "total_size": 0,
+            "largest_file_size": 0,
+            "file_count": len(filenames),
+            "expected_extracted_size": 0,
+        },
+    )
+    assert started.status_code == 200
+    created = await client.post(
+        f"/api/datasets/{dataset_id}/uploads/batch",
+        json={
+            "batch_id": str(batch_id),
+            "files": [
+                {"filename": name, "size": 0, "chunk_size": 1, "kind": "file"}
+                for name in filenames
+            ],
+        },
+    )
+    assert created.status_code == 201
+    return batch_id, [item["upload_id"] for item in created.json()["uploads"]]
+
+
+def _expire_upload_directory(path: Path, now: datetime) -> None:
+    timestamp = (now - timedelta(hours=25)).timestamp()
+    for candidate in [path, *path.rglob("*")]:
+        os.utime(candidate, (timestamp, timestamp), follow_symlinks=False)
+
+
+async def test_upload_cleanup_aborts_only_batches_with_expired_sessions(
+    client: httpx.AsyncClient,
+    app,
+) -> None:
+    dataset_id = await _cleanup_dataset(client)
+    stale_batch, stale_ids = await _manifest_uploads(
+        client,
+        dataset_id,
+        ("images/a.jpg", "images/b.jpg"),
+    )
+    fresh_batch, fresh_ids = await _manifest_uploads(client, dataset_id)
+    unrelated_dataset_id = await _cleanup_dataset(client)
+    unrelated_batch, unrelated_ids = await _manifest_uploads(
+        client,
+        unrelated_dataset_id,
+    )
+    empty_batch = uuid4()
+    assert (
+        await client.put(
+            f"/api/datasets/{dataset_id}/upload-batches/{empty_batch}",
+            json={
+                "total_size": 0,
+                "largest_file_size": 0,
+                "file_count": 1,
+                "expected_extracted_size": 0,
+            },
+        )
+    ).status_code == 200
+    now = datetime.now(timezone.utc)
+    for upload_id in stale_ids:
+        _expire_upload_directory(upload_directory(app.state.settings, upload_id), now)
+
+    result = await sweep_upload_storage(
+        app.state.session_factory,
+        storage_dir=app.state.settings.storage_dir,
+        now=now,
+    )
+
+    assert result.expired_sessions == 2
+    assert result.reclaimed_directories == 2
+    async with app.state.session_factory() as session:
+        batch_states = dict(
+            (
+                await session.execute(
+                    select(UploadBatch.id, UploadBatch.state).where(
+                        UploadBatch.id.in_(
+                            [stale_batch, fresh_batch, unrelated_batch, empty_batch]
+                        )
+                    )
+                )
+            ).all()
+        )
+        assert batch_states == {
+            stale_batch: "aborted",
+            fresh_batch: "open",
+            unrelated_batch: "open",
+            empty_batch: "open",
+        }
+        for upload_id in [*stale_ids, *fresh_ids, *unrelated_ids]:
+            upload = await session.get(UploadSession, upload_id)
+            assert upload is not None
+            assert upload.state == ("aborted" if upload_id in stale_ids else "open")
+            assert upload_directory(app.state.settings, upload_id).is_dir() == (
+                upload_id not in stale_ids
+            )
+
+
+@pytest.mark.parametrize("batch_state", ["sealed", "aborted"])
+async def test_upload_cleanup_preserves_nonopen_batch_state(
+    client: httpx.AsyncClient,
+    app,
+    batch_state: str,
+) -> None:
+    dataset_id = await _cleanup_dataset(client)
+    batch_id, upload_ids = await _manifest_uploads(client, dataset_id)
+    async with app.state.session_factory() as session:
+        batch = await session.get(UploadBatch, batch_id)
+        assert batch is not None
+        batch.state = batch_state
+        await session.commit()
+    now = datetime.now(timezone.utc)
+    directory = upload_directory(app.state.settings, upload_ids[0])
+    _expire_upload_directory(directory, now)
+
+    result = await sweep_upload_storage(
+        app.state.session_factory,
+        storage_dir=app.state.settings.storage_dir,
+        now=now,
+    )
+
+    assert result.expired_sessions == 1
+    assert not directory.exists()
+    async with app.state.session_factory() as session:
+        batch = await session.get(UploadBatch, batch_id)
+        upload = await session.get(UploadSession, upload_ids[0])
+        assert batch is not None and batch.state == batch_state
+        assert upload is not None and upload.state == "aborted"
+
+
+async def test_upload_cleanup_rolls_back_batch_session_and_files_on_commit_failure(
+    client: httpx.AsyncClient,
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset_id = await _cleanup_dataset(client)
+    batch_id, upload_ids = await _manifest_uploads(client, dataset_id)
+    upload_id = upload_ids[0]
+    directory = upload_directory(app.state.settings, upload_id)
+    chunk = directory / "unfinished.part"
+    chunk.write_bytes(b"partial-upload-content")
+    now = datetime.now(timezone.utc)
+    _expire_upload_directory(directory, now)
+
+    async def fail_commit(session: AsyncSession) -> None:
+        # Force both writes to the database, then observe them from another
+        # transaction to catch an accidental earlier commit of either row.
+        await session.flush()
+        assert await session.scalar(
+            select(UploadBatch.state).where(UploadBatch.id == batch_id)
+        ) == "aborted"
+        assert await session.scalar(
+            select(UploadSession.state).where(UploadSession.id == upload_id)
+        ) == "aborted"
+        async with app.state.session_factory() as observer:
+            assert await observer.scalar(
+                select(UploadBatch.state).where(UploadBatch.id == batch_id)
+            ) == "open"
+            assert await observer.scalar(
+                select(UploadSession.state).where(UploadSession.id == upload_id)
+            ) == "open"
+        assert not directory.exists()
+        raise RuntimeError("forced manifest cleanup commit failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(AsyncSession, "commit", fail_commit)
+        with pytest.raises(RuntimeError, match="forced manifest cleanup commit failure"):
+            await sweep_upload_storage(
+                app.state.session_factory,
+                storage_dir=app.state.settings.storage_dir,
+                now=now,
+            )
+
+    assert chunk.read_bytes() == b"partial-upload-content"
+    async with app.state.session_factory() as session:
+        batch = await session.get(UploadBatch, batch_id)
+        upload = await session.get(UploadSession, upload_id)
+        assert batch is not None and batch.state == "open"
+        assert upload is not None and upload.state == "open"

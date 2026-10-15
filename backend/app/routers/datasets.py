@@ -8,13 +8,18 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import case, func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import case, delete, func, select, update
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.class_colors import class_color
-from app.db import get_session, set_local_lock_timeout
-from app.deps import CurrentUserDep
+from app.db import get_session, is_lock_not_available, set_local_lock_timeout
+from app.deps import (
+    AdminWorkspaceDep,
+    CurrentWorkspaceDep,
+    EditorWorkspaceDep,
+    check_workspace_role,
+)
 from app.models import (
     Dataset,
     DatasetClass,
@@ -83,6 +88,7 @@ class ClassName(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1, max_length=255)
+    expected_catalog_version: int | None = Field(default=None, ge=0, strict=True)
 
     @field_validator("name")
     @classmethod
@@ -117,6 +123,8 @@ class SplitRow(BaseModel):
 
 class DatasetDetail(DatasetRow):
     splits: list[SplitRow]
+    workspace_id: int
+    my_role: str
 
 
 class ActiveJob(BaseModel):
@@ -148,6 +156,11 @@ class ClassRow(BaseModel):
 
 class ClassList(BaseModel):
     classes: list[ClassRow]
+    catalog_version: int
+
+
+class ClassUpdated(ClassRow, ClassList):
+    pass
 
 
 class DatasetRenamed(BaseModel):
@@ -211,13 +224,13 @@ class DatasetExtractRequest(DatasetName):
 async def _dataset_or_404(
     session: AsyncSession,
     dataset_id: int,
-    owner_id: int,
+    workspace_id: int,
     *,
     for_update: bool = False,
 ) -> Dataset:
     statement = select(Dataset).where(
         Dataset.id == dataset_id,
-        Dataset.owner_id == owner_id,
+        Dataset.workspace_id == workspace_id,
         Dataset.is_placeholder.is_(False),
     )
     if for_update:
@@ -257,17 +270,18 @@ async def create_dataset(
     body: DatasetCreate,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: EditorWorkspaceDep,
 ) -> Dataset:
     if body.project_id is None:
+        check_workspace_role(current_workspace, "admin")
         project = await session.scalar(
             select(Project).where(
-                Project.owner_id == current_user.id,
+                Project.workspace_id == current_workspace.id,
                 Project.name == body.name,
-            )
+            ).with_for_update()
         )
         if project is None:
-            project = Project(owner_id=current_user.id, name=body.name)
+            project = Project(workspace_id=current_workspace.id, name=body.name)
             session.add(project)
             await session.flush()
     else:
@@ -275,7 +289,7 @@ async def create_dataset(
             select(Project)
             .where(
                 Project.id == body.project_id,
-                Project.owner_id == current_user.id,
+                Project.workspace_id == current_workspace.id,
             )
             .with_for_update()
         )
@@ -296,7 +310,7 @@ async def create_dataset(
         select(Dataset)
         .where(
             Dataset.project_id == project.id,
-            Dataset.owner_id == current_user.id,
+            Dataset.workspace_id == current_workspace.id,
             Dataset.is_placeholder.is_(True),
             # Only migration-era untouched placeholders are reusable. Upload
             # drafts can own a paused job and must never be repurposed.
@@ -311,7 +325,7 @@ async def create_dataset(
     )
     if placeholder is None:
         dataset = Dataset(
-            owner_id=current_user.id,
+            workspace_id=current_workspace.id,
             project_id=project.id,
             name=body.name,
             status="pending",
@@ -363,7 +377,7 @@ async def create_dataset(
 @router.get("", response_model=DatasetPage)
 async def list_datasets(
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> DatasetPage:
@@ -384,7 +398,7 @@ async def list_datasets(
             select(Dataset, UploadJob)
             .outerjoin(UploadJob, UploadJob.id == latest_active_job_id)
             .where(
-                Dataset.owner_id == current_user.id,
+                Dataset.workspace_id == current_workspace.id,
                 Dataset.is_placeholder.is_(False),
                 ~Dataset.id.in_(source_dataset_ids),
             )
@@ -402,7 +416,7 @@ async def list_datasets(
         select(func.count())
         .select_from(Dataset)
         .where(
-            Dataset.owner_id == current_user.id,
+            Dataset.workspace_id == current_workspace.id,
             Dataset.is_placeholder.is_(False),
             ~Dataset.id.in_(source_dataset_ids),
         )
@@ -423,7 +437,7 @@ async def list_datasets(
                 .outerjoin(UploadJob, UploadJob.id == latest_active_job_id)
                 .where(
                     DatasetMergeSource.merged_dataset_id.in_(dataset_ids),
-                    Dataset.owner_id == current_user.id,
+                    Dataset.workspace_id == current_workspace.id,
                     Dataset.is_placeholder.is_(False),
                 )
                 .order_by(
@@ -459,7 +473,7 @@ async def create_merged_dataset(
     request: Request,
     response: Response,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: AdminWorkspaceDep,
 ) -> DatasetListRow:
     try:
         result = await merge_datasets(
@@ -467,7 +481,7 @@ async def create_merged_dataset(
             session,
             name=body.name,
             dataset_ids=body.dataset_ids,
-            owner_id=current_user.id,
+            workspace_id=current_workspace.id,
             purpose=body.purpose,
         )
     except DatasetMergeNotFound as error:
@@ -500,7 +514,7 @@ async def create_extracted_dataset(
     body: DatasetExtractRequest,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: AdminWorkspaceDep,
 ) -> Dataset:
     try:
         result = await extract_dataset_snapshot(
@@ -509,7 +523,7 @@ async def create_extracted_dataset(
             name=body.name,
             dataset_ids=body.dataset_ids,
             class_ids=body.class_ids,
-            owner_id=current_user.id,
+            workspace_id=current_workspace.id,
         )
     except DatasetExtractNotFound as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
@@ -531,7 +545,7 @@ async def add_merged_dataset_sources(
     body: DatasetMergeSourcesRequest,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: AdminWorkspaceDep,
 ) -> DatasetListRow:
     if dataset_id in body.dataset_ids:
         raise HTTPException(
@@ -544,7 +558,7 @@ async def add_merged_dataset_sources(
             session,
             merged_dataset_id=dataset_id,
             dataset_ids=body.dataset_ids,
-            owner_id=current_user.id,
+            workspace_id=current_workspace.id,
             purpose=body.purpose,
         )
     except DatasetMergeNotFound as error:
@@ -567,9 +581,9 @@ async def add_merged_dataset_sources(
 async def get_dataset(
     dataset_id: int,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
 ) -> DatasetDetail:
-    dataset = await _dataset_or_404(session, dataset_id, current_user.id)
+    dataset = await _dataset_or_404(session, dataset_id, current_workspace.id)
     priority = case(
         (Image.split == "train", 0),
         (Image.split == "val", 1),
@@ -586,6 +600,8 @@ async def get_dataset(
     ).all()
     return DatasetDetail(
         **DatasetRow.model_validate(dataset).model_dump(),
+        workspace_id=current_workspace.id,
+        my_role=current_workspace.role,
         splits=[
             SplitRow(split=split_name, image_count=count)
             for split_name, count in split_rows
@@ -594,25 +610,29 @@ async def get_dataset(
     )
 
 
+async def _dataset_catalog(session: AsyncSession, dataset_id: int) -> ClassList:
+    rows = (await session.execute(
+        select(Dataset.class_catalog_version, DatasetClass.class_id, DatasetClass.name)
+        .outerjoin(DatasetClass, DatasetClass.dataset_id == Dataset.id)
+        .where(Dataset.id == dataset_id).order_by(DatasetClass.class_id)
+    )).all()
+    if not rows:
+        raise HTTPException(status_code=404, detail="데이터셋을 찾을 수 없습니다.")
+    return ClassList(
+        catalog_version=rows[0].class_catalog_version,
+        classes=[ClassRow(class_id=row.class_id, name=row.name)
+                 for row in rows if row.class_id is not None],
+    )
+
+
 @router.get("/{dataset_id}/classes", response_model=ClassList)
 async def get_dataset_classes(
     dataset_id: int,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
 ) -> ClassList:
-    await _dataset_or_404(session, dataset_id, current_user.id)
-    rows = (
-        await session.scalars(
-            select(DatasetClass)
-            .where(DatasetClass.dataset_id == dataset_id)
-            .order_by(DatasetClass.class_id)
-        )
-    ).all()
-    return ClassList(
-        classes=[
-            ClassRow(class_id=row.class_id, name=row.name) for row in rows
-        ]
-    )
+    await _dataset_or_404(session, dataset_id, current_workspace.id)
+    return await _dataset_catalog(session, dataset_id)
 
 
 @router.patch("/{dataset_id}", response_model=DatasetRenamed)
@@ -620,9 +640,9 @@ async def rename_dataset(
     dataset_id: int,
     body: DatasetName,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: AdminWorkspaceDep,
 ) -> DatasetRenamed:
-    dataset = await _dataset_or_404(session, dataset_id, current_user.id)
+    dataset = await _dataset_or_404(session, dataset_id, current_workspace.id)
     dataset.name = body.name
     try:
         await session.commit()
@@ -634,74 +654,100 @@ async def rename_dataset(
 
 @router.patch(
     "/{dataset_id}/classes/{class_id}",
-    response_model=ClassRow,
+    response_model=ClassUpdated,
 )
 async def rename_dataset_class(
     dataset_id: int,
     class_id: int,
     body: ClassName,
     session: Session,
-    current_user: CurrentUserDep,
-) -> ClassRow:
-    # The dataset row lock serializes rename against run submission so the
-    # generated data.yaml is a coherent submit-time class-name snapshot.
-    dataset = await _dataset_or_404(
-        session,
-        dataset_id,
-        current_user.id,
-        for_update=True,
-    )
-    project = await session.scalar(
-        select(Project)
-        .where(
-            Project.id == dataset.project_id,
-            Project.owner_id == current_user.id,
-        )
-        .with_for_update()
-    )
-    if project is None:
-        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
-    dataset_class = await session.get(DatasetClass, (dataset_id, class_id))
-    if dataset_class is None:
-        raise HTTPException(status_code=404, detail="클래스를 찾을 수 없습니다.")
-    project_class = await session.get(
-        ProjectClass,
-        (dataset.project_id, class_id),
-    )
-    if project_class is None:
-        project_class = ProjectClass(
-            project_id=dataset.project_id,
-            class_id=class_id,
-            name=body.name,
-            color=class_color(class_id),
-        )
-        session.add(project_class)
-    else:
-        project_class.name = body.name
-    await session.execute(
-        update(DatasetClass)
-        .where(
-            DatasetClass.class_id == class_id,
-            DatasetClass.dataset_id.in_(
-                select(Dataset.id).where(
-                    Dataset.project_id == dataset.project_id,
-                    Dataset.owner_id == current_user.id,
-                    Dataset.is_placeholder.is_(False),
-                )
-            ),
-        )
-        .values(name=body.name)
-    )
-    project.updated_at = func.now()
+    current_workspace: AdminWorkspaceDep,
+) -> ClassUpdated:
+    # Renames wait behind autosave, with the parent and all siblings locked
+    # in the same order as ingestion and dataset mutations.
     try:
-        await session.commit()
+        await set_local_lock_timeout(session, timeout_ms=2500)
+        dataset = await _dataset_or_404(
+            session,
+            dataset_id,
+            current_workspace.id,
+        )
+        project = await session.scalar(
+            select(Project)
+            .where(
+                Project.id == dataset.project_id,
+                Project.workspace_id == current_workspace.id,
+            )
+            .with_for_update()
+        )
+        if project is None:
+            raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
+        await session.execute(select(Dataset.id).where(
+            Dataset.project_id == project.id,
+            Dataset.workspace_id == current_workspace.id,
+        ).order_by(Dataset.id).with_for_update())
+        current_version = await session.scalar(select(Dataset.class_catalog_version).where(
+            Dataset.id == dataset_id, Dataset.project_id == project.id,
+            Dataset.workspace_id == current_workspace.id,
+        ))
+        if current_version is None:
+            raise HTTPException(status_code=404, detail="데이터셋을 찾을 수 없습니다.")
+        if body.expected_catalog_version is not None and body.expected_catalog_version != current_version:
+            raise HTTPException(status_code=409, detail={"code": "class_catalog_changed"})
+        dataset_class = await session.get(DatasetClass, (dataset_id, class_id))
+        if dataset_class is None:
+            raise HTTPException(status_code=404, detail="클래스를 찾을 수 없습니다.")
+        project_class = await session.get(
+            ProjectClass,
+            (dataset.project_id, class_id),
+        )
+        if project_class is None:
+            project_class = ProjectClass(
+                project_id=dataset.project_id,
+                class_id=class_id,
+                name=body.name,
+                color=class_color(class_id),
+            )
+            session.add(project_class)
+        else:
+            project_class.name = body.name
+        await session.execute(
+            update(DatasetClass)
+            .where(
+                DatasetClass.class_id == class_id,
+                DatasetClass.dataset_id.in_(
+                    select(Dataset.id).where(
+                        Dataset.project_id == dataset.project_id,
+                        Dataset.workspace_id == current_workspace.id,
+                        Dataset.is_placeholder.is_(False),
+                    )
+                ),
+            )
+            .values(name=body.name)
+        )
+        project.updated_at = func.now()
+        try:
+            await session.flush()
+            catalog = await _dataset_catalog(session, dataset_id)
+            await session.commit()
+        except IntegrityError as error:
+            await session.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="이미 있는 클래스 이름입니다.",
+            ) from error
+        return ClassUpdated(class_id=class_id, name=body.name, **catalog.model_dump())
     except IntegrityError as error:
         await session.rollback()
         raise HTTPException(
             status_code=409,
             detail="이미 있는 클래스 이름입니다.",
         ) from error
-    return ClassRow(class_id=class_id, name=body.name)
+    except DBAPIError as error:
+        await session.rollback()
+        if is_lock_not_available(error):
+            raise HTTPException(status_code=409, detail="다른 데이터 작업이 진행 중이에요. 잠시 후 다시 시도해 주세요.") from error
+        raise
 
 
 @router.delete("/{dataset_id}", status_code=204)
@@ -709,23 +755,22 @@ async def delete_dataset(
     dataset_id: int,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: AdminWorkspaceDep,
 ) -> Response:
     dataset = await _dataset_or_404(
         session,
         dataset_id,
-        current_user.id,
+        current_workspace.id,
         for_update=True,
     )
-    # Delete only the selected dataset reference.  Merge membership cascades
-    # away and any surviving source datasets become visible again.
+    # Delete only the selected dataset reference; independent snapshots survive.
     targets = [dataset]
     target_ids = [item.id for item in targets]
     active_run_id = await session.scalar(
         select(TrainingRun.id)
         .where(
             TrainingRun.dataset_id.in_(target_ids),
-            TrainingRun.owner_id == current_user.id,
+            TrainingRun.workspace_id == current_workspace.id,
             TrainingRun.state.in_(("running", "canceling")),
         )
         .limit(1)
@@ -738,7 +783,7 @@ async def delete_dataset(
                 "학습이 끝나거나 취소된 뒤 다시 시도하세요."
             ),
         )
-    owner_id = dataset.owner_id
+    workspace_id = dataset.workspace_id
     storage_dir = request.app.state.settings.storage_dir
     await set_local_lock_timeout(session)
     release_plan = await plan_dataset_storage_release(session, target_ids)
@@ -759,13 +804,24 @@ async def delete_dataset(
     )
     staged_list = await stage_deletions_async(storage_dir, deletion_paths)
     try:
+        # A snapshot with a deleted source no longer represents its remaining
+        # membership. Detach all its sources atomically with the deletion so
+        # it cannot be reused as a snapshot of that smaller source set.
+        affected_merges = select(DatasetMergeSource.merged_dataset_id).where(
+            DatasetMergeSource.source_dataset_id.in_(target_ids)
+        )
+        await session.execute(
+            delete(DatasetMergeSource).where(
+                DatasetMergeSource.merged_dataset_id.in_(affected_merges)
+            )
+        )
         for item in targets:
             await session.delete(item)
         await session.flush()
         await apply_dataset_storage_release(session, release_plan)
         await decrease_bytes_used(
             session,
-            owner_id,
+            workspace_id,
             release_plan.released_bytes,
         )
         await session.commit()

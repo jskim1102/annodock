@@ -15,19 +15,56 @@ import {
 } from "../api/client";
 import { appHref } from "../navigation";
 import { useAuthSession } from "../store/auth";
+import { useWorkspace } from "../store/workspace";
 import { getAccountPresentation } from "../utils/accountPresentation";
 import { probeAdminOverview, resetAdminProbe } from "../utils/adminAccess";
 import { formatBytes } from "../utils/formatBytes";
 import { Icon } from "./Icon";
 import { ThemeToggle } from "./ThemeToggle";
+import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
 
 interface AppShellProps extends PropsWithChildren {
-  active: "projects" | "runs" | "admin";
+  active: "projects" | "runs" | "members" | "admin";
   breadcrumb?: ReactNode;
   mainClassName?: string;
 }
 
 const STORAGE_QUOTA_RETRY_MS = 3_000;
+
+let adminProbeSession: string | null | undefined;
+
+export function useAdminNavigation(enabled = true): boolean {
+  const session = useAuthSession();
+  const sessionKey = session.accessToken && session.refreshToken
+    ? session.accessToken
+    : null;
+  const [confirmedAdminSession, setConfirmedAdminSession] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!enabled) return;
+    let alive = true;
+    setConfirmedAdminSession(null);
+    // Match the token-based session used for authenticated requests, even if
+    // profile metadata is absent. The shell and root share one server probe.
+    if (adminProbeSession !== sessionKey) {
+      resetAdminProbe();
+      adminProbeSession = sessionKey;
+    }
+    if (sessionKey !== null) {
+      probeAdminOverview()
+        .then((overview) => {
+          if (alive) setConfirmedAdminSession(overview === null ? null : sessionKey);
+        })
+        .catch(() => {
+          // Keep ordinary navigation on probe errors; /admin checks access
+          // independently when the user visits it.
+        });
+    }
+    return () => { alive = false; };
+  }, [sessionKey, enabled]);
+
+  return enabled && sessionKey !== null && confirmedAdminSession === sessionKey;
+}
 
 export function Brand({ inverse = false }: { inverse?: boolean }) {
   return (
@@ -52,13 +89,13 @@ export function StorageMeter({
     ? null
     : `${formatBytes(quota.used_bytes)} / ${formatBytes(quota.limit_bytes)}`;
   const ariaLabel = usageLabel === null
-    ? "스토리지 사용량 정보 없음"
-    : `스토리지 사용 중 ${usageLabel}`;
+    ? "워크스페이스 용량 정보 없음"
+    : `워크스페이스 용량 사용 중 ${usageLabel}`;
 
   if (compact) {
     return (
       <span className="storage-pill" aria-label={ariaLabel}>
-        <span>스토리지</span>
+        <span>워크스페이스 용량</span>
         <span className="storage-pill-values">
           <span className="mono">{usageLabel ?? "—"}</span>
         </span>
@@ -69,7 +106,7 @@ export function StorageMeter({
   return (
     <div className="sidebar-storage">
       <div className="sidebar-storage-label">
-        <strong>스토리지</strong>
+        <strong>워크스페이스 용량</strong>
         <span className="mono">{usageLabel ?? "—"}</span>
       </div>
     </div>
@@ -83,11 +120,9 @@ export function AppShell({
   children,
 }: AppShellProps) {
   const session = useAuthSession();
+  const workspaceId = useWorkspace().active?.id ?? null;
   const [loggingOut, setLoggingOut] = useState(false);
-  // Server response is the source of truth for admin access; nothing is
-  // persisted client-side, so the link simply stays hidden until the probe
-  // confirms the grant for this page load.
-  const [adminVisible, setAdminVisible] = useState(false);
+  const adminVisible = useAdminNavigation();
   const [storageQuota, setStorageQuota] = useState<StorageQuota | null>(null);
   const storageTokenKey = session.accessToken && session.refreshToken
     ? session.accessToken
@@ -121,28 +156,18 @@ export function AppShell({
         });
     };
     loadStorageQuota();
-    window.addEventListener(STORAGE_QUOTA_INVALIDATED_EVENT, loadStorageQuota);
+    const invalidate = () => {
+      setStorageQuota(null);
+      loadStorageQuota();
+    };
+    window.addEventListener(STORAGE_QUOTA_INVALIDATED_EVENT, invalidate);
     return () => {
       alive = false;
       clearStorageQuotaRetry();
-      window.removeEventListener(STORAGE_QUOTA_INVALIDATED_EVENT, loadStorageQuota);
+      window.removeEventListener(STORAGE_QUOTA_INVALIDATED_EVENT, invalidate);
     };
-  }, [storageTokenKey]);
+  }, [storageTokenKey, workspaceId]);
 
-  useEffect(() => {
-    let alive = true;
-    probeAdminOverview()
-      .then((overview) => {
-        if (alive) setAdminVisible(overview !== null);
-      })
-      .catch(() => {
-        // Network or auth hiccups keep the link hidden; the probe result is
-        // advisory here — the /admin route re-checks with the server anyway.
-      });
-    return () => {
-      alive = false;
-    };
-  }, []);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const accountMenuRef = useRef<HTMLDivElement>(null);
   const accountTriggerRef = useRef<HTMLButtonElement>(null);
@@ -188,27 +213,39 @@ export function AppShell({
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <a className="sidebar-brand" href={appHref("/projects")} aria-label="Annodock 홈">
+        <a className="sidebar-brand" href={appHref(adminVisible ? "/admin" : "/projects")} aria-label="Annodock 홈">
           <Brand inverse />
         </a>
-        <div className="sidebar-kicker">워크스페이스</div>
+        <WorkspaceSwitcher />
         <nav className="sidebar-nav" aria-label="워크스페이스">
-          <a
-            className="sidebar-link"
-            href={appHref("/projects")}
-            aria-current={active === "projects" ? "page" : undefined}
-          >
-            <Icon name="folder" size={15} />
-            프로젝트
-          </a>
-          <a
-            className="sidebar-link"
-            href={appHref("/runs")}
-            aria-current={active === "runs" ? "page" : undefined}
-          >
-            <Icon name="cpu" size={15} />
-            AI 학습
-          </a>
+          {!adminVisible && (
+            <>
+              <a
+                className="sidebar-link"
+                href={appHref("/projects")}
+                aria-current={active === "projects" ? "page" : undefined}
+              >
+                <Icon name="folder" size={15} />
+                프로젝트
+              </a>
+              <a
+                className="sidebar-link"
+                href={appHref("/runs")}
+                aria-current={active === "runs" ? "page" : undefined}
+              >
+                <Icon name="cpu" size={15} />
+                AI 학습
+              </a>
+              <a
+                className="sidebar-link"
+                href={appHref("/members")}
+                aria-current={active === "members" ? "page" : undefined}
+              >
+                <Icon name="users" size={15} />
+                멤버
+              </a>
+            </>
+          )}
           {adminVisible && (
             <a
               className="sidebar-link"
@@ -216,7 +253,7 @@ export function AppShell({
               aria-current={active === "admin" ? "page" : undefined}
             >
               <Icon name="users" size={15} />
-              관리자
+              사이트 관리
             </a>
           )}
         </nav>

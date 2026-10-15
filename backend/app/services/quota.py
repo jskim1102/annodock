@@ -1,4 +1,4 @@
-"""Transactional per-user storage accounting and quota estimates."""
+"""Transactional per-workspace storage accounting and quota estimates."""
 
 from __future__ import annotations
 
@@ -17,7 +17,8 @@ from app.models import (
     Image,
     MediaObject,
     TrainingRun,
-    UserStorage,
+    Workspace,
+    WorkspaceStorage,
 )
 
 
@@ -35,6 +36,7 @@ class QuotaStatus:
     used_bytes: int
     limit_bytes: int
     required_bytes: int
+    workspace_kind: str
 
     @property
     def remaining_bytes(self) -> int:
@@ -46,8 +48,9 @@ class QuotaStatus:
 
     @property
     def detail(self) -> str:
+        subject = "워크스페이스" if self.workspace_kind == "team" else "사용자"
         return (
-            "사용자 저장공간 쿼터를 초과합니다. "
+            f"{subject} 저장공간 쿼터를 초과합니다. "
             f"잔여 용량 {self.remaining_bytes:,} B, "
             f"필요 용량 {self.required_bytes:,} B입니다."
         )
@@ -77,49 +80,49 @@ def _validated_limit(value: int) -> int:
 
 async def _locked_storage(
     session: AsyncSession,
-    owner_id: int,
-) -> UserStorage:
+    workspace_id: int,
+) -> WorkspaceStorage:
     await session.execute(
-        postgresql_insert(UserStorage)
-        .values(owner_id=owner_id, bytes_used=0)
-        .on_conflict_do_nothing(index_elements=[UserStorage.owner_id])
+        postgresql_insert(WorkspaceStorage)
+        .values(workspace_id=workspace_id, bytes_used=0)
+        .on_conflict_do_nothing(index_elements=[WorkspaceStorage.workspace_id])
     )
     storage = await session.scalar(
-        select(UserStorage)
-        .where(UserStorage.owner_id == owner_id)
+        select(WorkspaceStorage)
+        .where(WorkspaceStorage.workspace_id == workspace_id)
         .with_for_update()
     )
     if storage is None:  # pragma: no cover - protected by the upsert
-        raise RuntimeError("user storage row could not be created")
+        raise RuntimeError("workspace storage row could not be created")
     return storage
 
 
-async def get_bytes_used(session: AsyncSession, owner_id: int) -> int:
+async def get_bytes_used(session: AsyncSession, workspace_id: int) -> int:
     """Read only the persisted counter; never scan the storage tree."""
 
     value = await session.scalar(
-        select(UserStorage.bytes_used).where(UserStorage.owner_id == owner_id)
+        select(WorkspaceStorage.bytes_used).where(WorkspaceStorage.workspace_id == workspace_id)
     )
     return int(value or 0)
 
 
 async def set_quota_limit(
     session: AsyncSession,
-    owner_id: int,
+    workspace_id: int,
     limit_bytes: int,
 ) -> int:
-    """Persist one user's override without overwriting their usage counter."""
+    """Persist one workspace's override without overwriting their usage counter."""
 
     limit = _validated_limit(limit_bytes)
     await session.execute(
-        postgresql_insert(UserStorage)
+        postgresql_insert(WorkspaceStorage)
         .values(
-            owner_id=owner_id,
+            workspace_id=workspace_id,
             bytes_used=0,
             quota_limit_bytes=limit,
         )
         .on_conflict_do_update(
-            index_elements=[UserStorage.owner_id],
+            index_elements=[WorkspaceStorage.workspace_id],
             set_={
                 "quota_limit_bytes": limit,
                 "updated_at": func.now(),
@@ -129,8 +132,8 @@ async def set_quota_limit(
     return limit
 
 
-async def get_referenced_bytes(session: AsyncSession, owner_id: int) -> int:
-    """Return logical bytes referenced by all of one owner's resources.
+async def get_referenced_bytes(session: AsyncSession, workspace_id: int) -> int:
+    """Return logical bytes referenced by all of one workspace's resources.
 
     Shared media is intentionally counted once per ``Image`` row here.  This
     value answers how much material the datasets expose, while ``bytes_used``
@@ -149,16 +152,16 @@ async def get_referenced_bytes(session: AsyncSession, owner_id: int) -> int:
             )
         )
         .join(Dataset, Dataset.id == Image.dataset_id)
-        .where(Dataset.owner_id == owner_id)
+        .where(Dataset.workspace_id == workspace_id)
     )
     export_bytes = await session.scalar(
         select(func.coalesce(func.sum(ExportArtifact.archive_bytes), 0))
         .join(Dataset, Dataset.id == ExportArtifact.dataset_id)
-        .where(Dataset.owner_id == owner_id)
+        .where(Dataset.workspace_id == workspace_id)
     )
     run_bytes = await session.scalar(
         select(func.coalesce(func.sum(TrainingRun.artifact_bytes), 0)).where(
-            TrainingRun.owner_id == owner_id,
+            TrainingRun.workspace_id == workspace_id,
             TrainingRun.artifacts_deleted_at.is_(None),
             TrainingRun.artifact_bytes.is_not(None),
         )
@@ -172,31 +175,31 @@ async def get_referenced_bytes(session: AsyncSession, owner_id: int) -> int:
 
 async def increase_bytes_used(
     session: AsyncSession,
-    owner_id: int,
+    workspace_id: int,
     amount: int,
 ) -> int:
     amount = _validated_amount(amount, field="amount")
-    storage = await _locked_storage(session, owner_id)
+    storage = await _locked_storage(session, workspace_id)
     storage.bytes_used += amount
     return int(storage.bytes_used)
 
 
 async def decrease_bytes_used(
     session: AsyncSession,
-    owner_id: int,
+    workspace_id: int,
     amount: int,
 ) -> int:
     """Release accounted bytes, clamping legacy under-counted rows at zero."""
 
     amount = _validated_amount(amount, field="amount")
-    storage = await _locked_storage(session, owner_id)
+    storage = await _locked_storage(session, workspace_id)
     storage.bytes_used = max(0, int(storage.bytes_used) - amount)
     return int(storage.bytes_used)
 
 
 async def quota_status(
     session: AsyncSession,
-    owner_id: int,
+    workspace_id: int,
     *,
     limit_bytes: int,
     required_bytes: int,
@@ -205,17 +208,21 @@ async def quota_status(
     row = (
         await session.execute(
             select(
-                UserStorage.bytes_used,
-                UserStorage.quota_limit_bytes,
-            ).where(UserStorage.owner_id == owner_id)
+                Workspace.kind,
+                WorkspaceStorage.bytes_used,
+                WorkspaceStorage.quota_limit_bytes,
+            )
+            .outerjoin(WorkspaceStorage, WorkspaceStorage.workspace_id == Workspace.id)
+            .where(Workspace.id == workspace_id)
         )
     ).one_or_none()
-    used_bytes = int(row.bytes_used) if row is not None else 0
+    used_bytes = int(row.bytes_used or 0) if row is not None else 0
     override = row.quota_limit_bytes if row is not None else None
     return QuotaStatus(
         used_bytes=used_bytes,
         limit_bytes=(int(override) if override is not None else default_limit),
         required_bytes=_validated_amount(required_bytes, field="required_bytes"),
+        workspace_kind=row.kind if row is not None else "personal",
     )
 
 
@@ -421,7 +428,7 @@ def path_tree_bytes(path: Path) -> int:
 
 def increase_bytes_used_sync(
     cursor: SyncCursor,
-    owner_id: int,
+    workspace_id: int,
     amount: int,
 ) -> None:
     """Worker-side equivalent of the async transactional counter update."""
@@ -429,11 +436,11 @@ def increase_bytes_used_sync(
     amount = _validated_amount(amount, field="amount")
     cursor.execute(
         """
-        INSERT INTO user_storage (owner_id, bytes_used)
+        INSERT INTO workspace_storage (workspace_id, bytes_used)
         VALUES (%s, %s)
-        ON CONFLICT (owner_id) DO UPDATE
-        SET bytes_used = user_storage.bytes_used + EXCLUDED.bytes_used,
+        ON CONFLICT (workspace_id) DO UPDATE
+        SET bytes_used = workspace_storage.bytes_used + EXCLUDED.bytes_used,
             updated_at = now()
         """,
-        (owner_id, amount),
+        (workspace_id, amount),
     )

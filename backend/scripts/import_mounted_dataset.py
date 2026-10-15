@@ -30,6 +30,7 @@ from app.models import (  # noqa: E402
     Project,
     ProjectClass,
     UploadJob,
+    Workspace,
 )
 from app.services.collect import (  # noqa: E402
     CollectedFile,
@@ -138,13 +139,15 @@ async def _check_quota(
     settings: Settings,
     session_factory: async_sessionmaker[AsyncSession],
     *,
-    owner_id: int,
+    workspace_id: int,
     required_bytes: int,
 ) -> None:
     async with session_factory() as session:
+        if await session.get(Workspace, workspace_id) is None:
+            raise LookupError(f"workspace {workspace_id} does not exist")
         status = await quota_status(
             session,
-            owner_id,
+            workspace_id,
             limit_bytes=settings.quota_bytes_per_user,
             required_bytes=required_bytes,
         )
@@ -156,7 +159,7 @@ async def _create_import_target(
     settings: Settings,
     session_factory: async_sessionmaker[AsyncSession],
     *,
-    owner_id: int,
+    workspace_id: int,
     project_id: int,
     name: str,
     file_count: int,
@@ -164,17 +167,17 @@ async def _create_import_target(
     async with session_factory() as session:
         project = await session.scalar(
             select(Project)
-            .where(Project.id == project_id, Project.owner_id == owner_id)
+            .where(Project.id == project_id, Project.workspace_id == workspace_id)
             .with_for_update()
         )
         if project is None:
             raise LookupError(
-                f"project {project_id} does not belong to owner {owner_id}"
+                f"project {project_id} does not belong to workspace {workspace_id}"
             )
 
         existing = await session.scalar(
             select(Dataset)
-            .where(Dataset.owner_id == owner_id, Dataset.name == name)
+            .where(Dataset.workspace_id == workspace_id, Dataset.name == name)
             .with_for_update()
         )
         if existing is not None:
@@ -212,7 +215,7 @@ async def _create_import_target(
                 ).all()
             )
             dataset = Dataset(
-                owner_id=owner_id,
+                workspace_id=workspace_id,
                 project_id=project_id,
                 name=name,
                 status="processing",
@@ -263,7 +266,7 @@ async def import_mounted_dataset(
     database_url: str,
     source: Path,
     metadata: Path,
-    owner_id: int,
+    workspace_id: int,
     project_id: int,
     name: str,
     dry_run: bool = False,
@@ -298,13 +301,13 @@ async def import_mounted_dataset(
         await _check_quota(
             settings,
             session_factory,
-            owner_id=owner_id,
+            workspace_id=workspace_id,
             required_bytes=summary.total_bytes,
         )
         target = await _create_import_target(
             settings,
             session_factory,
-            owner_id=owner_id,
+            workspace_id=workspace_id,
             project_id=project_id,
             name=name,
             file_count=summary.file_count,
@@ -334,7 +337,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--metadata", type=Path, required=True)
-    parser.add_argument("--owner-id", type=int, required=True)
+    parser.add_argument("--workspace-id", type=int, required=True)
     parser.add_argument("--project-id", type=int, required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--database-url")
@@ -351,7 +354,7 @@ def main() -> None:
             database_url=args.database_url or settings.database_url,
             source=args.source,
             metadata=args.metadata,
-            owner_id=args.owner_id,
+            workspace_id=args.workspace_id,
             project_id=args.project_id,
             name=args.name,
             dry_run=args.dry_run,

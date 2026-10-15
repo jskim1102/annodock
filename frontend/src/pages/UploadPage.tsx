@@ -1,7 +1,9 @@
+import { useWorkspace } from "../store/workspace";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   ApiError,
+  captureWorkspaceId,
   getAllIssues,
   getDataset,
   getProject,
@@ -25,11 +27,13 @@ import {
   clearUploadBatchResume,
   completeUploadBatch,
   createDatasetForUpload,
+  isResumableUploadError,
   pollUploadJob,
   prepareUploadBatch,
   rememberUploadDatasetTarget,
   resumeUploadDatasetTarget,
   transferUploadBatch,
+  withUploadBatchRestart,
 } from "../api/upload";
 import { AppShell, BreadcrumbLink } from "../components/AppShell";
 import { ClassConflictResolutionPanel } from "../components/ClassConflictResolutionPanel";
@@ -77,6 +81,7 @@ const ISSUE_LABELS: Record<IssueKind, string> = {
   ignored_file: "사용하지 않은 파일",
   class_conflict: "클래스 오류",
   rejected_file: "거부된 파일",
+  upload_lock_retry: "잠금 충돌로 재시도",
 };
 
 const ISSUE_ORDER = Object.keys(ISSUE_LABELS) as IssueKind[];
@@ -131,6 +136,9 @@ const JOB_PHASE_LABELS: Record<string, string> = {
 };
 
 export function UploadPage() {
+  const { active } = useWorkspace();
+  const canManage = active?.role === "admin" || active?.role === "owner";
+  const canUpload = canManage || active?.role === "editor";
   const requestedProjectId = useMemo(() => {
     const raw = new URLSearchParams(window.location.search).get("project_id");
     const parsed = raw === null ? Number.NaN : Number(raw);
@@ -143,6 +151,7 @@ export function UploadPage() {
   // 유닛(=데이터셋)당 영속 매니페스트를 유지해 재시도도 같은 작업으로 수렴시킨다.
   const unitTransfersRef = useRef<Record<string, UnitTransferState>>({});
   const selectionLockedRef = useRef(false);
+  const uploadWorkspaceRef = useRef<number | null | undefined>(undefined);
   const datasetNameEditedRef = useRef(false);
   const classResolutionPreferencesRef = useRef<ClassResolutionPreferences>({});
   const [dragging, setDragging] = useState(false);
@@ -171,6 +180,7 @@ export function UploadPage() {
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [canResume, setCanResume] = useState(false);
   const [pendingClassResolution, setPendingClassResolution] = useState<ClassResolutionPlan | null>(null);
   const [pendingClassResolutionJobId, setPendingClassResolutionJobId] = useState<number | null>(null);
   const [classResolutionBusy, setClassResolutionBusy] = useState(false);
@@ -313,6 +323,7 @@ export function UploadPage() {
   );
 
   const startUpload = async () => {
+    if (!canUpload) return;
     if (project === null) {
       setError("데이터셋을 추가할 프로젝트가 필요합니다.");
       return;
@@ -336,12 +347,17 @@ export function UploadPage() {
       return;
     }
     selectionLockedRef.current = true;
+    if (uploadWorkspaceRef.current === undefined) {
+      uploadWorkspaceRef.current = captureWorkspaceId();
+    }
+    const workspaceId = uploadWorkspaceRef.current;
     const isResumingPreparedBatch = Object.values(unitTransfersRef.current).some(
       (state) => state.pendingBatch !== undefined,
     );
     setBusy(true);
     setDone(false);
     setError(null);
+    setCanResume(false);
     setClassResolutionError(null);
     setIssues([]);
     setExpandedIssueKind(null);
@@ -429,7 +445,7 @@ export function UploadPage() {
           let duplicateAttempts = 0;
           while (createdTargetId === undefined) {
             try {
-              const created = await createDatasetForUpload(candidateName, project.id);
+              const created = await createDatasetForUpload(candidateName, project.id, workspaceId);
               createdTargetId = created.id;
               reservedNames.add(created.name);
             } catch (reason: unknown) {
@@ -450,6 +466,7 @@ export function UploadPage() {
             unit.name,
             createdTargetId,
             unitFiles,
+            workspaceId,
           );
           targetIds[unit.key] = createdTargetId;
           setUploadTargets({ ...targetIds });
@@ -461,6 +478,7 @@ export function UploadPage() {
             resumeDatasetName,
             unitFiles,
             Object.values(targetIds),
+            workspaceId,
           );
           if (resumedTargetId !== null) {
             targetId = resumedTargetId;
@@ -476,122 +494,144 @@ export function UploadPage() {
           (total, batchFiles) => total + uploadableBytes(batchFiles),
           0,
         );
-        let transferState = unitTransfersRef.current[unit.key];
+        let transferState: UnitTransferState | undefined = unitTransfersRef.current[unit.key];
         if (unitDatasetResults === null) {
-          if (transferState === undefined) {
-            let operation: PreparedUploadOperation;
-            try {
-              operation = await beginUploadBatch(targetId, unitFiles);
-            } catch (reason: unknown) {
-              if (!(
-                targetWasResumed
-                && reason instanceof ApiError
-                && reason.status === 404
-              )) throw reason;
-              clearUploadDatasetTarget(
-                project.id,
-                resumeDatasetName,
-                targetId,
-                unitFiles,
-              );
-              targetId = await createTarget();
-              operation = await beginUploadBatch(targetId, unitFiles);
-            }
-            transferState = {
-              operation,
-              knownJobId: operation.knownJobId,
-            };
-            unitTransfersRef.current[unit.key] = transferState;
-          }
-          const batchStartIndex = batchCounts[unit.key] ?? 0;
-          const pendingBatches = transferState.knownJobId === null
-            ? unit.batches.slice(batchStartIndex)
-            : [];
-          for (const [pendingIndex, batchFiles] of pendingBatches.entries()) {
-            const batchIndex = batchStartIndex + pendingIndex;
-            const batchStart = completedWork;
-            const batchBytes = uploadableBytes(batchFiles);
-            const pendingBatch = transferState.pendingBatch;
-            if (pendingBatch && pendingBatch.index !== batchIndex) {
-              throw new Error(`${unit.name}: 이어 올릴 전송 배치 순서가 일치하지 않습니다.`);
-            }
-            let batch = pendingBatch?.batch;
-            if (batch === undefined) {
-              batch = await prepareUploadBatch(targetId, batchFiles, ({
-                preparedFiles,
-                totalFiles,
-              }) => {
-                const preparationWork = (
-                  batchStart + batchBytes * preparedFiles / totalFiles
+          await withUploadBatchRestart(() => targetId, async () => {
+            if (transferState === undefined) {
+              let operation: PreparedUploadOperation;
+              try {
+                operation = await beginUploadBatch(targetId, unitFiles, workspaceId);
+              } catch (reason: unknown) {
+                if (!(
+                  targetWasResumed
+                  && reason instanceof ApiError
+                  && reason.status === 404
+                )) throw reason;
+                clearUploadDatasetTarget(
+                  project.id,
+                  resumeDatasetName,
+                  targetId,
+                  unitFiles,
+                  workspaceId,
                 );
-                const etaSeconds = updateOverallEstimate(preparationWork);
+                targetId = await createTarget();
+                operation = await beginUploadBatch(targetId, unitFiles, workspaceId);
+              }
+              transferState = {
+                operation,
+                knownJobId: operation.knownJobId,
+              };
+              unitTransfersRef.current[unit.key] = transferState;
+            }
+            const batchStartIndex = batchCounts[unit.key] ?? 0;
+            const pendingBatches = transferState.knownJobId === null
+              ? unit.batches.slice(batchStartIndex)
+              : [];
+            for (const [pendingIndex, batchFiles] of pendingBatches.entries()) {
+              const batchIndex = batchStartIndex + pendingIndex;
+              const batchStart = completedWork;
+              const batchBytes = uploadableBytes(batchFiles);
+              const pendingBatch = transferState.pendingBatch;
+              if (pendingBatch && pendingBatch.index !== batchIndex) {
+                throw new Error(`${unit.name}: 이어 올릴 전송 배치 순서가 일치하지 않습니다.`);
+              }
+              let batch = pendingBatch?.batch;
+              if (batch === undefined) {
+                batch = await prepareUploadBatch(targetId, batchFiles, transferState.operation, ({
+                  preparedFiles,
+                  totalFiles,
+                }) => {
+                  const preparationWork = (
+                    batchStart + batchBytes * preparedFiles / totalFiles
+                  );
+                  const etaSeconds = updateOverallEstimate(preparationWork);
+                  setProgress({
+                    processed: preparationWork,
+                    total: totalWork,
+                    current: `${unit.name} · ${preparedFiles.toLocaleString()} / ${totalFiles.toLocaleString()} 준비 중`,
+                  });
+                  setLiveProgress({
+                    stage: "preparing",
+                    imageProcessed: 0,
+                    imageTotal: 0,
+                    etaSeconds,
+                  });
+                });
+                transferState.pendingBatch = { index: batchIndex, batch };
+              }
+              const transferStart = batchStart + batch.totalBytes;
+              const transferred = await transferUploadBatch(batch, ({
+                uploadedBytes,
+                uploadedImages,
+                totalImages,
+                currentPath,
+              }) => {
+                const etaSeconds = updateOverallEstimate(transferStart + uploadedBytes);
                 setProgress({
-                  processed: preparationWork,
+                  processed: transferStart + uploadedBytes,
                   total: totalWork,
-                  current: `${unit.name} · ${preparedFiles.toLocaleString()} / ${totalFiles.toLocaleString()} 준비 중`,
+                  current: `${unit.name} · ${currentPath}`,
                 });
                 setLiveProgress({
-                  stage: "preparing",
-                  imageProcessed: 0,
-                  imageTotal: 0,
+                  stage: "transferring",
+                  imageProcessed: uploadedImages,
+                  imageTotal: totalImages,
                   etaSeconds,
                 });
               });
-              transferState.pendingBatch = { index: batchIndex, batch };
-            }
-            const transferStart = batchStart + batch.totalBytes;
-            const transferred = await transferUploadBatch(batch, ({
-              uploadedBytes,
-              uploadedImages,
-              totalImages,
-              currentPath,
-            }) => {
-              const etaSeconds = updateOverallEstimate(transferStart + uploadedBytes);
+              if (
+                transferState.knownJobId === null
+                && transferred.knownJobId !== null
+              ) transferState.knownJobId = transferred.knownJobId;
+              transferState.pendingBatch = undefined;
+              completedWork += batch.totalBytes * 2;
+              const etaSeconds = updateOverallEstimate(completedWork);
+              completedBatches += 1;
+              batchCounts[unit.key] = (batchCounts[unit.key] ?? 0) + 1;
+              setCompletedBatchCounts({ ...batchCounts });
               setProgress({
-                processed: transferStart + uploadedBytes,
+                processed: completedWork,
                 total: totalWork,
-                current: `${unit.name} · ${currentPath}`,
+                current: `${unit.name} · 전송 완료`,
               });
-              setLiveProgress({
-                stage: "transferring",
-                imageProcessed: uploadedImages,
-                imageTotal: totalImages,
+              setLiveProgress((current) => ({
+                ...current,
                 etaSeconds,
-              });
-            });
-            if (
-              transferState.knownJobId === null
-              && transferred.knownJobId !== null
-            ) transferState.knownJobId = transferred.knownJobId;
-            transferState.pendingBatch = undefined;
-            completedWork += batch.totalBytes * 2;
-            const etaSeconds = updateOverallEstimate(completedWork);
-            completedBatches += 1;
-            batchCounts[unit.key] = (batchCounts[unit.key] ?? 0) + 1;
+              }));
+            }
+            if (transferState.knownJobId === null) {
+              // Seal inside the same recovery boundary: a cached transfer can
+              // resume directly here after the server has expired its batch.
+              transferState.knownJobId = await completeUploadBatch(transferState.operation);
+            }
+          }, () => {
+            // A new manifest needs every file in this unit, including batches
+            // transferred before a later page discovered an expired session.
+            const transferredCount = batchCounts[unit.key] ?? 0;
+            completedWork -= unit.batches.slice(0, transferredCount).reduce(
+              (total, batchFiles) => total + uploadableBytes(batchFiles) * 2,
+              0,
+            );
+            completedBatches -= transferredCount;
+            batchCounts[unit.key] = 0;
             setCompletedBatchCounts({ ...batchCounts });
+            delete unitTransfersRef.current[unit.key];
+            transferState = undefined;
+            progressEstimateRef.current = null;
             setProgress({
               processed: completedWork,
               total: totalWork,
-              current: `${unit.name} · 전송 완료`,
+              current: "이전 업로드 기록이 만료되어 새로 시작합니다",
             });
-            setLiveProgress((current) => ({
-              ...current,
-              etaSeconds,
-            }));
-          }
+            setLiveProgress({ ...EMPTY_LIVE_PROGRESS, stage: "preparing" });
+          });
         }
 
         if (unitDatasetResults === null) {
           if (transferState === undefined) {
             throw new Error(`${unit.name}: 업로드 배치를 복구하지 못했습니다.`);
           }
-          let jobId = transferState.knownJobId;
-          if (jobId === null) {
-            // 완료 본문에 수십만 개 세션 ID를 싣지 않는다. 서버가 영속
-            // 매니페스트를 원자적으로 봉인하고 재호출에도 같은 잡을 준다.
-            jobId = await completeUploadBatch(transferState.operation);
-            transferState.knownJobId = jobId;
-          }
+          const jobId = transferState.knownJobId;
           if (jobId !== null) {
             const activeJobId = jobId;
             const unitProcessStart = completedWork;
@@ -613,7 +653,7 @@ export function UploadPage() {
                 current: `${unit.name} · ${JOB_PHASE_LABELS[job.phase] ?? job.phase}`,
               });
             };
-            let terminal = await pollUploadJob(activeJobId, updateJobProgress);
+            let terminal = await pollUploadJob(activeJobId, updateJobProgress, workspaceId);
             if (terminal.state === "failed") {
               delete unitTransfersRef.current[unit.key];
               batchCounts[unit.key] = 0;
@@ -656,8 +696,8 @@ export function UploadPage() {
               await resolveJobClassConflicts(activeJobId, {
                 revision: terminal.class_resolution.revision,
                 resolutions: remembered,
-              });
-              terminal = await pollUploadJob(activeJobId, updateJobProgress);
+              }, workspaceId);
+              terminal = await pollUploadJob(activeJobId, updateJobProgress, workspaceId);
             }
             if (terminal.state === "failed") {
               delete unitTransfersRef.current[unit.key];
@@ -693,8 +733,8 @@ export function UploadPage() {
           class_count: 0,
         }];
         const [details, issueRows] = await Promise.all([
-          Promise.all(datasetResults.map((result) => getDataset(result.id))),
-          getAllIssues(targetId),
+          Promise.all(datasetResults.map((result) => getDataset(result.id, workspaceId))),
+          getAllIssues(targetId, workspaceId),
         ]);
         if (details.some((detail) => detail.status !== "ready")) {
           throw new Error(`${unit.name}: 사용할 수 있는 데이터셋으로 처리되지 않았습니다.`);
@@ -724,7 +764,7 @@ export function UploadPage() {
         setCompletedDatasets([...completed]);
       }
 
-      if (selectedMergedDataset !== null) {
+      if (selectedMergedDataset !== null && canManage) {
         progressEstimateRef.current = null;
         setLiveProgress((current) => ({
           ...current,
@@ -739,7 +779,7 @@ export function UploadPage() {
         const merged = await extendMergedDataset(selectedMergedDataset.id, {
           dataset_ids: completed.map((dataset) => dataset.id),
           purpose: "merge",
-        });
+        }, workspaceId);
         setFinalDataset({ id: merged.id, name: merged.name });
         setStats({
           images: merged.image_count,
@@ -751,7 +791,7 @@ export function UploadPage() {
           total: totalWork,
           current: "기존 병합 데이터셋에 포함 완료",
         });
-      } else if (uploadPlan.length > 1) {
+      } else if (uploadPlan.length > 1 && canManage) {
         progressEstimateRef.current = null;
         setLiveProgress((current) => ({
           ...current,
@@ -767,7 +807,7 @@ export function UploadPage() {
           name: datasetName.trim(),
           dataset_ids: completed.map((dataset) => dataset.id),
           purpose: "merge",
-        });
+        }, workspaceId);
         setFinalDataset({ id: merged.id, name: merged.name });
         setStats({
           images: merged.image_count,
@@ -789,6 +829,7 @@ export function UploadPage() {
             uploadPlan.length > 1 ? null : unit.name,
             targetId,
             unit.batches.flat(),
+            workspaceId,
           );
         }
         delete unitTransfersRef.current[unit.key];
@@ -800,26 +841,34 @@ export function UploadPage() {
       }));
       setDone(true);
     } catch (reason: unknown) {
+      const resumable = isResumableUploadError(reason);
+      setCanResume(resumable);
       progressEstimateRef.current = null;
       setLiveProgress((current) => ({
         ...current,
         stage: "idle",
         etaSeconds: null,
       }));
-      setProgress((current) => ({
+      setProgress((current) => resumable ? ({
         ...current,
         current: "업로드 일시 중지 · 이어 올리기 가능",
+      }) : ({
+        ...current,
+        current: "업로드 중단 · 오류를 확인해 주세요",
       }));
       const message = reason instanceof Error ? reason.message : "업로드에 실패했습니다.";
       const partial = completed.length > 0
         ? `${completed.length}개 데이터셋은 완료되었습니다. `
-        : completedBatches > 0
+        : resumable && completedBatches > 0
           ? `${completedBatches}개 전송 배치는 서버에 보존되었습니다. 재시도하면 이어서 진행합니다. `
           : "";
       setError(`${partial}${message}`);
     } finally {
       invalidateStorageQuotaCache();
-      if (Object.keys(targetIds).length === 0) selectionLockedRef.current = false;
+      if (Object.keys(targetIds).length === 0) {
+        selectionLockedRef.current = false;
+        uploadWorkspaceRef.current = undefined;
+      }
       setBusy(false);
     }
   };
@@ -834,7 +883,7 @@ export function UploadPage() {
       await resolveJobClassConflicts(pendingClassResolutionJobId, {
         revision: pendingClassResolution.revision,
         resolutions,
-      });
+      }, uploadWorkspaceRef.current);
       classResolutionPreferencesRef.current = rememberClassResolutions(
         classResolutionPreferencesRef.current,
         pendingClassResolution,
@@ -883,6 +932,8 @@ export function UploadPage() {
   const labelingDataset = finalDataset;
   const canNavigateAfterUpload = done && percentage === 100 && labelingDataset !== null;
 
+  if (!canUpload) return <AppShell active="projects" breadcrumb="데이터셋 추가"><p className="banner-info">라벨러 이상만 업로드할 수 있어요</p></AppShell>;
+
   return (
     <>
       <AppShell
@@ -925,9 +976,9 @@ export function UploadPage() {
                   || (hasUploadTargets && uploadableSourceCount <= 1)
                 }
                 placeholder={
-                  selectedMergedDataset !== null
+                  selectedMergedDataset !== null && canManage
                     ? "업로드 데이터셋 이름 입력"
-                    : uploadableSourceCount > 1
+                    : uploadableSourceCount > 1 && canManage
                       ? "병합 데이터셋 이름 입력"
                       : "데이터셋 이름 입력"
                 }
@@ -943,13 +994,13 @@ export function UploadPage() {
                 className={datasetNameMissing ? "error-text" : "hint"}
                 id="dataset-name-hint"
               >
-                {datasetNameMissing
+                {!canManage && uploadableSourceCount > 1 ? `${uploadableSourceCount}개 항목을 각각 데이터셋으로 업로드합니다.` : datasetNameMissing
                   ? uploadableSourceCount > 1
                     ? "병합 데이터셋 이름을 입력해야 업로드를 시작할 수 있습니다."
                     : "데이터셋 이름을 입력해야 업로드를 시작할 수 있습니다."
                   : uploadableSourceCount > 200
                   ? "한 번에 자동 병합할 수 있는 항목은 최대 200개입니다."
-                  : selectedMergedDataset !== null
+                  : selectedMergedDataset !== null && canManage
                     ? uploadableSourceCount > 1
                       ? `${uploadableSourceCount.toLocaleString()}개 항목을 각각 업로드한 뒤 ${selectedMergedDataset.name}에 포함합니다.`
                       : `업로드한 데이터셋을 ${selectedMergedDataset.name}에 포함합니다.`
@@ -965,7 +1016,7 @@ export function UploadPage() {
               </span>
             </div>
           </div>
-          {mergedUploadTargets.length > 0 ? (
+          {canManage && mergedUploadTargets.length > 0 ? (
             <fieldset
               className="upload-merge-target-fieldset"
               aria-describedby="upload-merge-target-description"
@@ -1142,7 +1193,7 @@ export function UploadPage() {
                   : busy
                     ? "처리 중…"
                     : hasUploadTargets
-                      ? "이어 올리기"
+                      ? canResume ? "이어 올리기" : "다시 시도"
                       : "업로드 시작"}
               </button>
             </div>

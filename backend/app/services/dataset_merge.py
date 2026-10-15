@@ -172,7 +172,7 @@ def copy_source_images(
     settings: Settings,
     *,
     target_dataset_id: int,
-    owner_id: int,
+    workspace_id: int,
     target_storage: Path,
     sources: list[Dataset],
     images_by_dataset: dict[int, list[Image]],
@@ -287,7 +287,7 @@ def copy_source_images(
 
             source_media = source_image.media_object
             can_share_media = (
-                source_media is not None and source_media.owner_id == owner_id
+                source_media is not None and source_media.workspace_id == workspace_id
             )
             if can_share_media:
                 hardlinked = _link_bundle_or_copy(path_pairs)
@@ -303,7 +303,7 @@ def copy_source_images(
                 media_object = source_media
             elif can_share_media:
                 media_object = MediaObject(
-                    owner_id=owner_id,
+                    workspace_id=workspace_id,
                     created_by_dataset_id=target_dataset_id,
                     original_bytes=original_bytes,
                     display_bytes=display_bytes,
@@ -357,6 +357,12 @@ def copy_source_images(
                     thumb_bytes=thumb_bytes,
                     box_count=len(annotations),
                     has_label_source=source_image.has_label_source,
+                    # A snapshot imports label content (including an explicit
+                    # empty completion), not the source team's active work.
+                    label_status="labeled" if (
+                        source_image.label_status == "labeled"
+                        or source_image.has_label_source or annotations
+                    ) else "unlabeled",
                     is_modified=source_image.is_modified,
                     annotations=annotations,
                 )
@@ -388,20 +394,39 @@ async def merge_datasets(
     *,
     name: str,
     dataset_ids: list[int],
-    owner_id: int,
+    workspace_id: int,
     purpose: MergePurpose = "merge",
     target_dataset_id: int | None = None,
 ) -> DatasetMergeResult:
+    # Parent first: ingestion and catalog triggers can touch sibling datasets.
+    references = (await session.execute(select(Dataset.id, Dataset.project_id).where(
+        Dataset.id.in_(dataset_ids), Dataset.workspace_id == workspace_id,
+        Dataset.is_placeholder.is_(False),
+    ))).all()
+    if len(references) != len(set(dataset_ids)):
+        raise DatasetMergeNotFound("선택한 데이터셋을 찾을 수 없습니다.")
+    project_ids = {row.project_id for row in references}
+    # Invalid cross-project input still follows the existing validation order.
+    # Lock its parents first as well, without locking datasets in reverse order.
+    for project_id in sorted(project_ids):
+        project = await session.scalar(select(Project).where(
+            Project.id == project_id, Project.workspace_id == workspace_id,
+        ).with_for_update())
+        if project is None:
+            raise DatasetMergeNotFound("프로젝트를 찾을 수 없습니다.")
+
     source_rows = (
         await session.scalars(
             select(Dataset)
             .where(
                 Dataset.id.in_(dataset_ids),
-                Dataset.owner_id == owner_id,
+                Dataset.workspace_id == workspace_id,
+                Dataset.project_id.in_(project_ids),
                 Dataset.is_placeholder.is_(False),
             )
             .order_by(Dataset.id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).all()
     source_by_id = {dataset.id: dataset for dataset in source_rows}
@@ -412,23 +437,8 @@ async def merge_datasets(
         raise DatasetMergeConflict("사용 가능한 데이터셋만 합칠 수 있습니다.")
     if any(dataset.is_merged for dataset in sources):
         raise DatasetMergeConflict("병합 데이터셋은 다시 합칠 수 없습니다.")
-    project_ids = {dataset.project_id for dataset in sources}
     if len(project_ids) != 1:
-        raise DatasetMergeConflict(
-            "같은 프로젝트의 데이터셋만 합칠 수 있습니다."
-        )
-    project_id = sources[0].project_id
-    project = await session.scalar(
-        select(Project)
-        .where(
-            Project.id == project_id,
-            Project.owner_id == owner_id,
-        )
-        .with_for_update()
-    )
-    if project is None:
-        raise DatasetMergeNotFound("프로젝트를 찾을 수 없습니다.")
-
+        raise DatasetMergeConflict("같은 프로젝트의 데이터셋만 합칠 수 있습니다.")
     reserved_target: Dataset | None = None
     overlapping_merge_ids = list(
         (
@@ -450,7 +460,7 @@ async def merge_datasets(
                     select(Dataset)
                     .where(
                         Dataset.id.in_(overlapping_merge_ids),
-                        Dataset.owner_id == owner_id,
+                        Dataset.workspace_id == workspace_id,
                         Dataset.project_id == project_id,
                         Dataset.is_placeholder.is_(False),
                     )
@@ -487,8 +497,8 @@ async def merge_datasets(
                 existing is not None
                 and set(existing_source_ids) == requested_source_ids
             ):
-                purpose_changed = _promote_merge_purpose(existing, purpose)
                 if existing.id == target_dataset_id:
+                    purpose_changed = _promote_merge_purpose(existing, purpose)
                     if existing.status == "ready":
                         if purpose_changed:
                             await session.commit()
@@ -522,6 +532,13 @@ async def merge_datasets(
                     .order_by(UploadJob.id.desc())
                     .limit(1)
                 )
+                if existing.status != "ready" and not (
+                    existing.status == "pending" and active_merge_job is not None
+                ):
+                    raise DatasetMergeConflict(
+                        "실패한 병합 작업은 삭제한 뒤 다시 시도해 주세요."
+                    )
+                purpose_changed = _promote_merge_purpose(existing, purpose)
                 if purpose_changed:
                     await session.commit()
                     await session.refresh(existing)
@@ -598,7 +615,7 @@ async def merge_datasets(
         and work_total > DATASET_MERGE_INLINE_WORK_LIMIT
     ):
         dataset = Dataset(
-            owner_id=owner_id,
+            workspace_id=workspace_id,
             project_id=project_id,
             name=name,
             status="pending",
@@ -726,7 +743,7 @@ async def merge_datasets(
     dataset = reserved_target
     if dataset is None:
         dataset = Dataset(
-            owner_id=owner_id,
+            workspace_id=workspace_id,
             project_id=sources[0].project_id,
             name=name,
             status="pending",
@@ -756,7 +773,7 @@ async def merge_datasets(
         copied = copy_source_images(
             settings,
             target_dataset_id=dataset.id,
-            owner_id=owner_id,
+            workspace_id=workspace_id,
             target_storage=storage_path,
             sources=sources,
             images_by_dataset=images_by_dataset,
@@ -791,7 +808,7 @@ async def merge_datasets(
         dataset.annotation_count = copied.annotation_count
         dataset.class_count = len(project_class_rows)
         dataset.status = "ready" if copied.images else "failed"
-        await increase_bytes_used(session, owner_id, copied.accounted_bytes)
+        await increase_bytes_used(session, workspace_id, copied.accounted_bytes)
         await session.commit()
         await session.refresh(dataset)
         return DatasetMergeResult(dataset=dataset, sources=sources)
@@ -835,7 +852,7 @@ async def run_dataset_merge_job(
             if len(dataset_ids) < 2:
                 raise LookupError("dataset merge sources do not exist")
             target_dataset_id = target.id
-            owner_id = target.owner_id
+            workspace_id = target.workspace_id
             name = target.name
             purpose: MergePurpose = target.merge_purpose or "merge"
 
@@ -851,7 +868,7 @@ async def run_dataset_merge_job(
                 merge_session,
                 name=name,
                 dataset_ids=dataset_ids,
-                owner_id=owner_id,
+                workspace_id=workspace_id,
                 purpose=purpose,
                 target_dataset_id=target_dataset_id,
             )
@@ -881,20 +898,39 @@ async def extend_merged_dataset(
     *,
     merged_dataset_id: int,
     dataset_ids: list[int],
-    owner_id: int,
+    workspace_id: int,
     purpose: MergePurpose = "merge",
 ) -> DatasetMergeResult:
     requested_ids = [merged_dataset_id, *dataset_ids]
+    # Parent first: ingestion and catalog triggers can touch sibling datasets.
+    references = (await session.execute(select(Dataset.id, Dataset.project_id).where(
+        Dataset.id.in_(requested_ids), Dataset.workspace_id == workspace_id,
+        Dataset.is_placeholder.is_(False),
+    ))).all()
+    if len(references) != len(set(requested_ids)):
+        raise DatasetMergeNotFound("선택한 데이터셋을 찾을 수 없습니다.")
+    project_ids = {row.project_id for row in references}
+    # Invalid cross-project input still follows the existing validation order.
+    # Lock its parents first as well, without locking datasets in reverse order.
+    for project_id in sorted(project_ids):
+        project = await session.scalar(select(Project).where(
+            Project.id == project_id, Project.workspace_id == workspace_id,
+        ).with_for_update())
+        if project is None:
+            raise DatasetMergeNotFound("프로젝트를 찾을 수 없습니다.")
+
     dataset_rows = (
         await session.scalars(
             select(Dataset)
             .where(
                 Dataset.id.in_(requested_ids),
-                Dataset.owner_id == owner_id,
+                Dataset.workspace_id == workspace_id,
+                Dataset.project_id.in_(project_ids),
                 Dataset.is_placeholder.is_(False),
             )
             .order_by(Dataset.id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).all()
     dataset_by_id = {dataset.id: dataset for dataset in dataset_rows}
@@ -910,17 +946,6 @@ async def extend_merged_dataset(
         raise DatasetMergeConflict("사용 가능한 데이터셋만 합칠 수 있습니다.")
     if any(source.project_id != target.project_id for source in sources):
         raise DatasetMergeConflict("같은 프로젝트의 데이터셋만 합칠 수 있습니다.")
-
-    project = await session.scalar(
-        select(Project)
-        .where(
-            Project.id == target.project_id,
-            Project.owner_id == owner_id,
-        )
-        .with_for_update()
-    )
-    if project is None:
-        raise DatasetMergeNotFound("프로젝트를 찾을 수 없습니다.")
 
     target_memberships = list(
         (
@@ -1004,7 +1029,7 @@ async def extend_merged_dataset(
             select(Dataset)
             .where(
                 Dataset.id.in_(leaf_source_ids),
-                Dataset.owner_id == owner_id,
+                Dataset.workspace_id == workspace_id,
                 Dataset.project_id == target.project_id,
                 Dataset.is_placeholder.is_(False),
             )
@@ -1032,7 +1057,7 @@ async def extend_merged_dataset(
         select(TrainingRun.id)
         .where(
             TrainingRun.dataset_id.in_(losing_ids),
-            TrainingRun.owner_id == owner_id,
+            TrainingRun.workspace_id == workspace_id,
             TrainingRun.state.in_(("running", "canceling")),
         )
         .limit(1)
@@ -1140,7 +1165,7 @@ async def extend_merged_dataset(
         copied = copy_source_images(
             settings,
             target_dataset_id=target.id,
-            owner_id=owner_id,
+            workspace_id=workspace_id,
             target_storage=target_storage,
             sources=sources,
             images_by_dataset=images_by_dataset,
@@ -1223,9 +1248,9 @@ async def extend_merged_dataset(
         project.updated_at = func.now()
         quota_delta = copied.accounted_bytes - release_plan.released_bytes
         if quota_delta > 0:
-            await increase_bytes_used(session, owner_id, quota_delta)
+            await increase_bytes_used(session, workspace_id, quota_delta)
         elif quota_delta < 0:
-            await decrease_bytes_used(session, owner_id, -quota_delta)
+            await decrease_bytes_used(session, workspace_id, -quota_delta)
         await session.commit()
         await session.refresh(target)
     except BaseException as error:

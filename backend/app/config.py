@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     disk_headroom_factor: float = Field(gt=0)
     allowed_image_exts: Annotated[tuple[str, ...], NoDecode]
     quota_bytes_per_user: int = Field(default=100 * 1024**3, gt=0)
+    team_create_limit: int = Field(default=2, ge=0)
     run_artifact_keep_count: int = Field(default=10, ge=0)
     run_artifact_keep_days: int = Field(default=30, ge=0)
     upload_gc_ttl_hours: int = Field(default=24, gt=0)

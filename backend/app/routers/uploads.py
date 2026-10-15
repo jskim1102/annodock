@@ -21,9 +21,10 @@ from starlette.datastructures import FormData, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
 from app.db import get_session, set_local_lock_timeout
-from app.deps import CurrentUserDep
+from app.deps import CurrentWorkspaceDep, EditorWorkspaceDep
 from app.models import Dataset, UploadBatch, UploadJob, UploadSession
 from app.services.uploads import (
+    EXPIRED_UPLOAD_MESSAGE,
     ChunkFileUpload,
     abort_upload,
     complete_upload,
@@ -269,13 +270,13 @@ async def _parse_chunk_batch(
 async def _dataset_or_404(
     session: AsyncSession,
     dataset_id: int,
-    owner_id: int,
+    workspace_id: int,
     *,
     for_update: bool = False,
 ) -> Dataset:
     statement = select(Dataset).where(
         Dataset.id == dataset_id,
-        Dataset.owner_id == owner_id,
+        Dataset.workspace_id == workspace_id,
     )
     if for_update:
         statement = statement.with_for_update()
@@ -289,7 +290,7 @@ async def _upload_batch_or_404(
     session: AsyncSession,
     dataset_id: int,
     batch_id: UUID,
-    owner_id: int,
+    workspace_id: int,
     *,
     for_update: bool = False,
 ) -> UploadBatch:
@@ -299,7 +300,7 @@ async def _upload_batch_or_404(
         .where(
             UploadBatch.id == batch_id,
             UploadBatch.dataset_id == dataset_id,
-            Dataset.owner_id == owner_id,
+            Dataset.workspace_id == workspace_id,
         )
     )
     if for_update:
@@ -313,7 +314,7 @@ async def _upload_batch_or_404(
 async def _upload_or_404(
     session: AsyncSession,
     upload_id: int,
-    owner_id: int,
+    workspace_id: int,
     *,
     for_update: bool = False,
 ) -> UploadSession:
@@ -322,7 +323,7 @@ async def _upload_or_404(
         .join(Dataset, Dataset.id == UploadSession.dataset_id)
         .where(
             UploadSession.id == upload_id,
-            Dataset.owner_id == owner_id,
+            Dataset.workspace_id == workspace_id,
         )
     )
     if for_update:
@@ -338,13 +339,13 @@ async def delete_upload(
     upload_id: int,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: EditorWorkspaceDep,
 ) -> Response:
     await set_local_lock_timeout(session)
     await _upload_or_404(
         session,
         upload_id,
-        current_user.id,
+        current_workspace.id,
         for_update=True,
     )
     await abort_upload(
@@ -359,7 +360,7 @@ async def _owned_batch_or_404(
     session: AsyncSession,
     dataset_id: int,
     upload_ids: list[int],
-    owner_id: int,
+    workspace_id: int,
 ) -> None:
     requested_ids = set(upload_ids)
     owned_ids = set(
@@ -370,7 +371,7 @@ async def _owned_batch_or_404(
                 .where(
                     upload_ids_match(requested_ids),
                     UploadSession.dataset_id == dataset_id,
-                    Dataset.owner_id == owner_id,
+                    Dataset.workspace_id == workspace_id,
                 )
             )
         ).all()
@@ -406,15 +407,15 @@ def _check_capacity(
         ) from error
 
 
-async def _check_user_quota(
+async def _check_workspace_quota(
     session: AsyncSession,
     request: Request,
-    owner_id: int,
+    workspace_id: int,
     required_bytes: int,
 ) -> None:
     status = await quota_status(
         session,
-        owner_id,
+        workspace_id,
         limit_bytes=request.app.state.settings.quota_bytes_per_user,
         required_bytes=required_bytes,
     )
@@ -451,20 +452,28 @@ async def begin_upload_batch(
     body: UploadBatchPreflight,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: EditorWorkspaceDep,
 ) -> UploadBatchState:
     """Create or replay one durable manifest before any file sessions."""
 
     await _dataset_or_404(
         session,
         dataset_id,
-        current_user.id,
+        current_workspace.id,
         for_update=True,
     )
     upload_batch = await session.get(UploadBatch, batch_id)
     if upload_batch is not None:
         if upload_batch.dataset_id != dataset_id:
             raise HTTPException(status_code=404, detail="업로드 배치를 찾을 수 없습니다.")
+        if upload_batch.state == "aborted":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "upload_batch_aborted",
+                    "message": EXPIRED_UPLOAD_MESSAGE,
+                },
+            )
         persisted = (
             upload_batch.expected_file_count,
             upload_batch.expected_total_size,
@@ -486,10 +495,10 @@ async def begin_upload_batch(
                 body.expected_extracted_size,
             ),
         )
-        await _check_user_quota(
+        await _check_workspace_quota(
             session,
             request,
-            current_user.id,
+            current_workspace.id,
             max(body.total_size, body.expected_extracted_size),
         )
         upload_batch = UploadBatch(
@@ -524,9 +533,9 @@ async def create_upload(
     body: UploadCreate,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: EditorWorkspaceDep,
 ) -> UploadCreated:
-    await _dataset_or_404(session, dataset_id, current_user.id)
+    await _dataset_or_404(session, dataset_id, current_workspace.id, for_update=True)
     _check_capacity(
         request,
         size=body.size,
@@ -537,10 +546,10 @@ async def create_upload(
             else body.expected_extracted_size
         ),
     )
-    await _check_user_quota(
+    await _check_workspace_quota(
         session,
         request,
-        current_user.id,
+        current_workspace.id,
         max(
             body.size,
             body.size
@@ -609,7 +618,7 @@ async def create_upload_batch(
     body: UploadBatchCreate,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: EditorWorkspaceDep,
 ) -> UploadBatchCreated:
     total_size = sum(item.size for item in body.files)
     total_file_count = sum(item.file_count for item in body.files)
@@ -625,9 +634,17 @@ async def create_upload_batch(
             session,
             dataset_id,
             body.batch_id,
-            current_user.id,
+            current_workspace.id,
             for_update=True,
         )
+        if upload_batch.state == "aborted":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "upload_batch_aborted",
+                    "message": EXPIRED_UPLOAD_MESSAGE,
+                },
+            )
         if upload_batch.state != "open":
             raise HTTPException(status_code=409, detail="이미 봉인된 업로드 배치입니다.")
         file_keys = [upload_file_key(item.filename) for item in body.files]
@@ -674,6 +691,14 @@ async def create_upload_batch(
                 raise HTTPException(
                     status_code=409,
                     detail=f"{item.filename}: 기존 업로드 세션의 정보가 다릅니다.",
+                )
+            if upload.state == "aborted":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "upload_session_aborted",
+                        "message": EXPIRED_UPLOAD_MESSAGE,
+                    },
                 )
             if upload.state != "open":
                 raise HTTPException(
@@ -734,17 +759,17 @@ async def create_upload_batch(
             uploads=[_created_upload(upload) for upload in uploads]
         )
 
-    await _dataset_or_404(session, dataset_id, current_user.id)
+    await _dataset_or_404(session, dataset_id, current_workspace.id, for_update=True)
     _check_capacity(
         request,
         size=total_size,
         file_count=total_file_count,
         expected_extracted_size=total_expected_extracted_size,
     )
-    await _check_user_quota(
+    await _check_workspace_quota(
         session,
         request,
-        current_user.id,
+        current_workspace.id,
         max(total_size, total_expected_extracted_size),
     )
 
@@ -794,9 +819,9 @@ async def preflight_upload_batch(
     body: UploadBatchPreflight,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: EditorWorkspaceDep,
 ) -> Response:
-    await _dataset_or_404(session, dataset_id, current_user.id)
+    await _dataset_or_404(session, dataset_id, current_workspace.id)
     _check_capacity(
         request,
         size=body.largest_file_size,
@@ -806,10 +831,10 @@ async def preflight_upload_batch(
             body.expected_extracted_size,
         ),
     )
-    await _check_user_quota(
+    await _check_workspace_quota(
         session,
         request,
-        current_user.id,
+        current_workspace.id,
         max(body.total_size, body.expected_extracted_size),
     )
     return Response(status_code=204)
@@ -823,9 +848,9 @@ async def put_chunk_batch(
     dataset_id: int,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: EditorWorkspaceDep,
 ) -> Response:
-    await _dataset_or_404(session, dataset_id, current_user.id)
+    await _dataset_or_404(session, dataset_id, current_workspace.id)
     form, metadata, files = await _parse_chunk_batch(request)
     try:
         upload_ids = [chunk.upload_id for chunk in metadata.chunks]
@@ -833,7 +858,7 @@ async def put_chunk_batch(
             session,
             dataset_id,
             upload_ids,
-            current_user.id,
+            current_workspace.id,
         )
         await store_chunk_files(
             session,
@@ -858,9 +883,9 @@ async def put_chunk_batch(
 async def get_upload(
     upload_id: int,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
 ) -> UploadState:
-    upload = await _upload_or_404(session, upload_id, current_user.id)
+    upload = await _upload_or_404(session, upload_id, current_workspace.id)
     return UploadState(
         upload_id=upload.id,
         chunk_size=upload.chunk_size,
@@ -876,9 +901,9 @@ async def put_chunk(
     chunk_number: int,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: EditorWorkspaceDep,
 ) -> Response:
-    await _upload_or_404(session, upload_id, current_user.id)
+    await _upload_or_404(session, upload_id, current_workspace.id)
     expected_size = await inspect_chunk(session, upload_id, chunk_number)
     content_length = request.headers.get("content-length")
     if content_length is not None:
@@ -919,9 +944,9 @@ async def finish_upload(
     upload_id: int,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: EditorWorkspaceDep,
 ) -> JobCreated:
-    await _upload_or_404(session, upload_id, current_user.id)
+    await _upload_or_404(session, upload_id, current_workspace.id)
     job = await complete_upload(
         session,
         request.app.state.settings,
@@ -942,14 +967,14 @@ async def finish_upload_batch(
     body: UploadBatchComplete,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: EditorWorkspaceDep,
 ) -> JobCreated:
-    await _dataset_or_404(session, dataset_id, current_user.id)
+    await _dataset_or_404(session, dataset_id, current_workspace.id)
     await _owned_batch_or_404(
         session,
         dataset_id,
         body.upload_ids,
-        current_user.id,
+        current_workspace.id,
     )
     job = await complete_upload_batch(
         session,
@@ -972,13 +997,13 @@ async def finish_upload_manifest(
     batch_id: UUID,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: EditorWorkspaceDep,
 ) -> JobCreated:
     await _upload_batch_or_404(
         session,
         dataset_id,
         batch_id,
-        current_user.id,
+        current_workspace.id,
     )
     job = await complete_upload_manifest(
         session,

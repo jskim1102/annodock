@@ -25,7 +25,7 @@ import httpx  # noqa: E402
 import torch  # noqa: E402
 
 from app.db import create_engine, create_session_factory  # noqa: E402
-from app.models import TrainingRun, UserStorage  # noqa: E402
+from app.models import TrainingRun, WorkspaceStorage  # noqa: E402
 from app.services.proc_identity import read_process_identity  # noqa: E402
 from app.services.reaper import reconcile_training_runs  # noqa: E402
 from app.services.storage import contained_storage_path  # noqa: E402
@@ -680,7 +680,7 @@ async def _verify_completed_storage(
                 raise AssertionError(f"DB run state is not done: {run.state}")
             out_dir_value = run.out_dir
             persisted_artifact_bytes = run.artifact_bytes
-            usage = await session.get(UserStorage, run.owner_id)
+            usage = await session.get(WorkspaceStorage, run.workspace_id)
         if not out_dir_value or Path(out_dir_value).is_absolute():
             raise AssertionError(f"run out_dir is not storage-relative: {out_dir_value}")
         out_dir = contained_storage_path(storage_dir, out_dir_value)
@@ -708,9 +708,9 @@ async def _verify_completed_storage(
                 f"{persisted_artifact_bytes} != {total_artifact_bytes}"
             )
         if usage is None or usage.bytes_used < total_artifact_bytes:
-            raise AssertionError("user storage counter omits training artifacts")
+            raise AssertionError("workspace storage counter omits training artifacts")
         _emit(f"run_artifact_bytes={total_artifact_bytes}")
-        _emit(f"user_storage_bytes={usage.bytes_used}")
+        _emit(f"workspace_storage_bytes={usage.bytes_used}")
         _emit("storage_artifacts=PASS")
     finally:
         await engine.dispose()

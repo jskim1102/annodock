@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import case, delete, func, select
+from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -58,11 +58,11 @@ async def _has_active_upload(
     session: AsyncSession,
     *,
     project_ids: list[int],
-    owner_id: int,
+    workspace_id: int,
 ) -> bool:
     dataset_ids = select(Dataset.id).where(
         Dataset.project_id.in_(project_ids),
-        Dataset.owner_id == owner_id,
+        Dataset.workspace_id == workspace_id,
     )
     active_job = await session.scalar(
         select(UploadJob.id)
@@ -109,13 +109,13 @@ async def _merge_projects(
     name: str,
     project_revisions: dict[int, datetime],
     classes: tuple[ProjectMergeClassPlan, ...],
-    owner_id: int,
+    workspace_id: int,
 ) -> ProjectMergeResult:
     project_ids = list(project_revisions)
     if await _has_active_upload(
         session,
         project_ids=project_ids,
-        owner_id=owner_id,
+        workspace_id=workspace_id,
     ):
         raise ProjectMergeConflict(
             "업로드 중이거나 처리 중인 프로젝트는 통합할 수 없습니다."
@@ -128,7 +128,7 @@ async def _merge_projects(
                     select(Project)
                     .where(
                         Project.id.in_(project_ids),
-                        Project.owner_id == owner_id,
+                        Project.workspace_id == workspace_id,
                     )
                     .order_by(Project.id)
                     .with_for_update(nowait=True)
@@ -153,7 +153,7 @@ async def _merge_projects(
     conflicting_name = await session.scalar(
         select(Project.id)
         .where(
-            Project.owner_id == owner_id,
+            Project.workspace_id == workspace_id,
             Project.name == name,
             Project.id.not_in(project_ids),
         )
@@ -169,7 +169,7 @@ async def _merge_projects(
                     select(Dataset)
                     .where(
                         Dataset.project_id.in_(project_ids),
-                        Dataset.owner_id == owner_id,
+                        Dataset.workspace_id == workspace_id,
                     )
                     .order_by(Dataset.id)
                     .with_for_update(nowait=True)
@@ -186,7 +186,7 @@ async def _merge_projects(
     if await _has_active_upload(
         session,
         project_ids=project_ids,
-        owner_id=owner_id,
+        workspace_id=workspace_id,
     ):
         raise ProjectMergeConflict(
             "업로드 중이거나 처리 중인 프로젝트는 통합할 수 없습니다."
@@ -275,7 +275,7 @@ async def _merge_projects(
             )
 
     target = Project(
-        owner_id=owner_id,
+        workspace_id=workspace_id,
         name=f"__project_merge_{uuid4().hex}",
     )
     session.add(target)
@@ -297,6 +297,29 @@ async def _merge_projects(
     }
     for dataset in datasets:
         dataset_ids_by_project[dataset.project_id].append(dataset.id)
+    remapped_projects = {
+        project_id
+        for (project_id, old_class_id), new_class_id in class_remap.items()
+        if old_class_id != new_class_id
+    }
+    remapped_dataset_ids = [
+        dataset.id for dataset in datasets if dataset.project_id in remapped_projects
+    ]
+    if remapped_dataset_ids:
+        # Lock all affected images in one global order, including empty images.
+        # Per-project locking could invert the order used by workspace reclaim.
+        await session.execute(
+            select(Image.id)
+            .where(Image.dataset_id.in_(remapped_dataset_ids))
+            .order_by(Image.id)
+            .with_for_update(of=Image)
+        )
+        await session.execute(
+            update(Image)
+            .where(Image.dataset_id.in_(remapped_dataset_ids))
+            .values(version=Image.version + 1)
+            .execution_options(synchronize_session=False)
+        )
     for project_id, scoped_dataset_ids in dataset_ids_by_project.items():
         if not scoped_dataset_ids:
             continue
@@ -363,7 +386,7 @@ async def _merge_projects(
     await session.flush()
     await session.execute(
         delete(Project)
-        .where(Project.id.in_(project_ids), Project.owner_id == owner_id)
+        .where(Project.id.in_(project_ids), Project.workspace_id == workspace_id)
         .execution_options(synchronize_session=False)
     )
     target.name = name
@@ -377,7 +400,7 @@ async def merge_projects(
     name: str,
     project_revisions: dict[int, datetime],
     classes: tuple[ProjectMergeClassPlan, ...],
-    owner_id: int,
+    workspace_id: int,
 ) -> ProjectMergeResult:
     """Consolidate source containers and preserve every dataset/media identity."""
 
@@ -387,7 +410,7 @@ async def merge_projects(
             name=name,
             project_revisions=project_revisions,
             classes=classes,
-            owner_id=owner_id,
+            workspace_id=workspace_id,
         )
     except Exception:
         await session.rollback()

@@ -109,7 +109,7 @@ def test_worker_preserves_legacy_augmentation_defaults(
 ) -> None:
     connection = MagicMock()
     connection.__enter__.return_value.cursor.return_value.__enter__.return_value.fetchone.return_value = {
-        "id": 1, "owner_id": 1, "weights": "yolo26n.pt", "epochs": 1,
+        "id": 1, "workspace_id": 1, "weights": "yolo26n.pt", "epochs": 1,
         "imgsz": 64, "batch": 1, "training_args": persisted,
         "out_dir": "training-runs/1",
     }

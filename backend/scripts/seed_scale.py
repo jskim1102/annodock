@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker  # noqa: E40
 
 from app.config import Settings  # noqa: E402
 from app.db import create_engine, create_session_factory  # noqa: E402
-from app.models import Dataset, DatasetClass, Image, MediaObject  # noqa: E402
+from app.models import Dataset, DatasetClass, Image, MediaObject, Workspace  # noqa: E402
 from app.services.quota import increase_bytes_used  # noqa: E402
 from app.services.storage import (  # noqa: E402
     contained_storage_path,
@@ -74,7 +74,7 @@ async def seed_scale_dataset(
             original_bytes = original_path.stat().st_size
             thumb_bytes = thumb_path.stat().st_size
             media_object = MediaObject(
-                owner_id=dataset.owner_id,
+                workspace_id=dataset.workspace_id,
                 created_by_dataset_id=dataset_id,
                 original_bytes=original_bytes,
                 display_bytes=0,
@@ -199,7 +199,7 @@ async def seed_scale_dataset(
             dataset.class_count = 3
             await increase_bytes_used(
                 session,
-                dataset.owner_id,
+                dataset.workspace_id,
                 original_bytes + thumb_bytes,
             )
             await session.commit()
@@ -219,6 +219,7 @@ async def create_and_seed(
     settings: Settings,
     *,
     database_url: str,
+    workspace_id: int,
     name: str,
     image_count: int,
     boxes_per_image: int,
@@ -227,7 +228,10 @@ async def create_and_seed(
     session_factory = create_session_factory(engine)
     try:
         async with session_factory() as session:
+            if await session.get(Workspace, workspace_id) is None:
+                raise LookupError(f"workspace {workspace_id} does not exist")
             dataset = Dataset(
+                workspace_id=workspace_id,
                 name=name,
                 status="pending",
                 storage_path="",
@@ -254,6 +258,7 @@ async def create_and_seed(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database-url")
+    parser.add_argument("--workspace-id", type=int, required=True)
     parser.add_argument(
         "--name",
         default=(
@@ -277,6 +282,7 @@ def main() -> None:
         create_and_seed(
             settings,
             database_url=args.database_url or settings.database_url,
+            workspace_id=args.workspace_id,
             name=args.name,
             image_count=args.images,
             boxes_per_image=args.boxes_per_image,

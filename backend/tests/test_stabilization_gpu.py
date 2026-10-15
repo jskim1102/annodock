@@ -83,8 +83,12 @@ async def test_heif_upload_annotation_edit_to_gpu_artifacts(
         assert images.status_code == 200 and images.json()["total"] == 10
         image_id = images.json()["items"][0]["id"]
         boxes = [{"class_id": 0, "cx": 0.4, "cy": 0.4, "w": 0.2, "h": 0.3}]
+        current = await client.get(f"/api/images/{image_id}/annotations")
+        assert current.status_code == 200, current.text
         saved = await client.put(
-            f"/api/images/{image_id}/annotations", json={"boxes": boxes}
+            f"/api/images/{image_id}/annotations",
+            json={"boxes": boxes, "expected_version": current.json()["version"],
+                  "expected_catalog_version": current.json()["catalog_version"]},
         )
         assert saved.status_code == 200, saved.text
         persisted = await client.get(f"/api/images/{image_id}/annotations")

@@ -30,7 +30,8 @@ async def _run(
     storage_dir = app.state.settings.storage_dir
     async with app.state.session_factory() as session:
         run = TrainingRun(
-            owner_id=1,
+            workspace_id=1,
+            created_by=1,
             dataset_id=None,
             dataset_name=f"test-workdir-cleanup-{uuid4().hex}",
             weights="yolo26n.pt",
@@ -108,7 +109,7 @@ async def test_async_failure_reclaims_workdir_after_collecting_artifacts(app) ->
             session,
             run_id,
             "test failure",
-            owner_id=1,
+            workspace_id=1,
             storage_dir=app.state.settings.storage_dir,
         )
     await _assert_terminal_cleanup(app, run_id, out_dir, "failed")
@@ -162,7 +163,7 @@ async def test_async_failure_preserves_workdir_when_artifact_collection_fails(
             session,
             run_id,
             "test failure",
-            owner_id=1,
+            workspace_id=1,
             storage_dir=app.state.settings.storage_dir,
         )
 
@@ -302,7 +303,7 @@ async def test_async_failure_with_unconfirmed_pid_does_not_stage_workdir(app) ->
             session,
             run_id,
             "PID was not confirmed",
-            owner_id=1,
+            workspace_id=1,
             storage_dir=app.state.settings.storage_dir,
         )
 

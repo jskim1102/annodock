@@ -9,19 +9,19 @@ from app.models import (
     ExportArtifact,
     Image,
     ImportIssue,
-    Membership,
+    WorkspaceMember,
     MediaObject,
-    Organization,
+    Workspace,
     Project,
     ProjectClass,
     RunImage,
     RunMetric,
-    Team,
+    WorkspaceInvite,
     TrainingRun,
     UploadBatch,
     UploadJob,
     UploadSession,
-    UserStorage,
+    WorkspaceStorage,
 )
 
 
@@ -39,11 +39,11 @@ EXPECTED_TABLES = {
     "upload_jobs",
     "import_issues",
     "exports",
-    "user_storage",
+    "workspace_storage",
     "admin_users",
-    "orgs",
-    "teams",
-    "memberships",
+    "workspaces",
+    "workspace_members",
+    "workspace_invites",
 }
 
 TRAINER_TABLES = {
@@ -55,7 +55,7 @@ TRAINER_TABLES = {
 EXPECTED_COLUMNS = {
     Dataset: {
         "id",
-        "owner_id",
+        "workspace_id",
         "project_id",
         "name",
         "status",
@@ -63,6 +63,7 @@ EXPECTED_COLUMNS = {
         "image_count",
         "annotation_count",
         "class_count",
+        "class_catalog_version",
         "is_merged",
         "merge_purpose",
         "is_extracted",
@@ -74,7 +75,7 @@ EXPECTED_COLUMNS = {
     },
     Project: {
         "id",
-        "owner_id",
+        "workspace_id",
         "name",
         "archived_at",
         "created_at",
@@ -107,12 +108,18 @@ EXPECTED_COLUMNS = {
         "thumb_bytes",
         "box_count",
         "has_label_source",
+        "label_status",
+        "assignee_id",
+        "assigned_at",
+        "labeled_by",
+        "labeled_at",
+        "version",
         "is_modified",
         "created_at",
     },
     MediaObject: {
         "id",
-        "owner_id",
+        "workspace_id",
         "created_by_dataset_id",
         "original_bytes",
         "display_bytes",
@@ -182,26 +189,20 @@ EXPECTED_COLUMNS = {
         "archive_bytes",
         "created_at",
     },
-    UserStorage: {
-        "owner_id",
+    WorkspaceStorage: {
+        "workspace_id",
         "bytes_used",
         "quota_limit_bytes",
         "updated_at",
     },
-    Organization: {"id", "owner_id", "name", "created_at"},
-    Team: {"id", "org_id", "name", "created_at"},
-    Membership: {
-        "team_id",
-        "user_id",
-        "role",
-        "can_view",
-        "can_edit",
-        "can_manage",
-        "created_at",
-    },
+    Workspace: {"id", "kind", "name", "created_by", "created_at"},
+    WorkspaceMember: {"workspace_id", "user_id", "role", "created_at"},
+    WorkspaceInvite: {"id", "workspace_id", "role", "token_hash", "created_by",
+                      "created_at", "expires_at", "max_uses", "uses", "revoked_at"},
     TrainingRun: {
         "id",
-        "owner_id",
+        "created_by",
+        "workspace_id",
         "dataset_id",
         "dataset_name",
         "weights",
@@ -267,7 +268,7 @@ def test_dataset_uses_precomputed_counts_and_owner_scoped_unique_names() -> None
         if isinstance(constraint, UniqueConstraint)
     }
     assert ("name",) not in unique_constraints
-    assert ("owner_id", "name") in unique_constraints
+    assert ("workspace_id", "name") in unique_constraints
 
     merge_purpose = columns["merge_purpose"]
     assert merge_purpose.nullable is True

@@ -16,7 +16,7 @@ from app.models import (
     Project,
     TrainingRun,
     UploadSession,
-    UserStorage,
+    WorkspaceStorage,
 )
 from app.services import cleanup
 from app.services.quota import get_bytes_used
@@ -109,7 +109,7 @@ async def test_dataset_delete_reclaims_all_upload_directories_without_quota_chan
     dataset_id = await _dataset(client, project_id)
     upload_ids = [await _upload(client, dataset_id) for _ in range(2)]
     async with app.state.session_factory() as session:
-        session.add(UserStorage(owner_id=1, bytes_used=456))
+        session.add(WorkspaceStorage(workspace_id=1, bytes_used=456))
         await session.commit()
 
     assert (await client.delete(f"/api/datasets/{dataset_id}")).status_code == 204
@@ -295,7 +295,8 @@ async def test_delete_restores_every_staged_path_when_rollback_fails(
             run_marker = run_root / "run-marker.bin"
             run_marker.write_bytes(b"run")
             run = TrainingRun(
-                owner_id=1,
+                workspace_id=1,
+                created_by=1,
                 dataset_id=dataset_id,
                 dataset_name=dataset.name,
                 weights="yolo26n.pt",
@@ -459,7 +460,7 @@ async def test_dataset_delete_reaper_tick_cannot_remove_inflight_quarantine(
         upload_marker = upload_root / "upload-marker.bin"
         upload_marker.write_bytes(b"upload")
         image = image_with_media(
-            owner_id=dataset.owner_id,
+            workspace_id=dataset.workspace_id,
             dataset_id=dataset_id,
             stem="sample",
             filename="sample.jpg",
@@ -477,10 +478,10 @@ async def test_dataset_delete_reaper_tick_cannot_remove_inflight_quarantine(
             has_label_source=False,
         )
         session.add(image)
-        usage = await session.get(UserStorage, 1)
+        usage = await session.get(WorkspaceStorage, 1)
         accounted_bytes = len(original_bytes) + len(thumb_bytes)
         if usage is None:
-            session.add(UserStorage(owner_id=1, bytes_used=accounted_bytes))
+            session.add(WorkspaceStorage(workspace_id=1, bytes_used=accounted_bytes))
         else:
             usage.bytes_used = accounted_bytes
         await session.commit()

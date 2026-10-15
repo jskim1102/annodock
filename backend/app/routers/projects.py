@@ -1,4 +1,4 @@
-"""Owner-scoped project hierarchy and project-level class catalogs."""
+"""Workspace-scoped project hierarchy and project-level class catalogs."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session, is_lock_not_available, set_local_lock_timeout
-from app.deps import CurrentUserDep
+from app.deps import AdminWorkspaceDep, CurrentUserDep, CurrentWorkspaceDep, OwnerWorkspaceDep
 from app.models import (
     Annotation,
     Dataset,
@@ -42,6 +42,7 @@ from app.services.project_merge import (
     ProjectMergeNotFound,
     merge_projects as merge_projects_service,
 )
+from app.services.project_transfer import transfer_project
 from app.services.storage import (
     StorageBoundaryError,
     contained_storage_path,
@@ -119,6 +120,18 @@ class ProjectName(BaseModel):
         return normalized
 
 
+class ProjectTransferRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_workspace_id: int = Field(gt=0, le=2**31 - 1, strict=True)
+
+
+class ProjectTransferResult(BaseModel):
+    project_id: int
+    workspace_id: int
+    moved_bytes: int
+
+
 class ProjectMergeClassSource(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -171,6 +184,15 @@ class ProjectClassRow(BaseModel):
     color: str
 
 
+class DatasetCatalogVersion(BaseModel):
+    dataset_id: int
+    catalog_version: int
+
+
+class ProjectClassUpdated(ProjectClassRow):
+    catalog_versions: list[DatasetCatalogVersion]
+
+
 class ProjectClassReplacement(ProjectClassCreate):
     class_id: int = Field(ge=0)
 
@@ -184,6 +206,7 @@ class ProjectClassBulkUpdate(BaseModel):
 
 class ProjectClassList(BaseModel):
     classes: list[ProjectClassRow]
+    catalog_versions: list[DatasetCatalogVersion]
 
 
 class ActiveJobRow(BaseModel):
@@ -256,6 +279,9 @@ class ProjectClassUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
 
+    expected_catalog_version: int | None = Field(default=None, ge=0, strict=True)
+    dataset_id: int | None = Field(default=None, gt=0, strict=True)
+
     @field_validator("name")
     @classmethod
     def normalize_name(cls, value: str | None) -> str | None:
@@ -277,6 +303,8 @@ class ProjectClassUpdate(BaseModel):
     def require_any_field(self) -> ProjectClassUpdate:
         if self.name is None and self.color is None:
             raise ValueError("name 또는 color 중 하나는 필요합니다")
+        if self.expected_catalog_version is not None and self.dataset_id is None:
+            raise ValueError("expected_catalog_version에는 dataset_id가 필요합니다")
         return self
 
 
@@ -295,11 +323,11 @@ def _active_job(job: UploadJob | None) -> ActiveJobRow | None:
 
 async def _project_rows(
     session: AsyncSession,
-    owner_id: int,
+    workspace_id: int,
     *,
     project_id: int | None = None,
 ) -> list[ProjectRow]:
-    statement = select(Project).where(Project.owner_id == owner_id)
+    statement = select(Project).where(Project.workspace_id == workspace_id)
     if project_id is not None:
         statement = statement.where(Project.id == project_id)
     projects = (
@@ -329,7 +357,7 @@ async def _project_rows(
             .outerjoin(UploadJob, UploadJob.id == latest_active_job_id)
             .where(
                 Dataset.project_id.in_(project_ids),
-                Dataset.owner_id == owner_id,
+                Dataset.workspace_id == workspace_id,
                 Dataset.is_placeholder.is_(False),
                 ~Dataset.id.in_(source_dataset_ids),
             )
@@ -359,7 +387,7 @@ async def _project_rows(
                     DatasetMergeSource.merged_dataset_id.in_(
                         visible_dataset_ids
                     ),
-                    Dataset.owner_id == owner_id,
+                    Dataset.workspace_id == workspace_id,
                     Dataset.is_placeholder.is_(False),
                 )
                 .order_by(
@@ -591,14 +619,14 @@ async def _project_rows(
 async def _owned_project_or_404(
     session: AsyncSession,
     project_id: int,
-    owner_id: int,
+    workspace_id: int,
     *,
     for_update: bool = False,
     nowait: bool = False,
 ) -> Project:
     statement = select(Project).where(
         Project.id == project_id,
-        Project.owner_id == owner_id,
+        Project.workspace_id == workspace_id,
     )
     if for_update:
         statement = statement.with_for_update(nowait=nowait)
@@ -630,9 +658,9 @@ async def _run_accounted_bytes(
 async def create_project(
     body: ProjectCreate,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: AdminWorkspaceDep,
 ) -> ProjectRow:
-    project = Project(owner_id=current_user.id, name=body.name)
+    project = Project(workspace_id=current_workspace.id, name=body.name)
     session.add(project)
     try:
         await session.flush()
@@ -657,17 +685,35 @@ async def create_project(
 
     rows = await _project_rows(
         session,
-        current_user.id,
+        current_workspace.id,
         project_id=project.id,
     )
     return rows[0]
+
+
+@router.post("/{project_id}/transfer", response_model=ProjectTransferResult)
+async def move_project(
+    project_id: int,
+    body: ProjectTransferRequest,
+    request: Request,
+    session: Session,
+    current_workspace: OwnerWorkspaceDep,
+    current_user: CurrentUserDep,
+) -> ProjectTransferResult:
+    result = await transfer_project(
+        session, project_id=project_id, source_workspace_id=current_workspace.id,
+        target_workspace_id=body.target_workspace_id, user_id=current_user.id,
+        limit_bytes=request.app.state.settings.quota_bytes_per_user,
+    )
+    await session.commit()
+    return ProjectTransferResult(**result)
 
 
 @router.post("/merge", status_code=201, response_model=ProjectRow)
 async def create_merged_project(
     body: ProjectMergeRequest,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: AdminWorkspaceDep,
 ) -> ProjectRow:
     try:
         result = await merge_projects_service(
@@ -691,7 +737,7 @@ async def create_merged_project(
                 )
                 for item in body.classes
             ),
-            owner_id=current_user.id,
+            workspace_id=current_workspace.id,
         )
     except ProjectMergeNotFound as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
@@ -705,7 +751,7 @@ async def create_merged_project(
 
     rows = await _project_rows(
         session,
-        current_user.id,
+        current_workspace.id,
         project_id=result.project_id,
     )
     if not rows:
@@ -716,9 +762,9 @@ async def create_merged_project(
 @router.get("", response_model=ProjectPage)
 async def list_projects(
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
 ) -> ProjectPage:
-    rows = await _project_rows(session, current_user.id)
+    rows = await _project_rows(session, current_workspace.id)
     return ProjectPage(items=rows, total=len(rows))
 
 
@@ -730,9 +776,9 @@ async def get_project_class_image_counts(
     project_id: int,
     dataset_ids: Annotated[list[int], Query(min_length=1, max_length=200)],
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
 ) -> ProjectClassImageCountPage:
-    await _owned_project_or_404(session, project_id, current_user.id)
+    await _owned_project_or_404(session, project_id, current_workspace.id)
     selected_dataset_ids = list(dict.fromkeys(dataset_ids))
     selected_count = await session.scalar(
         select(func.count())
@@ -740,7 +786,7 @@ async def get_project_class_image_counts(
         .where(
             Dataset.id.in_(selected_dataset_ids),
             Dataset.project_id == project_id,
-            Dataset.owner_id == current_user.id,
+            Dataset.workspace_id == current_workspace.id,
             Dataset.status == "ready",
             Dataset.is_placeholder.is_(False),
         )
@@ -787,11 +833,11 @@ async def get_project_class_image_counts(
 async def get_project(
     project_id: int,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
 ) -> ProjectRow:
     rows = await _project_rows(
         session,
-        current_user.id,
+        current_workspace.id,
         project_id=project_id,
     )
     if not rows:
@@ -804,12 +850,12 @@ async def rename_project(
     project_id: int,
     body: ProjectName,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: AdminWorkspaceDep,
 ) -> ProjectRenamed:
     project = await _owned_project_or_404(
         session,
         project_id,
-        current_user.id,
+        current_workspace.id,
         for_update=True,
     )
     project.name = body.name
@@ -824,61 +870,91 @@ async def rename_project(
     return ProjectRenamed(id=project_id, name=body.name)
 
 
+async def _catalog_versions(session: AsyncSession, project_id: int) -> list[DatasetCatalogVersion]:
+    rows = (await session.execute(select(Dataset.id, Dataset.class_catalog_version)
+        .where(Dataset.project_id == project_id).order_by(Dataset.id))).all()
+    return [DatasetCatalogVersion(dataset_id=row.id, catalog_version=row.class_catalog_version) for row in rows]
+
+
 @router.patch(
     "/{project_id}/classes/{class_id}",
-    response_model=ProjectClassRow,
+    response_model=ProjectClassUpdated,
 )
 async def update_project_class(
     project_id: int,
     class_id: int,
     body: ProjectClassUpdate,
     session: Session,
-    current_user: CurrentUserDep,
-) -> ProjectClassRow:
+    current_workspace: AdminWorkspaceDep,
+) -> ProjectClassUpdated:
     # 프로젝트 잠금으로 rename 전파와 학습 제출 스냅샷을 직렬화한다
     # (datasets.rename_dataset_class 와 같은 계약).
-    project = await _owned_project_or_404(
-        session,
-        project_id,
-        current_user.id,
-        for_update=True,
-    )
-    project_class = await session.get(ProjectClass, (project_id, class_id))
-    if project_class is None:
-        raise HTTPException(status_code=404, detail="클래스를 찾을 수 없습니다.")
     try:
-        if body.name is not None:
-            project_class.name = body.name
-            # 프로젝트 안 모든 실데이터셋의 동일 class_id 에 이름 전파
-            await session.execute(
-                update(DatasetClass)
-                .where(
-                    DatasetClass.class_id == class_id,
-                    DatasetClass.dataset_id.in_(
-                        select(Dataset.id).where(
-                            Dataset.project_id == project_id,
-                            Dataset.owner_id == current_user.id,
-                            Dataset.is_placeholder.is_(False),
-                        )
-                    ),
+        await set_local_lock_timeout(session, timeout_ms=2500)
+        project = await _owned_project_or_404(
+            session,
+            project_id,
+            current_workspace.id,
+            for_update=True,
+        )
+        if body.name is not None or body.expected_catalog_version is not None:
+            await session.execute(select(Dataset.id).where(
+                Dataset.project_id == project_id,
+                Dataset.workspace_id == current_workspace.id,
+            ).order_by(Dataset.id).with_for_update())
+        if body.expected_catalog_version is not None:
+            current_version = await session.scalar(select(Dataset.class_catalog_version).where(
+                Dataset.id == body.dataset_id, Dataset.project_id == project_id,
+                Dataset.workspace_id == current_workspace.id,
+            ))
+            if current_version is None:
+                raise HTTPException(status_code=404, detail="데이터셋을 찾을 수 없습니다.")
+            if body.expected_catalog_version != current_version:
+                raise HTTPException(status_code=409, detail={"code": "class_catalog_changed"})
+        project_class = await session.get(ProjectClass, (project_id, class_id))
+        if project_class is None:
+            raise HTTPException(status_code=404, detail="클래스를 찾을 수 없습니다.")
+        try:
+            if body.name is not None:
+                project_class.name = body.name
+                # 프로젝트 안 모든 실데이터셋의 동일 class_id 에 이름 전파
+                await session.execute(
+                    update(DatasetClass)
+                    .where(
+                        DatasetClass.class_id == class_id,
+                        DatasetClass.dataset_id.in_(
+                            select(Dataset.id).where(
+                                Dataset.project_id == project_id,
+                                Dataset.workspace_id == current_workspace.id,
+                                Dataset.is_placeholder.is_(False),
+                            )
+                        ),
+                    )
+                    .values(name=body.name)
                 )
-                .values(name=body.name)
-            )
-        if body.color is not None:
-            project_class.color = body.color
-        project.updated_at = func.now()
-        await session.commit()
-    except IntegrityError as error:
+            if body.color is not None:
+                project_class.color = body.color
+            project.updated_at = func.now()
+            await session.flush()
+            catalog_versions = await _catalog_versions(session, project_id)
+            await session.commit()
+        except IntegrityError as error:
+            await session.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="이미 있는 클래스 이름입니다.",
+            ) from error
+        return ProjectClassUpdated(
+            class_id=class_id,
+            name=project_class.name,
+            color=project_class.color,
+            catalog_versions=catalog_versions,
+        )
+    except DBAPIError as error:
         await session.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail="이미 있는 클래스 이름입니다.",
-        ) from error
-    return ProjectClassRow(
-        class_id=class_id,
-        name=project_class.name,
-        color=project_class.color,
-    )
+        if is_lock_not_available(error):
+            raise HTTPException(status_code=409, detail="다른 데이터 작업이 진행 중이에요. 잠시 후 다시 시도해 주세요.") from error
+        raise
 
 
 @router.put(
@@ -889,7 +965,7 @@ async def replace_project_classes(
     project_id: int,
     body: ProjectClassBulkUpdate,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: AdminWorkspaceDep,
 ) -> ProjectClassList:
     """Atomically reorder the catalog and every persisted class reference."""
     active_job_statement = (
@@ -897,7 +973,7 @@ async def replace_project_classes(
         .join(Dataset, Dataset.id == UploadJob.dataset_id)
         .where(
             Dataset.project_id == project_id,
-            Dataset.owner_id == current_user.id,
+            Dataset.workspace_id == current_workspace.id,
             UploadJob.state.in_(
                 ("queued", "running", "awaiting_class_resolution")
             ),
@@ -915,7 +991,7 @@ async def replace_project_classes(
         project = await _owned_project_or_404(
             session,
             project_id,
-            current_user.id,
+            current_workspace.id,
             for_update=True,
             nowait=True,
         )
@@ -951,7 +1027,6 @@ async def replace_project_classes(
             )
             .where(ProjectClass.project_id == project_id)
             .order_by(ProjectClass.class_id)
-            .with_for_update()
         )
     ).all()
     current_class_ids = [row.class_id for row in current_classes]
@@ -981,7 +1056,7 @@ async def replace_project_classes(
                 select(Dataset.id)
                 .where(
                     Dataset.project_id == project_id,
-                    Dataset.owner_id == current_user.id,
+                    Dataset.workspace_id == current_workspace.id,
                 )
                 .order_by(Dataset.id)
                 .with_for_update(nowait=True)
@@ -1002,7 +1077,7 @@ async def replace_project_classes(
     dataset_classes = (
         (
             await session.execute(
-                select(DatasetClass.dataset_id, DatasetClass.class_id)
+                select(DatasetClass.dataset_id, DatasetClass.class_id, DatasetClass.name)
                 .where(DatasetClass.dataset_id.in_(dataset_ids))
                 .order_by(DatasetClass.dataset_id, DatasetClass.class_id)
                 .with_for_update()
@@ -1043,7 +1118,6 @@ async def replace_project_classes(
         row.class_id: new_class_id
         for new_class_id, row in enumerate(body.classes)
     }
-    class_name_by_old_id = {row.class_id: row.name for row in body.classes}
     project_image_ids = select(Image.id).where(Image.dataset_id.in_(dataset_ids))
 
     try:
@@ -1051,6 +1125,14 @@ async def replace_project_classes(
             old_class_id != new_class_id
             for old_class_id, new_class_id in class_id_remap.items()
         ):
+            # Versions guard the catalog generation even for images without
+            # boxes. Match reclaim's stable image lock order for bulk changes.
+            await session.execute(select(Image.id).where(
+                Image.dataset_id.in_(dataset_ids),
+            ).order_by(Image.id).with_for_update(of=Image))
+            await session.execute(update(Image).where(
+                Image.dataset_id.in_(dataset_ids),
+            ).values(version=Image.version + 1).execution_options(synchronize_session=False))
             await session.execute(
                 update(Annotation)
                 .where(
@@ -1069,11 +1151,37 @@ async def replace_project_classes(
                 )
                 .execution_options(synchronize_session=False)
             )
-        if dataset_ids:
+        class_ids_by_dataset: dict[int, set[int]] = {}
+        for row in dataset_classes:
+            class_ids_by_dataset.setdefault(row.dataset_id, set()).add(row.class_id)
+        changed_dataset_ids = {
+            row.dataset_id for row in dataset_classes
+            if class_id_remap[row.class_id] != row.class_id
+            or body.classes[class_id_remap[row.class_id]].name != row.name
+        }
+        datasets_by_catalog: dict[frozenset[int], list[int]] = {}
+        for dataset_id, class_ids in class_ids_by_dataset.items():
+            if dataset_id in changed_dataset_ids:
+                datasets_by_catalog.setdefault(frozenset(class_ids), []).append(dataset_id)
+        for old_ids, matching_dataset_ids in datasets_by_catalog.items():
+            target_ids = {class_id_remap[class_id] for class_id in old_ids}
+            # Reuse occupied target keys and move remaining rows only into
+            # vacant keys. This avoids immediate-PK collisions for both dense
+            # swaps and sparse catalogs without DELETE + INSERT. Each dataset
+            # participates in one statement, so its catalog advances once.
+            row_targets = {class_id: class_id for class_id in sorted(old_ids & target_ids)}
+            row_targets.update(zip(sorted(old_ids - target_ids), sorted(target_ids - old_ids), strict=True))
             await session.execute(
-                delete(DatasetClass).where(
-                    DatasetClass.dataset_id.in_(dataset_ids)
+                update(DatasetClass)
+                .where(DatasetClass.dataset_id.in_(matching_dataset_ids))
+                .values(
+                    class_id=case(row_targets, value=DatasetClass.class_id, else_=DatasetClass.class_id),
+                    name=case(
+                        {old_id: body.classes[new_id].name for old_id, new_id in row_targets.items()},
+                        value=DatasetClass.class_id, else_=DatasetClass.name,
+                    ),
                 )
+                .execution_options(synchronize_session=False)
             )
         await session.execute(
             delete(ProjectClass).where(ProjectClass.project_id == project_id)
@@ -1089,17 +1197,9 @@ async def replace_project_classes(
                 for new_class_id, row in enumerate(body.classes)
             ]
         )
-        session.add_all(
-            [
-                DatasetClass(
-                    dataset_id=row.dataset_id,
-                    class_id=class_id_remap[row.class_id],
-                    name=class_name_by_old_id[row.class_id],
-                )
-                for row in dataset_classes
-            ]
-        )
         project.updated_at = func.now()
+        await session.flush()
+        catalog_versions = await _catalog_versions(session, project_id)
         await session.commit()
     except IntegrityError as error:
         await session.rollback()
@@ -1109,6 +1209,7 @@ async def replace_project_classes(
         ) from error
 
     return ProjectClassList(
+        catalog_versions=catalog_versions,
         classes=[
             ProjectClassRow(
                 class_id=new_class_id,
@@ -1125,13 +1226,13 @@ async def delete_project(
     project_id: int,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: AdminWorkspaceDep,
     confirm: Annotated[bool, Query()] = False,
 ) -> Response:
     project = await _owned_project_or_404(
         session,
         project_id,
-        current_user.id,
+        current_workspace.id,
         for_update=True,
     )
     datasets = list(
@@ -1140,7 +1241,7 @@ async def delete_project(
                 select(Dataset)
                 .where(
                     Dataset.project_id == project_id,
-                    Dataset.owner_id == current_user.id,
+                    Dataset.workspace_id == current_workspace.id,
                 )
                 .order_by(Dataset.id)
                 .with_for_update()
@@ -1155,7 +1256,7 @@ async def delete_project(
                     select(TrainingRun)
                     .where(
                         TrainingRun.dataset_id.in_(dataset_ids),
-                        TrainingRun.owner_id == current_user.id,
+                        TrainingRun.workspace_id == current_workspace.id,
                     )
                     .order_by(TrainingRun.id)
                     .with_for_update()
@@ -1257,7 +1358,7 @@ async def delete_project(
         if accounted_bytes:
             await decrease_bytes_used(
                 session,
-                current_user.id,
+                current_workspace.id,
                 accounted_bytes,
             )
         await session.commit()

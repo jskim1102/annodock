@@ -15,7 +15,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db import set_local_lock_timeout
-from app.models import Dataset, TrainingRun, UploadJob, UploadSession
+from app.models import Dataset, TrainingRun, UploadBatch, UploadJob, UploadSession
 from app.services.quota import decrease_bytes_used, path_tree_bytes
 from app.services.uploads import upload_ids_match
 from app.services.storage import (
@@ -312,6 +312,22 @@ async def sweep_upload_storage(
                     expired_upload_count = len(uploads)
                     for item in uploads:
                         item.state = "aborted"
+                    batch_ids = {
+                        item.upload_batch_id
+                        for item in uploads
+                        if item.upload_batch_id is not None
+                    }
+                    if batch_ids:
+                        # Expired file sessions make their open manifest
+                        # unusable. Commit both state changes together.
+                        await session.execute(
+                            update(UploadBatch)
+                            .where(
+                                UploadBatch.id.in_(batch_ids),
+                                UploadBatch.state == "open",
+                            )
+                            .values(state="aborted")
+                        )
                     if job is not None and job.state not in {"done", "failed"}:
                         job.state = "failed"
                         job.phase = "failed"
@@ -485,14 +501,14 @@ def _retention_candidates(
     keep_days: int,
     now: datetime,
 ) -> list[int]:
-    by_owner: dict[int, list[TrainingRun]] = defaultdict(list)
+    by_workspace: dict[int, list[TrainingRun]] = defaultdict(list)
     for run in runs:
-        by_owner[run.owner_id].append(run)
+        by_workspace[run.workspace_id].append(run)
 
     cutoff = now - timedelta(days=keep_days)
     candidates: list[int] = []
-    for owner_runs in by_owner.values():
-        owner_runs.sort(
+    for workspace_runs in by_workspace.values():
+        workspace_runs.sort(
             key=lambda run: (
                 run.finished_at
                 or run.created_at
@@ -501,7 +517,7 @@ def _retention_candidates(
             ),
             reverse=True,
         )
-        for index, run in enumerate(owner_runs):
+        for index, run in enumerate(workspace_runs):
             beyond_count = index >= keep_count
             expired = run.finished_at is not None and run.finished_at < cutoff
             if beyond_count or expired:
@@ -517,7 +533,7 @@ async def retain_run_artifacts(
     keep_days: int,
     now: datetime | None = None,
 ) -> RetentionResult:
-    """Delete terminal artifacts beyond either per-user retention limit."""
+    """Delete terminal artifacts beyond either per-workspace retention limit."""
 
     if keep_count < 0 or keep_days < 0:
         raise ValueError("retention limits must be non-negative")
@@ -572,7 +588,7 @@ async def retain_run_artifacts(
             )
             run.artifacts_deleted_at = observed_at
             run.artifact_bytes = 0
-            owner_id = run.owner_id
+            workspace_id = run.workspace_id
             try:
                 await session.commit()
             except BaseException as error:
@@ -588,7 +604,7 @@ async def retain_run_artifacts(
 
         await asyncio.to_thread(finalize_staged_deletions, [staged])
         async with session_factory() as session:
-            await decrease_bytes_used(session, owner_id, artifact_bytes)
+            await decrease_bytes_used(session, workspace_id, artifact_bytes)
             await session.commit()
         removed_runs += 1
         removed_bytes += artifact_bytes

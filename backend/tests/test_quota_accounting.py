@@ -15,7 +15,7 @@ from app.models import (
     Image,
     TrainingRun,
     UploadJob,
-    UserStorage,
+    WorkspaceStorage,
 )
 from app.services.collect import CollectedFile
 from app.services.ingest import ingest_collected
@@ -33,10 +33,10 @@ from tests.factories import image_with_media
 pytestmark = pytest.mark.asyncio
 
 
-async def _reset_usage(app, owner_id: int = 1) -> None:
+async def _reset_usage(app, workspace_id: int = 1) -> None:
     async with app.state.session_factory() as session:
         await session.execute(
-            delete(UserStorage).where(UserStorage.owner_id == owner_id)
+            delete(WorkspaceStorage).where(WorkspaceStorage.workspace_id == workspace_id)
         )
         await session.commit()
 
@@ -133,7 +133,7 @@ async def test_completed_run_counts_artifacts_but_not_original_hardlinks(
         original.parent.mkdir(parents=True, exist_ok=True)
         original.write_bytes(b"original-image-bytes")
         image = image_with_media(
-            owner_id=dataset.owner_id,
+            workspace_id=dataset.workspace_id,
             dataset_id=dataset_id,
             stem="sample",
             filename="sample.jpg",
@@ -152,7 +152,8 @@ async def test_completed_run_counts_artifacts_but_not_original_hardlinks(
         )
         session.add(image)
         run = TrainingRun(
-            owner_id=1,
+            workspace_id=dataset.workspace_id,
+            created_by=1,
             dataset_id=dataset_id,
             dataset_name=dataset.name,
             weights="yolo26n.pt",
@@ -169,7 +170,7 @@ async def test_completed_run_counts_artifacts_but_not_original_hardlinks(
         await session.flush()
         out_dir = storage_dir / "training-runs" / str(run.id)
         run.out_dir = storage_relative_path(storage_dir, out_dir)
-        session.add(UserStorage(owner_id=1, bytes_used=original.stat().st_size))
+        session.add(WorkspaceStorage(workspace_id=dataset.workspace_id, bytes_used=original.stat().st_size))
         await session.commit()
         run_id = run.id
         original_bytes = original.stat().st_size
@@ -215,7 +216,8 @@ async def test_canceled_run_collects_and_accounts_partial_artifacts(
     storage_dir = app.state.settings.storage_dir
     async with app.state.session_factory() as session:
         run = TrainingRun(
-            owner_id=1,
+            workspace_id=1,
+            created_by=1,
             dataset_id=None,
             dataset_name=f"test-quota-cancel-{uuid4().hex}",
             weights="yolo26n.pt",

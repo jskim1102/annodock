@@ -7,13 +7,14 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import func, select
 
+from app.deps import ensure_personal_workspace
 from app.models import (
     Dataset,
     Project,
     RunImage,
     RunMetric,
     TrainingRun,
-    UserStorage,
+    WorkspaceStorage,
 )
 from app.services.storage import storage_relative_path
 
@@ -24,19 +25,20 @@ pytestmark = pytest.mark.asyncio
 async def _persist_run(
     app,
     *,
-    owner_id: int,
+    user_id: int,
     state: str = "done",
 ) -> tuple[int, int, Path, int]:
     storage_dir = app.state.settings.storage_dir
     async with app.state.session_factory() as session:
+        workspace_id = (await ensure_personal_workspace(session, user_id)).id
         project = Project(
-            owner_id=owner_id,
+            workspace_id=workspace_id,
             name=f"test-run-delete-project-{uuid4().hex}",
         )
         session.add(project)
         await session.flush()
         dataset = Dataset(
-            owner_id=owner_id,
+            workspace_id=workspace_id,
             project_id=project.id,
             name=f"test-run-delete-dataset-{uuid4().hex}",
             status="ready",
@@ -45,7 +47,8 @@ async def _persist_run(
         session.add(dataset)
         await session.flush()
         run = TrainingRun(
-            owner_id=owner_id,
+            workspace_id=workspace_id,
+            created_by=user_id,
             dataset_id=dataset.id,
             dataset_name=dataset.name,
             weights="yolo26n.pt",
@@ -100,7 +103,7 @@ async def _persist_run(
                 lr={"lr0": 0.01},
             )
         )
-        session.add(UserStorage(owner_id=owner_id, bytes_used=artifact_bytes))
+        session.add(WorkspaceStorage(workspace_id=workspace_id, bytes_used=artifact_bytes))
         await session.commit()
         return run.id, dataset.id, run_directory, artifact_bytes
 
@@ -111,7 +114,7 @@ async def test_terminal_run_delete_requires_confirmation_then_removes_run_only(
 ) -> None:
     run_id, dataset_id, run_directory, artifact_bytes = await _persist_run(
         app,
-        owner_id=1,
+        user_id=1,
     )
 
     confirmation = await client.delete(f"/api/runs/{run_id}")
@@ -144,7 +147,7 @@ async def test_terminal_run_delete_requires_confirmation_then_removes_run_only(
         )
         assert image_count == 0
         assert metric_count == 0
-        usage = await session.get(UserStorage, 1)
+        usage = await session.get(WorkspaceStorage, 1)
         assert usage is not None
         assert usage.bytes_used == 0
     assert artifact_bytes > 0
@@ -158,7 +161,7 @@ async def test_active_run_cannot_be_deleted(
 ) -> None:
     run_id, dataset_id, run_directory, artifact_bytes = await _persist_run(
         app,
-        owner_id=1,
+        user_id=1,
         state=state,
     )
 
@@ -170,7 +173,7 @@ async def test_active_run_cannot_be_deleted(
     async with app.state.session_factory() as session:
         assert await session.get(TrainingRun, run_id) is not None
         assert await session.get(Dataset, dataset_id) is not None
-        usage = await session.get(UserStorage, 1)
+        usage = await session.get(WorkspaceStorage, 1)
         assert usage is not None
         assert usage.bytes_used == artifact_bytes
 
@@ -182,7 +185,7 @@ async def test_foreign_owner_cannot_delete_run(
 ) -> None:
     run_id, _dataset_id, run_directory, _artifact_bytes = await _persist_run(
         app,
-        owner_id=101,
+        user_id=101,
     )
 
     response = await client.delete(

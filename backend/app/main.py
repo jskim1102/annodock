@@ -17,8 +17,10 @@ from app.db import create_engine, create_session_factory, is_lock_not_available
 from app.routers.admin import router as admin_router
 from app.services.admin import dispose_auth_engine
 from app.routers.annotations import router as annotations_router
+from app.routers.assignments import router as assignments_router
 from app.routers.datasets import router as datasets_router
 from app.routers.images import router as images_router
+from app.routers.invites import router as invites_router
 from app.routers.jobs import router as jobs_router
 from app.routers.models import router as models_router
 from app.routers.projects import router as projects_router
@@ -27,6 +29,7 @@ from app.routers.storage import router as storage_router
 from app.routers.training import router as training_router
 from app.routers.training import runs_router as training_runs_router
 from app.routers.uploads import router as uploads_router
+from app.routers.workspaces import router as workspaces_router
 from app.services.reaper import run_reaper_loop
 from app.services.jobs import recover_upload_jobs
 
@@ -124,11 +127,14 @@ def create_app(
         return {"status": "ok"}
 
     application.include_router(admin_router)
+    application.include_router(workspaces_router)
+    application.include_router(invites_router)
     application.include_router(storage_router)
     application.include_router(datasets_router)
     application.include_router(projects_router)
     application.include_router(images_router)
     application.include_router(annotations_router)
+    application.include_router(assignments_router)
     application.include_router(uploads_router)
     application.include_router(jobs_router)
     application.include_router(runs_router)

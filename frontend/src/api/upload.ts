@@ -1,10 +1,12 @@
 import {
   apiFetch,
+  captureWorkspaceId,
   type DatasetRow,
   type Job,
   requestJson,
   responseOrThrow,
 } from "./client";
+import { getWorkspaceKind } from "../store/workspace";
 import {
   readStoredJson,
   removeStoredValue,
@@ -60,6 +62,7 @@ interface UploadTargetResumeRecord {
 }
 
 export interface PreparedUploadOperation {
+  workspaceId: number | null;
   datasetId: number;
   batchId: string;
   knownJobId: number | null;
@@ -79,6 +82,7 @@ export interface TransferredUploadBatch {
 }
 
 export interface PreparedUploadBatch {
+  workspaceId: number | null;
   datasetId: number;
   uploads: PreparedUpload[];
   totalBytes: number;
@@ -185,11 +189,13 @@ function selectionFingerprint(files: readonly CollectedFile[]): string {
 function uploadTargetResumeKey(
   projectId: number,
   collected: readonly CollectedFile[],
+  workspaceId: number | null,
 ) {
   const fingerprint = selectionFingerprint(uniqueManifestFiles(collected));
   return {
     fingerprint,
-    storageKey: `upload-target:${projectId}:${fingerprint}`,
+    storageKey: `upload-target:${workspaceId ?? "personal"}:${projectId}:${fingerprint}`,
+    legacyKey: `upload-target:${projectId}:${fingerprint}`,
   };
 }
 
@@ -210,9 +216,12 @@ export function resumeUploadDatasetTarget(
   datasetName: string | null,
   collected: readonly CollectedFile[],
   claimedDatasetIds: readonly number[] = [],
+  workspaceId: number | null = captureWorkspaceId(),
 ): number | null {
-  const { fingerprint, storageKey } = uploadTargetResumeKey(projectId, collected);
-  const record = parseUploadTargetResume(readStoredJson(storageKey));
+  const { fingerprint, storageKey, legacyKey } = uploadTargetResumeKey(projectId, collected, workspaceId);
+  const scoped = parseUploadTargetResume(readStoredJson(storageKey));
+  const record = scoped ?? (getWorkspaceKind(workspaceId) === "personal"
+    ? parseUploadTargetResume(readStoredJson(legacyKey)) : null);
   if (
     record === null
     || record.projectId !== projectId
@@ -225,6 +234,7 @@ export function resumeUploadDatasetTarget(
     // must never be assigned to two units of the same merge operation.
     || claimedDatasetIds.includes(record.datasetId)
   ) return null;
+  if (!scoped && writeStoredJson(storageKey, record)) removeStoredValue(legacyKey);
   return record.datasetId;
 }
 
@@ -233,8 +243,9 @@ export function rememberUploadDatasetTarget(
   datasetName: string,
   datasetId: number,
   collected: readonly CollectedFile[],
+  workspaceId: number | null = captureWorkspaceId(),
 ): void {
-  const { fingerprint, storageKey } = uploadTargetResumeKey(projectId, collected);
+  const { fingerprint, storageKey } = uploadTargetResumeKey(projectId, collected, workspaceId);
   writeStoredJson(storageKey, {
     datasetId,
     projectId,
@@ -248,8 +259,9 @@ export function clearUploadDatasetTarget(
   datasetName: string | null,
   datasetId: number,
   collected: readonly CollectedFile[],
+  workspaceId: number | null = captureWorkspaceId(),
 ): void {
-  const { storageKey } = uploadTargetResumeKey(projectId, collected);
+  const { storageKey } = uploadTargetResumeKey(projectId, collected, workspaceId);
   const record = parseUploadTargetResume(readStoredJson(storageKey));
   if (
     record?.datasetId === datasetId
@@ -408,9 +420,55 @@ function expectedExtractedSize(item: CollectedFile) {
   return item.kind === "zip" ? item.file.size * 4 : item.file.size;
 }
 
+function isExpiredUploadError(error: unknown): boolean {
+  if (
+    !error || typeof error !== "object"
+    || !("status" in error) || error.status !== 409
+    || !("detail" in error)
+  ) return false;
+  const detail = error.detail;
+  return Boolean(
+    detail && typeof detail === "object" && "code" in detail
+    && (detail.code === "upload_batch_aborted" || detail.code === "upload_session_aborted"),
+  );
+}
+
+export function isResumableUploadError(error: unknown): boolean {
+  if (error instanceof TypeError) return true; // fetch transport failures
+  if (!error || typeof error !== "object" || !("status" in error)) return false;
+  const status = error.status;
+  return typeof status === "number" && (
+    status === 0 || status === 408 || status === 429
+    || (status >= 500 && status !== 507)
+  );
+}
+
+export async function withUploadBatchRestart<T>(
+  datasetId: () => number,
+  upload: () => Promise<T>,
+  onRestart: () => void,
+): Promise<T> {
+  try {
+    return await upload();
+  } catch (error) {
+    if (!isExpiredUploadError(error)) throw error;
+    // Resolve the target after the attempt: a missing saved draft may have
+    // been replaced. Its dataset-target checkpoint must survive expiration.
+    const targetId = datasetId();
+    manifestMemory.delete(targetId);
+    activeOperations.delete(targetId);
+    removeStoredValue(datasetResumeKey(targetId));
+    onRestart();
+  }
+  // One retry covers preparation, transfer and completion. Keep this outside
+  // the catch so a second failure propagates without another reset.
+  return upload();
+}
+
 export async function beginUploadBatch(
   datasetId: number,
   collected: readonly CollectedFile[],
+  workspaceId: number | null = captureWorkspaceId(),
 ): Promise<PreparedUploadOperation> {
   const accepted = uniqueManifestFiles(collected);
   if (accepted.length === 0) {
@@ -446,6 +504,7 @@ export async function beginUploadBatch(
   const response = await requestJson<UploadBatchResponse>(
     `/api/datasets/${datasetId}/upload-batches/${resume.batchId}`,
     {
+      workspaceId,
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -460,6 +519,7 @@ export async function beginUploadBatch(
     throw new UploadError(502, "업로드 배치 식별자가 서버 응답과 다릅니다.");
   }
   const operation = {
+    workspaceId,
     datasetId,
     batchId: response.batch_id,
     knownJobId: response.job_id,
@@ -469,7 +529,7 @@ export async function beginUploadBatch(
   return operation;
 }
 
-async function preflight(datasetId: number, files: readonly CollectedFile[]) {
+async function preflight(datasetId: number, files: readonly CollectedFile[], workspaceId: number | null) {
   const totalSize = files.reduce((sum, item) => sum + item.file.size, 0);
   const largestFileSize = files.reduce(
     (largest, item) => Math.max(largest, item.file.size),
@@ -478,6 +538,7 @@ async function preflight(datasetId: number, files: readonly CollectedFile[]) {
   await requestJson<void>(
     `/api/datasets/${datasetId}/upload-batches/preflight`,
     {
+      workspaceId,
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -505,10 +566,12 @@ async function createUploadBatch(
   datasetId: number,
   items: readonly CollectedFile[],
   batchId?: string,
+  workspaceId: number | null = captureWorkspaceId(),
 ) {
   return requestJson<{ uploads: UploadCreated[] }>(
     `/api/datasets/${datasetId}/uploads/batch`,
     {
+      workspaceId,
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -526,13 +589,13 @@ async function createUploadBatch(
   );
 }
 
-async function putChunk(uploadId: number, index: number, chunk: Blob) {
+async function putChunk(uploadId: number, index: number, chunk: Blob, workspaceId: number | null) {
   let lastError: unknown;
   for (let attempt = 1; attempt <= MAX_CHUNK_ATTEMPTS; attempt += 1) {
     try {
       await responseOrThrow(await apiFetch(
         `/api/uploads/${uploadId}/chunks/${index}`,
-        { method: "PUT", body: chunk },
+        { method: "PUT", body: chunk, workspaceId },
       ));
       return;
     } catch (error) {
@@ -604,6 +667,7 @@ function* pendingChunkBatches(
 async function putChunkBatch(
   datasetId: number,
   chunks: readonly PendingChunk[],
+  workspaceId: number | null,
 ) {
   // Older resumable sessions can have a chunk size above the new envelope.
   // Keep their established single-chunk transport instead of invalidating the
@@ -614,6 +678,7 @@ async function putChunkBatch(
       chunk.upload.session.upload_id,
       chunk.chunkNumber,
       chunk.upload.item.file.slice(chunk.start, chunk.end),
+      workspaceId,
     );
     return;
   }
@@ -638,7 +703,7 @@ async function putChunkBatch(
     try {
       await responseOrThrow(await apiFetch(
         `/api/datasets/${datasetId}/uploads/chunks/batch`,
-        { method: "POST", body },
+        { method: "POST", body, workspaceId },
       ));
       return;
     } catch (error) {
@@ -658,8 +723,10 @@ async function putChunkBatch(
 export function createDatasetForUpload(
   name: string,
   projectId: number,
+  workspaceId: number | null = captureWorkspaceId(),
 ): Promise<DatasetRow> {
   return requestJson("/api/datasets", {
+    workspaceId,
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name, project_id: projectId, upload_draft: true }),
@@ -681,7 +748,7 @@ async function prepareManifestUploadBatch(
   const uploads: PreparedUpload[] = [];
   for (let offset = 0; offset < accepted.length; offset += MAX_SESSION_BATCH_SIZE) {
     const items = accepted.slice(offset, offset + MAX_SESSION_BATCH_SIZE);
-    const created = await createUploadBatch(datasetId, items, operation.batchId);
+    const created = await createUploadBatch(datasetId, items, operation.batchId, operation.workspaceId);
     if (created.uploads.length !== items.length) {
       throw new UploadError(502, "업로드 준비 응답의 파일 수가 올바르지 않습니다.");
     }
@@ -708,6 +775,7 @@ async function prepareManifestUploadBatch(
     });
   }
   return {
+    workspaceId: operation.workspaceId,
     datasetId,
     uploads,
     totalBytes: accepted.reduce((sum, item) => sum + item.file.size, 0),
@@ -721,11 +789,12 @@ async function prepareLegacyUploadBatch(
   datasetId: number,
   collected: readonly CollectedFile[],
   onPreparationProgress?: (progress: UploadPreparationProgress) => void,
+  workspaceId: number | null = captureWorkspaceId(),
 ): Promise<PreparedUploadBatch> {
   const accepted = collected.filter((item) => item.kind !== "other");
   if (accepted.length === 0) throw new UploadError(422, "업로드할 파일이 없습니다.");
   onPreparationProgress?.({ preparedFiles: 0, totalFiles: accepted.length });
-  await preflight(datasetId, accepted);
+  await preflight(datasetId, accepted, workspaceId);
   const resumeKey = datasetResumeKey(datasetId);
   const resumeRecord = readDatasetResume(resumeKey);
   const prepared: Array<PreparedUpload | undefined> = new Array(accepted.length);
@@ -774,6 +843,7 @@ async function prepareLegacyUploadBatch(
         try {
           session = await requestJson<UploadSession>(
             `/api/uploads/${resume.uploadId}`,
+            { workspaceId },
           );
           if (session.size !== candidate.item.file.size) session = null;
         } catch (error) {
@@ -832,6 +902,8 @@ async function prepareLegacyUploadBatch(
     const created = await createUploadBatch(
       datasetId,
       sessionBatch.map((candidate) => candidate.item),
+      undefined,
+      workspaceId,
     );
     if (created.uploads.length !== sessionBatch.length) {
       throw new UploadError(502, "업로드 준비 응답의 파일 수가 올바르지 않습니다.");
@@ -868,6 +940,7 @@ async function prepareLegacyUploadBatch(
   });
 
   return {
+    workspaceId,
     datasetId,
     uploads,
     totalBytes: accepted.reduce((sum, item) => sum + item.file.size, 0),
@@ -969,7 +1042,7 @@ export async function transferUploadBatch(
     pendingChunkBatches(openUploads),
     MAX_CONCURRENT_TRANSFERS,
     async (chunks) => {
-      await putChunkBatch(batch.datasetId, chunks);
+      await putChunkBatch(batch.datasetId, chunks, batch.workspaceId);
       chunks.forEach((chunk) => {
         const received = chunk.upload.session.received;
         if (!received.includes(chunk.chunkNumber)) {
@@ -1005,6 +1078,7 @@ export async function completeUploadBatches(
   const created = await requestJson<{ job_id: number }>(
     `/api/datasets/${batch.datasetId}/upload-batches/complete`,
     {
+      workspaceId: batch.workspaceId,
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1029,7 +1103,7 @@ export async function completeUploadBatch(
 ): Promise<number> {
   const created = await requestJson<{ job_id: number }>(
     `/api/datasets/${operation.datasetId}/upload-batches/${operation.batchId}/complete`,
-    { method: "POST" },
+    { method: "POST", workspaceId: operation.workspaceId },
   );
   operation.knownJobId = created.job_id;
   return created.job_id;
@@ -1055,9 +1129,10 @@ export function clearUploadBatchResume(
 export async function pollUploadJob(
   jobId: number,
   onJob: (job: Job) => void,
+  workspaceId: number | null = captureWorkspaceId(),
 ): Promise<Job> {
   while (true) {
-    const job = await requestJson<Job>(`/api/jobs/${jobId}`);
+    const job = await requestJson<Job>(`/api/jobs/${jobId}`, { workspaceId });
     onJob(job);
     if (
       job.state === "awaiting_class_resolution"

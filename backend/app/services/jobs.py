@@ -6,9 +6,10 @@ import asyncio
 from collections.abc import Callable
 
 from fastapi import FastAPI
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.db import is_retryable_lock_error
 from app.models import Dataset, ImportIssue, UploadJob
 
 
@@ -74,7 +75,7 @@ async def fail_job(
                     (
                         await session.scalars(
                             select(Dataset).where(
-                                Dataset.owner_id == dataset.owner_id,
+                                Dataset.workspace_id == dataset.workspace_id,
                                 Dataset.upload_group_id
                                 == dataset.upload_group_id,
                             )
@@ -93,6 +94,27 @@ async def fail_job(
             )
         )
         await session.commit()
+
+
+async def requeue_upload_after_lock_failure(
+    session_factory: async_sessionmaker[AsyncSession], job_id: int, detail: str,
+) -> None:
+    """Persist a bounded retry budget so a process restart cannot reset it."""
+    async with session_factory() as session:
+        job = await session.scalar(select(UploadJob).where(UploadJob.id == job_id).with_for_update())
+        if job is None or job.state not in {"queued", "running"}:
+            return
+        retries = await session.scalar(select(func.count(ImportIssue.id)).where(
+            ImportIssue.job_id == job_id, ImportIssue.kind == "upload_lock_retry",
+        ))
+        if (retries or 0) < 3:
+            job.state = "queued"
+            job.phase = "queued"
+            session.add(ImportIssue(job_id=job_id, kind="upload_lock_retry", path="",
+                detail=f"잠금 오류로 업로드를 다시 처리합니다 ({(retries or 0) + 1}/3): {detail}"[:2000]))
+            await session.commit()
+            return
+    await fail_job(session_factory, job_id, f"잠금 오류 재시도 3회 초과. 업로드 파일을 보존했습니다: {detail}")
 
 
 async def claim_upload_job(
@@ -136,15 +158,24 @@ def enqueue_upload_batch_job(
         for task in application.state.job_tasks
     ):
         return
-    task = asyncio.create_task(
-        run_upload_batch_job(
-            application.state.settings,
-            application.state.session_factory,
-            job_id,
-            upload_ids,
-        ),
-        name=task_name,
-    )
+    async def dispatch() -> None:
+        # Keep the retry chain in the existing tracked task: duplicate enqueue
+        # remains harmless and shutdown cancels the entire chain together.
+        while True:
+            try:
+                await run_upload_batch_job(
+                    application.state.settings, application.state.session_factory, job_id, upload_ids,
+                )
+                return
+            except Exception as error:
+                if not is_retryable_lock_error(error):
+                    raise
+                async with application.state.session_factory() as session:
+                    state = await session.scalar(select(UploadJob.state).where(UploadJob.id == job_id))
+                if state != "queued":
+                    return
+
+    task = asyncio.create_task(dispatch(), name=task_name)
     application.state.job_tasks.add(task)
     task.add_done_callback(application.state.job_tasks.discard)
 

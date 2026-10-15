@@ -30,6 +30,9 @@ from app.services.storage import (
 )
 
 
+EXPIRED_UPLOAD_MESSAGE = "이전 업로드 기록이 만료되었습니다. 새로 시작합니다."
+
+
 def upload_directory(settings: Settings, upload_id: int) -> Path:
     return storage_root(settings.storage_dir) / "uploads" / str(upload_id)
 
@@ -137,7 +140,10 @@ def require_open(upload: UploadSession) -> None:
     if upload.state == "aborted":
         raise HTTPException(
             status_code=409,
-            detail="중단된 업로드입니다. 처음부터 다시 시작하세요.",
+            detail={
+                "code": "upload_session_aborted",
+                "message": EXPIRED_UPLOAD_MESSAGE,
+            },
         )
     if upload.state != "open":
         raise HTTPException(status_code=409, detail="이미 완료된 업로드입니다.")
@@ -594,6 +600,14 @@ async def complete_upload_manifest(
     )
     if existing_job is not None:
         return existing_job
+    if upload_batch.state == "aborted":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "upload_batch_aborted",
+                "message": EXPIRED_UPLOAD_MESSAGE,
+            },
+        )
     if upload_batch.state != "open":
         raise HTTPException(status_code=409, detail="이미 봉인된 업로드 배치입니다.")
 

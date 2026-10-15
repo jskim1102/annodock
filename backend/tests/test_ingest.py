@@ -11,6 +11,7 @@ import httpx
 import pytest
 from PIL import Image as PillowImage
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import OperationalError
 
 from app.models import (
     Annotation,
@@ -22,7 +23,7 @@ from app.models import (
     ProjectClass,
     UploadJob,
     UploadSession,
-    UserStorage,
+    WorkspaceStorage,
 )
 from app.services.collect import CollectedFile
 from app.services.ingest import ingest_collected, run_upload_batch_job
@@ -157,6 +158,14 @@ async def test_ingest_matches_stems_reports_issues_and_updates_progress(
             ).all()
         )
         assert len(stored_images) == 2
+        assert {image.filename: image.label_status for image in stored_images} == {
+            "a.jpg": "labeled", "b.jpg": "unlabeled",
+        }
+        for image in stored_images:
+            assert (image.assignee_id, image.assigned_at, image.labeled_by,
+                    image.labeled_at, image.version, image.is_modified) == (
+                None, None, None, None, 0, False,
+            )
         assert all(image.media_object_id is not None for image in stored_images)
         assert len({image.media_object_id for image in stored_images}) == 2
         media_objects = list(
@@ -169,7 +178,7 @@ async def test_ingest_matches_stems_reports_issues_and_updates_progress(
             ).all()
         )
         assert len(media_objects) == 2
-        usage = await session.get(UserStorage, dataset.owner_id)
+        usage = await session.get(WorkspaceStorage, dataset.workspace_id)
         assert usage is not None
         assert usage.bytes_used == sum(
             item.original_bytes + item.display_bytes + item.thumb_bytes
@@ -223,7 +232,12 @@ async def test_ingest_matches_stems_reports_issues_and_updates_progress(
     sibling_classes = await client.get(
         f"/api/datasets/{sibling.json()['id']}/classes"
     )
+    async with app.state.session_factory() as session:
+        catalog_version = await session.scalar(select(Dataset.class_catalog_version).where(
+            Dataset.id == sibling.json()["id"],
+        ))
     assert sibling_classes.json() == {
+        "catalog_version": catalog_version,
         "classes": [{"class_id": 0, "name": "person"}]
     }
 
@@ -288,6 +302,15 @@ async def test_empty_yolo_label_is_separate_from_missing_label(
         assert {
             image.filename: image.has_label_source for image in images
         } == {"empty.jpg": True, "missing.jpg": False}
+        assert {image.filename: image.label_status for image in images} == {
+            "empty.jpg": "labeled", "missing.jpg": "unlabeled",
+        }
+        for image in images:
+            assert image.box_count == 0
+            assert (image.assignee_id, image.assigned_at, image.labeled_by,
+                    image.labeled_at, image.version, image.is_modified) == (
+                None, None, None, None, 0, False,
+            )
         assert Counter(issue.kind for issue in issues) == {
             "image_without_label": 1,
             "empty_label": 1,
@@ -1167,3 +1190,211 @@ async def test_checkpoint_resume_keeps_collision_suffixes_stable(
             ).all()
         )
     assert stems == ["same", "same (1)", "z-later"]
+
+
+@pytest.mark.parametrize("sqlstate", ["55P03", "40P01"], ids=["lock-timeout", "deadlock"])
+@pytest.mark.parametrize("failure_stage", ["format-detection", "checkpoint"])
+async def test_retryable_ingest_database_failure_preserves_source_and_resumes(
+    client, app, monkeypatch, sqlstate, failure_stage,
+):
+    from app.services import ingest as ingest_service, jobs as jobs_service
+    from app.services.uploads import assembled_upload_path, upload_directory
+    from tests.test_upload_gc import _completed_image_upload
+
+    created = await client.post("/api/datasets", json={"name": f"test-ingest-retry-{uuid4().hex}"})
+    assert created.status_code == 201, created.text
+    dataset_id = created.json()["id"]
+    upload_id, job_id = await _completed_image_upload(client, dataset_id)
+    path = upload_directory(app.state.settings, upload_id)
+    original_bytes = (path / "chunks" / "0.part").read_bytes()
+    async with app.state.session_factory() as session:
+        original_catalog = await session.scalar(select(Dataset.class_catalog_version).where(Dataset.id == dataset_id))
+
+    original_ingest, original_detect = ingest_service.ingest_collected, ingest_service.detect_formats
+    attempts = 0
+
+    def raise_database_failure():
+        nonlocal attempts
+        attempts += 1
+        cause = RuntimeError(f"forced retryable SQLSTATE {sqlstate}")
+        cause.sqlstate = sqlstate
+        raise OperationalError("fixture ingest transaction", {}, cause)
+
+    async def ingest_until_checkpoint(*args, **kwargs):
+        return await original_ingest(*args, **{**kwargs, "before_commit": raise_database_failure})
+
+    async def fail_detection(*_args, **_kwargs):
+        raise_database_failure()
+
+    if failure_stage == "checkpoint":
+        monkeypatch.setattr(ingest_service, "ingest_collected", ingest_until_checkpoint)
+    else:
+        monkeypatch.setattr(ingest_service, "detect_formats", fail_detection)
+    raised = None
+    try:
+        await run_upload_batch_job(app.state.settings, app.state.session_factory, job_id, [upload_id])
+    except OperationalError as error:
+        raised = error
+    assert attempts == 1
+    assert path.is_dir(), "retryable database errors must retain the immutable upload source"
+    assert assembled_upload_path(app.state.settings, upload_id).read_bytes() == original_bytes
+    assert raised is not None and raised.orig.sqlstate == sqlstate
+    async with app.state.session_factory() as session:
+        job = await session.get(UploadJob, job_id)
+        dataset = await session.get(Dataset, dataset_id)
+        upload = await session.get(UploadSession, upload_id)
+        assert job.state in {"running", "queued"} and job.failed == 0 and job.ingest_cursor == 0
+        assert dataset.status != "failed" and dataset.image_count == 0
+        assert dataset.class_catalog_version == original_catalog
+        assert upload.state == "complete" and job.upload_ids == [upload_id]
+        assert await session.scalar(select(func.count(Image.id)).where(Image.dataset_id == dataset_id)) == 0
+        assert await session.scalar(select(func.count(ImportIssue.id)).where(
+            ImportIssue.job_id == job_id, ImportIssue.kind == "rejected_file",
+        )) == 0
+
+    monkeypatch.setattr(ingest_service, "ingest_collected", original_ingest)
+    monkeypatch.setattr(ingest_service, "detect_formats", original_detect)
+    enqueued = []
+    monkeypatch.setattr(jobs_service, "enqueue_upload_batch_job",
+                        lambda _app, target_job, upload_ids: enqueued.append((target_job, list(upload_ids))))
+    recovered = await jobs_service.recover_upload_jobs(app)
+    assert job_id in recovered and (job_id, [upload_id]) in enqueued
+    await run_upload_batch_job(app.state.settings, app.state.session_factory, job_id, [upload_id])
+    async with app.state.session_factory() as session:
+        job = await session.get(UploadJob, job_id)
+        dataset = await session.get(Dataset, dataset_id)
+        images = (await session.scalars(select(Image).where(Image.dataset_id == dataset_id))).all()
+        assert job.state == "done" and job.failed == 0 and job.ingest_cursor == 1
+        assert dataset.status == "ready" and dataset.image_count == 1
+        assert len(images) == 1
+        assert contained_storage_path(app.state.settings.storage_dir, images[0].file_path).read_bytes() == original_bytes
+    assert not path.exists(), "successful retry reclaims the temporary upload only after ingestion"
+
+
+@pytest.mark.parametrize("sqlstate", ["55P03", "40P01"], ids=["lock-timeout", "deadlock"])
+@pytest.mark.parametrize("exhaust_retries", [False, True], ids=["retry-to-done", "retry-limit"])
+async def test_enqueued_upload_retries_lock_failures_and_releases_mutation_guards(
+    client, app, monkeypatch, sqlstate, exhaust_retries,
+):
+    from app.services import ingest as ingest_service, jobs as jobs_service
+    from app.services.uploads import assembled_upload_path, upload_directory
+    from tests.test_annotation_version import _finish_tasks
+    from tests.test_dataset_merge import create_ready_dataset
+    from tests.test_upload_gc import _completed_image_upload
+
+    project = await client.post("/api/projects", json={
+        "name": f"test-enqueued-retry-project-{uuid4().hex}",
+        "classes": [{"name": "person", "color": "#123456"}, {"name": "vehicle", "color": "#654321"}],
+    })
+    assert project.status_code == 201, project.text
+    project_id = project.json()["id"]
+    dataset_ids = [await create_ready_dataset(
+        client, app, project_id=project_id, suffix=f"retry-{index}",
+        classes={0: "person", 1: "vehicle"}, annotation_class_id=0,
+        content=f"existing-{index}".encode(),
+    ) for index in range(2)]
+    dataset_id = dataset_ids[0]
+    upload_id, job_id = await _completed_image_upload(client, dataset_id)
+    path = upload_directory(app.state.settings, upload_id)
+    original_bytes = (path / "chunks" / "0.part").read_bytes()
+    real_ingest, real_run = ingest_service.ingest_collected, ingest_service.run_upload_batch_job
+    attempts = 0
+    preserved_failures = []
+
+    def at_checkpoint():
+        nonlocal attempts
+        attempts += 1
+        if exhaust_retries or attempts == 1:
+            cause = RuntimeError(f"forced checkpoint SQLSTATE {sqlstate}")
+            cause.sqlstate = sqlstate
+            raise OperationalError("fixture durable upload checkpoint", {}, cause)
+
+    async def ingest_with_checkpoint(*args, **kwargs):
+        return await real_ingest(*args, **{**kwargs, "before_commit": at_checkpoint})
+
+    async def observe_run_failure(*args, **kwargs):
+        try:
+            return await real_run(*args, **kwargs)
+        except OperationalError:
+            async with app.state.session_factory() as session:
+                job = await session.get(UploadJob, job_id)
+                dataset = await session.get(Dataset, dataset_id)
+                images = await session.scalar(select(func.count(Image.id)).where(Image.dataset_id == dataset_id))
+                preserved_failures.append((job.state, job.failed, job.ingest_cursor, dataset.image_count, images,
+                                           assembled_upload_path(app.state.settings, upload_id).read_bytes()))
+            raise
+
+    monkeypatch.setattr(ingest_service, "ingest_collected", ingest_with_checkpoint)
+    monkeypatch.setattr(ingest_service, "run_upload_batch_job", observe_run_failure)
+    # Exercise the actual dispatcher, including its duplicate-task protection.
+    jobs_service.enqueue_upload_batch_job(app, job_id, [upload_id])
+    jobs_service.enqueue_upload_batch_job(app, job_id, [upload_id])
+
+    async def await_terminal_job():
+        while True:
+            tasks = list(app.state.job_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            # Done callbacks may create the next task after the old task exits.
+            await asyncio.sleep(0)
+            async with app.state.session_factory() as session:
+                job = await session.get(UploadJob, job_id)
+                if job.state in ("done", "failed") and not app.state.job_tasks:
+                    return job.state
+
+    try:
+        terminal = await asyncio.wait_for(await_terminal_job(), timeout=10)
+    finally:
+        await _finish_tasks(list(app.state.job_tasks))
+    assert attempts == (4 if exhaust_retries else 2)
+    assert len(preserved_failures) == (4 if exhaust_retries else 1)
+    queued = ("queued", 0, 0, 1, 1, original_bytes)
+    expected_failures = ([queued] * 3 + [("failed", 1, 0, 1, 1, original_bytes)]
+                         if exhaust_retries else [queued])
+    assert preserved_failures == expected_failures
+    assert terminal == ("failed" if exhaust_retries else "done")
+    async with app.state.session_factory() as session:
+        job = await session.get(UploadJob, job_id)
+        dataset = await session.get(Dataset, dataset_id)
+        issues = list(await session.scalars(select(ImportIssue).where(ImportIssue.job_id == job_id)))
+        retries = [issue for issue in issues if issue.kind == "upload_lock_retry"]
+        failures = [issue for issue in issues if issue.kind == "rejected_file"]
+        assert len(retries) == (3 if exhaust_retries else 1)
+        assert len(failures) == int(exhaust_retries)
+        assert all(issue.detail for issue in issues)
+        assert job.upload_ids == [upload_id]
+        assert job.failed == int(exhaust_retries)
+        assert job.ingest_cursor == (0 if exhaust_retries else 1)
+        assert dataset.status == "ready" and dataset.image_count == (1 if exhaust_retries else 2)
+        images = list(await session.scalars(select(Image).where(Image.dataset_id == dataset_id)))
+        assert len(images) == dataset.image_count
+        if exhaust_retries:
+            assert assembled_upload_path(app.state.settings, upload_id).read_bytes() == original_bytes
+        else:
+            assert not path.exists()
+            uploaded = [image for image in images if image.filename == "source.jpg"]
+            assert len(uploaded) == 1
+            assert contained_storage_path(app.state.settings.storage_dir, uploaded[0].file_path).read_bytes() == original_bytes
+
+    issue_response = await client.get(f"/api/datasets/{dataset_id}/issues?offset=0&limit=100")
+    assert issue_response.status_code == 200, issue_response.text
+    assert sum(item["kind"] == "upload_lock_retry" for item in issue_response.json()["items"]) == (
+        3 if exhaust_retries else 1
+    )
+
+    # Neither a successful retry nor an exhausted retry may leave the durable
+    # active-job guard stuck, even though a failed attempt retains its input.
+    detail = await client.get(f"/api/projects/{project_id}")
+    assert detail.status_code == 200, detail.text
+    reordered = await client.put(f"/api/projects/{project_id}/classes", json={
+        "expected_updated_at": detail.json()["updated_at"],
+        "classes": [{"class_id": 1, "name": "vehicle", "color": "#654321"},
+                    {"class_id": 0, "name": "person", "color": "#123456"}],
+    })
+    assert reordered.status_code == 200, reordered.text
+    merged = await client.post("/api/datasets/merge", json={
+        "name": f"test-enqueued-retry-merge-{uuid4().hex}", "dataset_ids": dataset_ids,
+    })
+    assert merged.status_code == 201, merged.text
+    if exhaust_retries:
+        assert assembled_upload_path(app.state.settings, upload_id).read_bytes() == original_bytes

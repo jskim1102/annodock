@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.class_colors import class_color
 from app.config import Settings
-from app.db import is_lock_not_available
+from app.db import is_retryable_lock_error
 from app.models import (
     Annotation,
     Dataset,
@@ -54,7 +54,7 @@ from app.services.format_detect import (
     detect_formats,
     find_voc_annotation_documents,
 )
-from app.services.jobs import claim_upload_job, fail_job, transition_job
+from app.services.jobs import claim_upload_job, fail_job, requeue_upload_after_lock_failure, transition_job
 from app.services.image_names import (
     PairKey,
     available_pair_key,
@@ -356,7 +356,7 @@ async def ingest_collected(
             else None
         )
     except Exception as error:
-        if not is_lock_not_available(error):
+        if not is_retryable_lock_error(error):
             await fail_job(session_factory, job_id, str(error))
         raise
 
@@ -394,10 +394,10 @@ async def ingest_collected(
             )
             if job is None:
                 raise LookupError(f"upload job {job_id} does not exist")
+            # Catalog triggers also update sibling datasets. Serialize on the
+            # project before holding any dataset row, including during planning.
             dataset = await session.scalar(
-                select(Dataset)
-                .where(Dataset.id == job.dataset_id)
-                .with_for_update()
+                select(Dataset).where(Dataset.id == job.dataset_id)
             )
             if dataset is None:
                 raise LookupError(f"dataset {job.dataset_id} does not exist")
@@ -411,23 +411,32 @@ async def ingest_collected(
                     f"project {dataset.project_id} does not exist"
                 )
 
+            dataset = await session.scalar(
+                select(Dataset)
+                .where(Dataset.id == job.dataset_id, Dataset.project_id == project.id)
+                .execution_options(populate_existing=True)
+            )
+            if dataset is None:
+                raise LookupError("upload dataset moved or disappeared")
+
+            parts_query = select(Dataset).where(
+                Dataset.project_id == project.id,
+                Dataset.workspace_id == dataset.workspace_id,
+            )
             if dataset.upload_group_id is None:
-                upload_parts = [dataset]
+                parts_query = parts_query.where(Dataset.id == dataset.id)
             else:
-                upload_parts = list(
-                    (
-                        await session.scalars(
-                            select(Dataset)
-                            .where(
-                                Dataset.owner_id == dataset.owner_id,
-                                Dataset.upload_group_id
-                                == dataset.upload_group_id,
-                            )
-                            .order_by(Dataset.upload_part_index)
-                            .with_for_update()
-                        )
-                    ).all()
-                )
+                parts_query = parts_query.where(Dataset.upload_group_id == dataset.upload_group_id)
+            upload_parts = list((await session.scalars(
+                parts_query.order_by(Dataset.id).with_for_update()
+                .execution_options(populate_existing=True)
+            )).all())
+            dataset = next((part for part in upload_parts if part.id == job.dataset_id), None)
+            if dataset is None:
+                raise LookupError("upload dataset moved or disappeared")
+            upload_parts.sort(key=lambda part: part.upload_part_index or 0)
+
+            if dataset.upload_group_id is not None:
                 expected_indexes = list(range(1, len(upload_parts) + 1))
                 if (
                     not upload_parts
@@ -926,7 +935,7 @@ async def ingest_collected(
                     conflicting_name = await session.scalar(
                         select(Dataset.name)
                         .where(
-                            Dataset.owner_id == dataset.owner_id,
+                            Dataset.workspace_id == dataset.workspace_id,
                             Dataset.id != dataset.id,
                             Dataset.name.in_(part_names),
                         )
@@ -946,7 +955,7 @@ async def ingest_collected(
                     dataset.upload_part_count = part_count
                     sibling_parts = [
                         Dataset(
-                            owner_id=dataset.owner_id,
+                            workspace_id=dataset.workspace_id,
                             project_id=dataset.project_id,
                             name=part_names[index - 1],
                             status="pending",
@@ -1223,15 +1232,19 @@ async def ingest_collected(
                 if active_final_chunk.exists():
                     shutil.rmtree(active_final_chunk)
 
-                current_dataset = await session.scalar(
-                    select(Dataset)
-                    .where(Dataset.id == target_part.id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
                 current_project = await session.scalar(
                     select(Project)
                     .where(Project.id == project.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+                if project_renames:
+                    await session.execute(select(Dataset.id).where(
+                        Dataset.project_id == project.id,
+                    ).order_by(Dataset.id).with_for_update())
+                current_dataset = await session.scalar(
+                    select(Dataset)
+                    .where(Dataset.id == target_part.id)
                     .with_for_update()
                     .execution_options(populate_existing=True)
                 )
@@ -1246,7 +1259,7 @@ async def ingest_collected(
                     or current_project is None
                     or current_job is None
                 ):
-                    raise LookupError("upload checkpoint owner disappeared")
+                    raise LookupError("upload checkpoint dataset disappeared")
                 if current_job.ingest_cursor != chunk_start:
                     raise RuntimeError("upload checkpoint changed concurrently")
 
@@ -1283,7 +1296,7 @@ async def ingest_collected(
                     image = Image(
                         dataset_id=current_dataset.id,
                         media_object=MediaObject(
-                            owner_id=current_dataset.owner_id,
+                            workspace_id=current_dataset.workspace_id,
                             created_by_dataset_id=current_dataset.id,
                             original_bytes=prepared.original_bytes,
                             display_bytes=prepared.display_bytes,
@@ -1322,6 +1335,7 @@ async def ingest_collected(
                         thumb_bytes=prepared.thumb_bytes,
                         box_count=len(work.boxes),
                         has_label_source=work.has_label_source,
+                        label_status="labeled" if work.has_label_source or work.boxes else "unlabeled",
                         is_modified=False,
                     )
                     image.annotations = [
@@ -1380,7 +1394,7 @@ async def ingest_collected(
                             DatasetClass.dataset_id.in_(
                                 select(Dataset.id).where(
                                     Dataset.project_id == current_project.id,
-                                    Dataset.owner_id == current_dataset.owner_id,
+                                    Dataset.workspace_id == current_dataset.workspace_id,
                                     or_(
                                         Dataset.is_placeholder.is_(False),
                                         Dataset.id == current_dataset.id,
@@ -1424,7 +1438,7 @@ async def ingest_collected(
                 )
                 await increase_bytes_used(
                     session,
-                    current_dataset.owner_id,
+                    current_dataset.workspace_id,
                     chunk_bytes,
                 )
 
@@ -1452,6 +1466,16 @@ async def ingest_collected(
                 observer=phase_observer,
             )
             upload_part_ids = [part.id for part in upload_parts]
+            current_project = await session.scalar(
+                select(Project)
+                .where(Project.id == project.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if project_renames:
+                await session.execute(select(Dataset.id).where(
+                    Dataset.project_id == project.id,
+                ).order_by(Dataset.id).with_for_update())
             current_parts = list(
                 (
                     await session.scalars(
@@ -1467,12 +1491,6 @@ async def ingest_collected(
                 (part for part in current_parts if part.id == dataset.id),
                 None,
             )
-            current_project = await session.scalar(
-                select(Project)
-                .where(Project.id == project.id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
             current_job = await session.scalar(
                 select(UploadJob)
                 .where(UploadJob.id == job_id)
@@ -1485,7 +1503,7 @@ async def ingest_collected(
                 or current_job is None
                 or len(current_parts) != len(upload_parts)
             ):
-                raise LookupError("upload finalization owner disappeared")
+                raise LookupError("upload finalization dataset disappeared")
 
             final_issues = unseen_issues(pending_global_issues)
             session.add_all(
@@ -1525,7 +1543,7 @@ async def ingest_collected(
                         DatasetClass.dataset_id.in_(
                             select(Dataset.id).where(
                                 Dataset.project_id == current_project.id,
-                                Dataset.owner_id == current_dataset.owner_id,
+                                Dataset.workspace_id == current_dataset.workspace_id,
                                 or_(
                                     Dataset.is_placeholder.is_(False),
                                     Dataset.id == current_dataset.id,
@@ -1611,7 +1629,7 @@ async def ingest_collected(
                 )
             if (committed_cursor or 0) < active_chunk_end:
                 shutil.rmtree(active_final_chunk, ignore_errors=True)
-        if not is_lock_not_available(error):
+        if not is_retryable_lock_error(error):
             await fail_job(session_factory, job_id, str(error))
         raise
 
@@ -1642,6 +1660,7 @@ async def run_upload_batch_job(
     preserve_uploads = False
     try:
         if not await claim_upload_job(session_factory, job_id):
+            preserve_uploads = True
             return
         async with session_factory() as session:
             uploads = (
@@ -1755,8 +1774,9 @@ async def run_upload_batch_job(
             preserve_uploads = True
             raise
     except Exception as error:
-        if is_lock_not_available(error):
+        if is_retryable_lock_error(error):
             preserve_uploads = True
+            await requeue_upload_after_lock_failure(session_factory, job_id, str(error))
             raise
         try:
             await fail_job(session_factory, job_id, str(error))

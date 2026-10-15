@@ -225,7 +225,7 @@ test("dataset upload requires and submits the fixed project context", () => {
   assert.match(uploadPage, /URLSearchParams/);
   assert.match(uploadPage, /project_id/);
   assert.match(uploadPage, /getProject/);
-  assert.match(uploadPage, /createDatasetForUpload\(candidateName,\s*project\.id\)/);
+  assert.match(uploadPage, /createDatasetForUpload\(candidateName,\s*project\.id,\s*workspaceId\)/);
   assert.match(uploadApi, /projectId:\s*number/);
   assert.match(uploadApi, /project_id:\s*projectId/);
   assert.match(client, /export function getProjects/);

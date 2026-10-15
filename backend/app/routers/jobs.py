@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
-from app.deps import CurrentUserDep
+from app.deps import CurrentWorkspaceDep, EditorWorkspaceDep
 from app.models import Dataset, ImportIssue, Project, ProjectClass, UploadJob
 from app.services.class_resolution import (
     ClassResolutionNameConflict,
@@ -92,6 +92,7 @@ class IssueResponse(BaseModel):
         "duplicate_skipped",
         "ignored_file",
         "class_conflict",
+        "upload_lock_retry",
     ]
     path: str
     detail: str
@@ -110,14 +111,14 @@ class IssuePage(BaseModel):
 async def get_job(
     job_id: int,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
 ) -> JobResponse:
     result = await session.execute(
         select(UploadJob, Dataset)
         .join(Dataset, Dataset.id == UploadJob.dataset_id)
         .where(
             UploadJob.id == job_id,
-            Dataset.owner_id == current_user.id,
+            Dataset.workspace_id == current_workspace.id,
         )
     )
     row = result.one_or_none()
@@ -132,7 +133,7 @@ async def get_job(
                 await session.scalars(
                     select(Dataset)
                     .where(
-                        Dataset.owner_id == current_user.id,
+                        Dataset.workspace_id == current_workspace.id,
                         Dataset.upload_group_id == dataset.upload_group_id,
                     )
                     .order_by(Dataset.upload_part_index)
@@ -179,38 +180,36 @@ async def resolve_class_conflicts(
     body: ClassResolutionRequest,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: EditorWorkspaceDep,
 ) -> JobAccepted:
     job_ref = await session.scalar(
         select(UploadJob)
         .join(Dataset, Dataset.id == UploadJob.dataset_id)
         .where(
             UploadJob.id == job_id,
-            Dataset.owner_id == current_user.id,
+            Dataset.workspace_id == current_workspace.id,
         )
     )
     if job_ref is None:
         raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
 
-    # Keep the same lock order as ingestion and class rename: dataset, project,
-    # then the job payload. This serializes catalog changes without a cycle.
-    dataset = await session.scalar(
-        select(Dataset)
-        .where(
-            Dataset.id == job_ref.dataset_id,
-            Dataset.owner_id == current_user.id,
-        )
-        .with_for_update()
-    )
-    if dataset is None:
+    # Resolve the parent without a row lock, then follow Project -> Dataset -> Job.
+    project_id = await session.scalar(select(Dataset.project_id).where(
+        Dataset.id == job_ref.dataset_id, Dataset.workspace_id == current_workspace.id,
+    ))
+    if project_id is None:
         raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
-    project = await session.scalar(
-        select(Project)
-        .where(Project.id == dataset.project_id)
-        .with_for_update()
-    )
+    project = await session.scalar(select(Project).where(
+        Project.id == project_id, Project.workspace_id == current_workspace.id,
+    ).with_for_update())
     if project is None:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
+    dataset = await session.scalar(select(Dataset).where(
+        Dataset.id == job_ref.dataset_id, Dataset.project_id == project.id,
+        Dataset.workspace_id == current_workspace.id,
+    ).with_for_update().execution_options(populate_existing=True))
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
     job = await session.scalar(
         select(UploadJob)
         .where(
@@ -285,14 +284,14 @@ async def resolve_class_conflicts(
 async def get_issues(
     dataset_id: int,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
 ) -> IssuePage:
     dataset_exists = await session.scalar(
         select(Dataset.id).where(
             Dataset.id == dataset_id,
-            Dataset.owner_id == current_user.id,
+            Dataset.workspace_id == current_workspace.id,
         )
     )
     if dataset_exists is None:

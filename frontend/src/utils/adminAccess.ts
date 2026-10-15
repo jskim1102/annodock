@@ -24,3 +24,11 @@ export function probeAdminOverview(): Promise<AdminOverview | null> {
 export function resetAdminProbe(): void {
   probe = null;
 }
+
+export async function adminHomePath(): Promise<"/admin" | "/projects"> {
+  try {
+    return await probeAdminOverview() === null ? "/projects" : "/admin";
+  } catch {
+    return "/projects";
+  }
+}

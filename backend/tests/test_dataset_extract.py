@@ -17,7 +17,7 @@ from app.models import (
     Image,
     RunImage,
     TrainingRun,
-    UserStorage,
+    WorkspaceStorage,
 )
 from app.services import dataset_merge as dataset_merge_service
 from app.services import training
@@ -109,7 +109,7 @@ async def _create_dataset(
             thumbnail.write_bytes(b"thumb-" + content)
             physical_bytes += original.stat().st_size + thumbnail.stat().st_size
             image = image_with_media(
-                owner_id=dataset.owner_id,
+                workspace_id=dataset.workspace_id,
                 dataset_id=dataset_id,
                 stem=stem,
                 filename=original.name,
@@ -149,7 +149,7 @@ async def _create_dataset(
         dataset.image_count = len(images)
         dataset.annotation_count = annotation_count
         dataset.class_count = 3
-        await increase_bytes_used(session, dataset.owner_id, physical_bytes)
+        await increase_bytes_used(session, dataset.workspace_id, physical_bytes)
         await session.commit()
     return dataset_id
 
@@ -175,7 +175,7 @@ async def test_extract_creates_visible_independent_filtered_snapshot(
         images=[("same", [1, 2, 2], b"second-selected")],
     )
     async with app.state.session_factory() as session:
-        source_usage = await session.get(UserStorage, 1)
+        source_usage = await session.get(WorkspaceStorage, 1)
         assert source_usage is not None
         source_physical_bytes = source_usage.bytes_used
     result_name = f"test-extract-result-{uuid4().hex}"
@@ -207,7 +207,12 @@ async def test_extract_creates_visible_independent_filtered_snapshot(
 
     classes = await client.get(f"/api/datasets/{extracted_id}/classes")
     assert classes.status_code == 200
+    async with app.state.session_factory() as session:
+        catalog_version = await session.scalar(select(Dataset.class_catalog_version).where(
+            Dataset.id == extracted_id,
+        ))
     assert classes.json() == {
+        "catalog_version": catalog_version,
         "classes": [
             {"class_id": 2, "name": "helmet"},
         ]
@@ -238,7 +243,7 @@ async def test_extract_creates_visible_independent_filtered_snapshot(
             .select_from(DatasetMergeSource)
             .where(DatasetMergeSource.merged_dataset_id == extracted_id)
         )
-        usage = await session.get(UserStorage, 1)
+        usage = await session.get(WorkspaceStorage, 1)
         extracted_row = await session.get(Dataset, extracted_id)
 
     assert [image.stem for image in images] == ["same", "same (1)"]
@@ -292,7 +297,12 @@ async def test_extract_creates_visible_independent_filtered_snapshot(
     renamed_classes = await client.get(
         f"/api/datasets/{extracted_id}/classes"
     )
+    async with app.state.session_factory() as session:
+        catalog_version = await session.scalar(select(Dataset.class_catalog_version).where(
+            Dataset.id == extracted_id,
+        ))
     assert renamed_classes.json() == {
+        "catalog_version": catalog_version,
         "classes": [{"class_id": 2, "name": "helmet"}]
     }
 
@@ -304,7 +314,12 @@ async def test_extract_creates_visible_independent_filtered_snapshot(
     renamed_classes = await client.get(
         f"/api/datasets/{extracted_id}/classes"
     )
+    async with app.state.session_factory() as session:
+        catalog_version = await session.scalar(select(Dataset.class_catalog_version).where(
+            Dataset.id == extracted_id,
+        ))
     assert renamed_classes.json() == {
+        "catalog_version": catalog_version,
         "classes": [{"class_id": 2, "name": "hardhat"}]
     }
 
@@ -325,7 +340,7 @@ async def test_extract_creates_visible_independent_filtered_snapshot(
     async with app.state.session_factory() as session:
         assert await session.get(Dataset, first_id) is not None
         assert await session.get(Dataset, second_id) is not None
-        usage = await session.get(UserStorage, 1)
+        usage = await session.get(WorkspaceStorage, 1)
     assert all(path.is_dir() for path in source_paths)
     assert usage is not None and usage.bytes_used == source_physical_bytes
 
@@ -511,7 +526,7 @@ async def test_extract_rejects_quota_without_persisting_partial_output(
         images=[("large", [2], b"larger-than-one-byte")],
     )
     async with app.state.session_factory() as session:
-        source_usage = await session.get(UserStorage, 1)
+        source_usage = await session.get(WorkspaceStorage, 1)
         assert source_usage is not None
         source_physical_bytes = source_usage.bytes_used
 
@@ -539,7 +554,7 @@ async def test_extract_rejects_quota_without_persisting_partial_output(
         output = await session.scalar(
             select(Dataset).where(Dataset.name == result_name)
         )
-        usage = await session.get(UserStorage, 1)
+        usage = await session.get(WorkspaceStorage, 1)
     assert output is None
     assert usage is not None and usage.bytes_used == source_physical_bytes
     assert set(datasets_root.iterdir()) == storage_entries_before

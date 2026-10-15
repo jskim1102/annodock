@@ -1,5 +1,6 @@
 import {
   type FormEvent,
+  type ReactNode,
   type PointerEvent as ReactPointerEvent,
   useCallback,
   useEffect,
@@ -19,6 +20,12 @@ export interface EditorClass {
 }
 
 interface BboxCanvasProps {
+  readOnly?: boolean;
+  canManageClasses?: boolean;
+  catalogVersion?: number;
+  statusBadge?: ReactNode;
+  imageInspector?: ReactNode;
+  completionAction?: ReactNode;
   imageSrc: string;
   imageWidth: number;
   imageHeight: number;
@@ -147,6 +154,8 @@ function boxesChanged(before: EditorBox[], after: EditorBox[]) {
 }
 
 export function BboxCanvas({
+  readOnly = false, canManageClasses = true, statusBadge, imageInspector, completionAction,
+  catalogVersion,
   imageSrc,
   imageWidth,
   imageHeight,
@@ -182,6 +191,11 @@ export function BboxCanvas({
   const [renameError, setRenameError] = useState("");
   const [colorClassId, setColorClassId] = useState<number | null>(null);
   const [fitScale, setFitScale] = useState(1);
+
+  useEffect(() => {
+    setRename(null);
+    setRenameError("");
+  }, [catalogVersion]);
 
   const renderedBoxes = previewBoxes ?? boxes;
   const visualScale = fitScale * (zoom / FIT_ZOOM);
@@ -255,7 +269,7 @@ export function BboxCanvas({
   };
 
   const beginBoxDrag = (event: ReactPointerEvent, box: EditorBox) => {
-    if (event.button !== 0 || tool !== "select") return;
+    if (readOnly || event.button !== 0 || tool !== "select") return;
     event.preventDefault();
     event.stopPropagation();
     if (spaceDownRef.current) {
@@ -279,7 +293,7 @@ export function BboxCanvas({
   };
 
   const beginResize = (event: ReactPointerEvent, box: EditorBox, handle: HandleName) => {
-    if (event.button !== 0 || tool !== "select") return;
+    if (readOnly || event.button !== 0 || tool !== "select") return;
     event.preventDefault();
     event.stopPropagation();
     if (spaceDownRef.current) {
@@ -326,7 +340,7 @@ export function BboxCanvas({
       beginPan(event);
       return;
     }
-    if (tool !== "draw" || !(event.target instanceof Node) || !frameRef.current?.contains(event.target)) return;
+    if (readOnly || tool !== "draw" || !(event.target instanceof Node) || !frameRef.current?.contains(event.target)) return;
     event.preventDefault();
     const point = pointInImage(event.clientX, event.clientY);
     const nextDraft = { x: point.x, y: point.y, width: 0, height: 0 };
@@ -398,6 +412,7 @@ export function BboxCanvas({
       return;
     }
 
+    commit = commit && !readOnly;
     if (drag.kind === "draw") {
       const nextDraft = draftRef.current;
       draftRef.current = null;
@@ -427,20 +442,21 @@ export function BboxCanvas({
   };
 
   const deleteSelected = useCallback(() => {
-    if (!selectedId) return;
+    if (readOnly || !selectedId) return;
     const next = boxes.filter((box) => box.id !== selectedId);
     if (next.length === boxes.length) return;
     onChange(next);
     setSelectedId(0);
-  }, [boxes, onChange, selectedId]);
+  }, [boxes, onChange, readOnly, selectedId]);
 
   const chooseClass = useCallback((classId: number) => {
+    if (readOnly) return;
     setSelectedClass(classId);
     const selected = boxes.find((box) => box.id === selectedId);
     if (selected && selected.classId !== classId) {
       onChange(boxes.map((box) => box.id === selectedId ? { ...box, classId } : box));
     }
-  }, [boxes, onChange, selectedId]);
+  }, [boxes, onChange, readOnly, selectedId]);
 
   const resetView = useCallback(() => {
     setZoom(FIT_ZOOM);
@@ -540,20 +556,20 @@ export function BboxCanvas({
     try {
       await onRenameClass(rename.id, value);
       setRename(null);
-    } catch {
-      setRenameError("이름을 저장하지 못했습니다.");
+    } catch (reason) {
+      setRenameError(reason instanceof Error ? reason.message : "이름을 저장하지 못했습니다.");
     } finally {
       setRenameBusy(false);
     }
   };
 
-  const saveLabel = saveState === "saved" ? "저장됨" : saveState === "saving" ? "저장 중" : "저장 실패";
+  const saveLabel = saveState === "saved" ? "저장됨" : saveState === "saving" ? "저장 중" : saveState === "rejected" ? "저장할 수 없음" : "재시도";
 
   return (
     <div className="viewer-body">
       <aside className="tool-rail" aria-label="라벨링 도구">
-        <button className="rail-button" type="button" aria-label="선택·팬" title="선택·팬" aria-pressed={tool === "select"} onClick={() => setTool("select")}><Icon name="mouse" size={17} /></button>
-        <button className="rail-button" type="button" aria-label="박스 생성" title="박스 생성" aria-pressed={tool === "draw"} onClick={() => setTool("draw")}><Icon name="box" size={17} /></button>
+        <button className="rail-button" type="button" disabled={readOnly} aria-label="선택·팬" title="선택·팬" aria-pressed={tool === "select"} onClick={() => setTool("select")}><Icon name="mouse" size={17} /></button>
+        <button className="rail-button" type="button" disabled={readOnly} aria-label="박스 생성" title="박스 생성" aria-pressed={tool === "draw"} onClick={() => setTool("draw")}><Icon name="box" size={17} /></button>
       </aside>
 
       <section
@@ -566,6 +582,7 @@ export function BboxCanvas({
         onPointerUp={() => finishPointer(true)}
         onPointerCancel={() => finishPointer(false)}
       >
+        {statusBadge ? <div className="viewer-status-badge">{statusBadge}</div> : null}
         <div
           ref={frameRef}
           className="image-frame"
@@ -589,7 +606,7 @@ export function BboxCanvas({
                 onPointerDown={(event) => beginBoxDrag(event, box)}
               >
                 <span className="box-label" style={{ background: editorClass?.color }}>{editorClass?.name ?? "미지정"}{box.score ? ` ${box.score}` : ""}</span>
-                {selected ? HANDLES.map((handle) => (
+                {selected && !readOnly ? HANDLES.map((handle) => (
                   <i
                     className={`resize-handle handle-${handle}`}
                     key={handle}
@@ -654,8 +671,9 @@ export function BboxCanvas({
                   }
                 }}
               >
-                <button
+                {canManageClasses ? <button
                   className="class-index class-color-trigger"
+                  disabled={!canManageClasses}
                   type="button"
                   aria-label={`${item.name} 색상 변경`}
                   style={{ background: item.color }}
@@ -663,9 +681,9 @@ export function BboxCanvas({
                     event.stopPropagation();
                     setColorClassId((current) => current === item.id ? null : item.id);
                   }}
-                >{item.id}</button>
+                >{item.id}</button> : <span className="class-index" style={{ background: item.color }}>{item.id}</span>}
                 <span>{item.name}</span>
-                <button
+                {canManageClasses ? <button
                   className="class-rename-trigger"
                   type="button"
                   aria-label={`${item.name} 이름 변경`}
@@ -674,7 +692,7 @@ export function BboxCanvas({
                     setRename({ id: item.id, value: item.name });
                     setRenameError("");
                   }}
-                >✎</button>
+                >✎</button> : null}
                 <span className="mono">{item.count}</span>
                 {colorClassId === item.id ? (
                   <ClassColorPicker
@@ -690,6 +708,7 @@ export function BboxCanvas({
           </div>
           {renameError ? <p className="class-rename-error" role="alert">{renameError}</p> : null}
         </section>
+        {imageInspector}
         <section className="shortcut-section">
           <h2>단축키</h2>
           <dl className="shortcut-list">
@@ -710,7 +729,8 @@ export function BboxCanvas({
             disabled={saveState !== "error"}
             onClick={onRetrySave}
           ><span />{saveLabel}</button>
-          <button className="btn btn-ghost btn-sm" type="button" disabled={undoDepth === 0} onClick={onUndo}><Icon name="undo" size={13} />실행취소</button>
+          <button className="btn btn-ghost btn-sm" type="button" disabled={readOnly || undoDepth === 0} onClick={onUndo}><Icon name="undo" size={13} />실행취소</button>
+          {completionAction ? <div className="viewer-completion-action">{completionAction}</div> : null}
         </footer>
       </aside>
     </div>

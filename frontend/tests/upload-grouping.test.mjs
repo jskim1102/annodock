@@ -395,9 +395,9 @@ test("the upload page chooses grouping automatically and uploads each source seq
   assert.match(uploadPage, /병합 데이터셋 이름을 입력해야 업로드를 시작할 수 있습니다\./);
   assert.match(uploadPage, /개 항목을 각각 업로드한 뒤 이 이름으로 자동 병합합니다/);
   assert.match(uploadPage, /for \(const unit of uploadPlan\)/);
-  assert.match(uploadPage, /createDatasetForUpload\(candidateName, project\.id\)/);
+  assert.match(uploadPage, /createDatasetForUpload\(candidateName, project\.id, workspaceId\)/);
   assert.match(uploadPage, /reason instanceof ApiError && reason\.status === 409/);
-  assert.match(uploadPage, /prepareUploadBatch\(targetId, batchFiles, \(\{/);
+  assert.match(uploadPage, /prepareUploadBatch\(targetId, batchFiles, transferState\.operation, \(\{/);
   assert.match(uploadPage, /const targetIds = \{ \.\.\.uploadTargets \}/);
   assert.match(uploadPage, /let targetId = targetIds\[unit\.key\]/);
   assert.match(uploadPage, /setUploadTargets\(\{ \.\.\.targetIds \}\)/);

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -12,7 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
-from app.deps import CurrentUserDep
+from app.deps import CurrentWorkspaceDep
 from app.models import Dataset, Image
 from app.services.storage import StorageBoundaryError, contained_storage_path
 
@@ -40,6 +41,11 @@ class ImageRow(BaseModel):
     height: int
     box_count: int
     is_modified: bool
+    label_status: str
+    assignee_id: int | None
+    labeled_by: int | None
+    labeled_at: datetime | None
+    version: int
 
 
 class ImagePage(BaseModel):
@@ -50,12 +56,12 @@ class ImagePage(BaseModel):
 async def _dataset_or_404(
     session: AsyncSession,
     dataset_id: int,
-    owner_id: int,
+    workspace_id: int,
 ) -> Dataset:
     dataset = await session.scalar(
         select(Dataset).where(
             Dataset.id == dataset_id,
-            Dataset.owner_id == owner_id,
+            Dataset.workspace_id == workspace_id,
         )
     )
     if dataset is None:
@@ -66,14 +72,14 @@ async def _dataset_or_404(
 async def _image_or_404(
     session: AsyncSession,
     image_id: int,
-    owner_id: int,
+    workspace_id: int,
 ) -> Image:
     image = await session.scalar(
         select(Image)
         .join(Dataset, Dataset.id == Image.dataset_id)
         .where(
             Image.id == image_id,
-            Dataset.owner_id == owner_id,
+            Dataset.workspace_id == workspace_id,
         )
     )
     if image is None:
@@ -100,16 +106,21 @@ def _stored_file_or_404(request: Request, stored_path: str) -> Path:
     return path
 
 
+@router.get("/images/{image_id}", response_model=ImageRow)
+async def get_image(image_id: int, session: Session, current_workspace: CurrentWorkspaceDep) -> ImageRow:
+    return ImageRow.model_validate(await _image_or_404(session, image_id, current_workspace.id))
+
+
 @router.get("/datasets/{dataset_id}/images", response_model=ImagePage)
 async def list_images(
     dataset_id: int,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=200)] = 200,
     split: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
 ) -> ImagePage:
-    await _dataset_or_404(session, dataset_id, current_user.id)
+    await _dataset_or_404(session, dataset_id, current_workspace.id)
     filters = [Image.dataset_id == dataset_id]
     if split is not None:
         filters.append(Image.split == split)
@@ -141,9 +152,9 @@ async def get_image_file(
     image_id: int,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
 ) -> FileResponse:
-    image = await _image_or_404(session, image_id, current_user.id)
+    image = await _image_or_404(session, image_id, current_workspace.id)
     if image.display_path is not None:
         path = _stored_file_or_404(request, image.display_path)
         media_type = "image/jpeg"
@@ -162,9 +173,9 @@ async def get_image_thumbnail(
     image_id: int,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
 ) -> FileResponse:
-    image = await _image_or_404(session, image_id, current_user.id)
+    image = await _image_or_404(session, image_id, current_workspace.id)
     path = _stored_file_or_404(request, image.thumb_path)
     return FileResponse(
         path,

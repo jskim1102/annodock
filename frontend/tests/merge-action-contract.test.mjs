@@ -23,9 +23,9 @@ test("the API client merges every selected source dataset", () => {
   assert.match(client, /export async function mergeDatasets/);
   assert.match(
     client,
-    /requestJson<DatasetListItem>\(\s*"\/api\/datasets\/merge",\s*jsonInit\("POST", input\),\s*\)/,
+    /requestJson<DatasetListItem>\(\s*"\/api\/datasets\/merge",\s*\{ \.\.\.jsonInit\("POST", input\), workspaceId \},\s*\)/,
   );
-  assert.match(client, /return waitForMergedDataset\(queued\)/);
+  assert.match(client, /return waitForMergedDataset\(queued, workspaceId\)/);
   assert.match(client, /export function extendMergedDataset/);
   assert.match(
     client,

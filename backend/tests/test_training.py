@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import func, select, update
 
 from app.inference.models_dir import PRESET_MODELS
-from app.models import Annotation, Dataset, DatasetClass, Image, RunImage, TrainingRun
+from app.models import Annotation, Dataset, DatasetClass, Image, RunImage, TrainingRun, Workspace, WorkspaceMember
 from app.services.proc_identity import ProcessIdentity, parse_proc_stat, read_process_identity
 from app.services.storage import contained_storage_path, storage_relative_path
 from app.services import training
@@ -39,8 +39,9 @@ async def _dataset(
     annotated: bool = True,
     annotated_count: int | None = None,
     label_source_count: int | None = None,
+    headers: dict[str, str] | None = None,
 ) -> int:
-    created = await client.post("/api/datasets", json={"name": _name("data")})
+    created = await client.post("/api/datasets", json={"name": _name("data")}, headers=headers)
     assert created.status_code == 201
     dataset_id = created.json()["id"]
 
@@ -67,7 +68,7 @@ async def _dataset(
             source = root / f"image {index}.jpg"
             source.write_bytes(f"image-{index}".encode())
             image = image_with_media(
-                owner_id=dataset.owner_id,
+                workspace_id=dataset.workspace_id,
                 dataset_id=dataset_id,
                 stem=f"image {index}",
                 filename=source.name,
@@ -126,7 +127,7 @@ def _host_ready(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         training,
         "spawn_worker",
-        lambda _run_id, _owner_id, _out_dir, _database_url: training.SpawnedWorker(
+        lambda _run_id, _workspace_id, _out_dir, _database_url: training.SpawnedWorker(
             pid=4242,
             pid_started_at="123456",
             boot_id="test-boot-id",
@@ -742,7 +743,7 @@ async def test_worker_spawn_uses_detached_argv_and_inherited_environment(
         "app.worker.train_worker",
         "--run-id",
         "17",
-        "--owner-id",
+        "--workspace-id",
         "171",
     ]
     assert observed["start_new_session"] is True
@@ -764,6 +765,59 @@ async def test_worker_spawn_uses_detached_argv_and_inherited_environment(
     )
 
 
+async def test_team_training_keeps_actor_and_workspace_distinct_through_worker_launch(
+    client: httpx.AsyncClient,
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_spawn = training.spawn_worker
+    _host_ready(monkeypatch)
+    monkeypatch.setattr(training, "spawn_worker", real_spawn)
+    workspace_id, actor_id = 7_001, 1
+    async with app.state.session_factory() as session:
+        session.add(Workspace(
+            id=workspace_id, kind="team", name="test-training-team", created_by=2,
+        ))
+        await session.flush()
+        session.add_all([
+            WorkspaceMember(workspace_id=workspace_id, user_id=2, role="owner"),
+            WorkspaceMember(workspace_id=workspace_id, user_id=actor_id, role="admin"),
+        ])
+        await session.commit()
+
+    headers = {"X-Workspace-Id": str(workspace_id)}
+    dataset_id = await _dataset(client, app, headers=headers)
+    launches = []
+
+    def fake_popen(argv, **_kwargs):
+        launches.append(argv)
+        return SimpleNamespace(pid=9003)
+
+    monkeypatch.setattr(training.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(training, "read_process_identity", lambda pid: ProcessIdentity(
+        pid=pid, state="S", started_at="test-team-start", boot_id="test-team-boot",
+    ))
+    response = await client.post(
+        f"/api/datasets/{dataset_id}/train", json=_body(batch=2), headers=headers,
+    )
+    assert response.status_code == 201, response.text
+    run_id = response.json()["run_id"]
+    async with app.state.session_factory() as session:
+        run = await session.get(TrainingRun, run_id)
+        assert run.workspace_id == workspace_id
+        assert run.created_by == actor_id
+        assert run.workspace_id != run.created_by
+    assert launches == [[
+        sys.executable, "-u", "-m", "app.worker.train_worker",
+        "--run-id", str(run_id), "--workspace-id", str(workspace_id),
+    ]]
+    dsn = app.state.settings.database_url.replace("+asyncpg", "", 1)
+    with pytest.raises(LookupError):
+        await asyncio.to_thread(train_worker.load_run_config, run_id, actor_id, dsn)
+    config = await asyncio.to_thread(train_worker.load_run_config, run_id, workspace_id, dsn)
+    assert config.workspace_id == workspace_id
+
+
 async def test_worker_spawn_happens_after_commit_and_persists_identity(
     client: httpx.AsyncClient,
     app,
@@ -775,7 +829,7 @@ async def test_worker_spawn_happens_after_commit_and_persists_identity(
 
     def committed_spawn(
         run_id: int,
-        owner_id: int,
+        workspace_id: int,
         out_dir: Path,
         database_url: str,
     ):
@@ -783,7 +837,7 @@ async def test_worker_spawn_happens_after_commit_and_persists_identity(
         with psycopg.connect(dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT state, out_dir, owner_id FROM training_runs WHERE id=%s",
+                    "SELECT state, out_dir, workspace_id FROM training_runs WHERE id=%s",
                     (run_id,),
                 )
                 observed["row"] = cursor.fetchone()
@@ -830,7 +884,7 @@ async def test_worker_identity_write_is_owner_scoped(
 
     def ownership_changed_spawn(
         run_id: int,
-        _owner_id: int,
+        _workspace_id: int,
         _out_dir: Path,
         database_url: str,
     ) -> training.SpawnedWorker:
@@ -838,7 +892,7 @@ async def test_worker_identity_write_is_owner_scoped(
         with psycopg.connect(dsn, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "UPDATE training_runs SET owner_id=%s WHERE id=%s",
+                    "UPDATE training_runs SET workspace_id=%s WHERE id=%s",
                     (2, run_id),
                 )
         return training.SpawnedWorker(
@@ -858,7 +912,7 @@ async def test_worker_identity_write_is_owner_scoped(
     async with app.state.session_factory() as session:
         run = await session.get(TrainingRun, response.json()["run_id"])
         assert run is not None
-        assert run.owner_id == 2
+        assert run.workspace_id == 2
         assert (run.pid, run.pid_started_at, run.boot_id) == (None, None, None)
 
 
@@ -872,7 +926,7 @@ async def test_worker_spawn_failure_marks_committed_run_failed(
 
     def fail_spawn(
         _run_id: int,
-        _owner_id: int,
+        _workspace_id: int,
         _out_dir: Path,
         _database_url: str,
     ):
@@ -999,7 +1053,7 @@ async def test_epoch_callback_upserts_one_based_metrics_and_all_lr_groups(
     statement = str(observed["statement"])
     parameters = observed["parameters"]
     assert "ON CONFLICT (run_id, epoch) DO UPDATE" in statement
-    assert "owned_run.owner_id=%s" in statement
+    assert "owned_run.workspace_id=%s" in statement
     assert "IS DISTINCT FROM" not in statement
     assert parameters[:7] == (7, 5, 0.11, 0.22, 0.33, 0.77, 0.55)
     assert parameters[7].obj == trainer.lr
@@ -1077,14 +1131,14 @@ async def test_run_complete_moves_trainer_paths_before_conditional_done(
 
     assert updated is True
     calls = observed["calls"]
-    assert "WHERE id=%s AND owner_id=%s AND state='running'" in str(calls[0][0])
+    assert "WHERE id=%s AND workspace_id=%s AND state='running'" in str(calls[0][0])
     artifact_bytes = (
         len(b"best")
         + len(b"last")
         + len(b"epoch,metric\n1,0.5\n")
     )
     assert calls[0][1] == (artifact_bytes, 9, 91)
-    assert "INSERT INTO user_storage" in str(calls[1][0])
+    assert "INSERT INTO workspace_storage" in str(calls[1][0])
     assert calls[1][1] == (91, artifact_bytes)
     assert not best.exists()
     assert not last.exists()
@@ -1108,7 +1162,7 @@ async def test_worker_spawn_training_uses_absolute_paths_and_exact_save_dir(
     data_yaml.write_text("path: /tmp\n")
     config = train_worker.RunConfig(
         run_id=10,
-        owner_id=101,
+        workspace_id=101,
         weights="yolo26n.pt",
         epochs=2,
         imgsz=320,
@@ -1144,8 +1198,8 @@ async def test_worker_spawn_training_uses_absolute_paths_and_exact_save_dir(
     monkeypatch.setattr(
         train_worker,
         "complete_run",
-        lambda run_id, owner_id, dsn, path, trainer: observed.setdefault(
-            "completed", (run_id, owner_id, dsn, path, trainer)
+        lambda run_id, workspace_id, dsn, path, trainer: observed.setdefault(
+            "completed", (run_id, workspace_id, dsn, path, trainer)
         ),
     )
 
@@ -1190,7 +1244,7 @@ async def test_autobatch_floor_marks_run_failed_before_first_epoch(
     (out_dir / "workdir" / "data.yaml").write_text("path: /tmp\n")
     config = train_worker.RunConfig(
         run_id=11,
-        owner_id=111,
+        workspace_id=111,
         weights="yolo26n.pt",
         epochs=3,
         imgsz=640,
@@ -1218,8 +1272,8 @@ async def test_autobatch_floor_marks_run_failed_before_first_epoch(
     monkeypatch.setattr(
         train_worker,
         "mark_run_failed",
-        lambda run_id, owner_id, dsn, error, **_kwargs: observed.setdefault(
-            "failed", (run_id, owner_id, dsn, error)
+        lambda run_id, workspace_id, dsn, error, **_kwargs: observed.setdefault(
+            "failed", (run_id, workspace_id, dsn, error)
         ),
     )
 

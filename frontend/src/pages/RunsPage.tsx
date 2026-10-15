@@ -1,3 +1,4 @@
+import { useWorkspace } from "../store/workspace";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 
 import { invalidateStorageQuotaCache } from "../api/client";
@@ -112,6 +113,8 @@ function DeleteRunsDialog({
 }
 
 export function RunsPage() {
+  const { active } = useWorkspace();
+  const canManage = active?.role === "admin" || active?.role === "owner";
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [chip, setChip] = useState<"running" | "ended">("running");
@@ -190,6 +193,7 @@ export function RunsPage() {
   const cleanable = selectedRuns.filter((run) => !ACTIVE_STATES.has(run.state) && run.artifacts_deleted_at === null);
 
   const cleanupSelected = async () => {
+    if (!canManage) return;
     if (cleanable.length === 0 || cleaning || deleting) return;
     const targets = [...cleanable];
     const completedIds = new Set<number>();
@@ -242,6 +246,7 @@ export function RunsPage() {
   };
 
   const deleteSelectedRuns = async () => {
+    if (!canManage) return;
     if (deleteTargets === null || deleteTargets.length === 0 || deleting) return;
     const targets = [...deleteTargets];
     const completedIds = new Set<number>();
@@ -305,7 +310,7 @@ export function RunsPage() {
             <button className="chip" type="button" aria-pressed={chip === "ended"} onClick={() => setChip("ended")}>종료 <b>{endedCount}</b></button>
           </div>
         </div>
-        <div className="run-detail-actions">
+        {canManage ? <div className="run-detail-actions">
           <button className="btn btn-danger btn-sm" type="button" disabled={cleanable.length === 0 || cleaning || deleting} onClick={() => void cleanupSelected()}><Icon name="trash" size={14} />{cleaning ? "정리 중…" : "선택한 산출물 정리"}</button>
           <button
             className="btn btn-danger btn-sm"
@@ -317,7 +322,7 @@ export function RunsPage() {
               setDeleteTargets([...selectedRuns]);
             }}
           ><Icon name="trash" size={14} />선택한 run 삭제</button>
-        </div>
+        </div> : null}
       </div>
       {error ? <p className="training-error" role="alert">{error}</p> : null}
       {notice ? <div className="run-notice" role="status">{notice}</div> : null}
@@ -331,7 +336,7 @@ export function RunsPage() {
               const progress = run.epochs > 0 ? Math.min(100, Math.round(run.epoch / run.epochs * 100)) : 0;
               return <Fragment key={run.id}>
                 <tr className={ACTIVE_STATES.has(run.state) ? "run-main-row" : undefined}>
-                  <td><button className={`checkbox${selected.has(run.id) ? " is-on" : ""}`} role="checkbox" aria-checked={selected.has(run.id)} type="button" aria-label={`run ${run.id} 선택`} onClick={() => toggleSelected(run.id)}>{selected.has(run.id) ? <Icon name="check" size={10} /> : null}</button></td>
+                  <td>{canManage ? <button className={`checkbox${selected.has(run.id) ? " is-on" : ""}`} role="checkbox" aria-checked={selected.has(run.id)} type="button" aria-label={`run ${run.id} 선택`} onClick={() => toggleSelected(run.id)}>{selected.has(run.id) ? <Icon name="check" size={10} /> : null}</button> : null}</td>
                   <td><button className="run-expand" type="button" aria-label={expanded ? "run 접기" : "run 펼치기"} aria-expanded={expanded} onClick={() => setExpandedId(expanded ? null : run.id)}><Icon name={expanded ? "chevron-down" : "chevron-right"} size={13} /></button>{ACTIVE_STATES.has(run.state) ? <span className="running-dot" /> : null}<a className="mono run-link" href={appHref(`/runs/${run.id}`)}>run {run.id}</a></td>
                   <td>{run.dataset_name}</td><td className="mono">{run.weights.replace(".pt", "")}</td>
                   <td>{ACTIVE_STATES.has(run.state) ? <span className="run-progress"><span className="bar"><i style={{ width: `${progress}%` }} /></span><span className="mono">{run.epoch} / {run.epochs}</span></span> : <span className="run-state-tags"><RunStateTag state={run.state} />{run.artifacts_deleted_at !== null ? <span className="tag tag-neutral">산출물 정리됨</span> : null}</span>}</td>
@@ -345,7 +350,7 @@ export function RunsPage() {
         </table>
         <div className="table-footer"><span className="mono">총 {visibleRuns.length}개</span></div>
       </section>
-      {deleteTargets ? (
+      {canManage && deleteTargets ? (
         <DeleteRunsDialog
           runs={deleteTargets}
           busy={deleting}

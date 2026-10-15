@@ -22,7 +22,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
-from app.deps import CurrentUserDep
+from app.deps import (
+    AdminWorkspaceDep,
+    CurrentWorkspaceDep,
+    ViewerWorkspaceDep,
+)
 from app.models import Dataset, Image, RunImage, RunMetric, TrainingRun
 from app.services.cleanup import (
     stage_run_artifacts_async,
@@ -153,7 +157,7 @@ def _summary(run: TrainingRun, epoch: int) -> RunSummary:
 async def _run_with_epoch(
     session: AsyncSession,
     run_id: int,
-    owner_id: int,
+    workspace_id: int,
 ) -> tuple[TrainingRun, int, dict[str, int]]:
     latest_epoch = _epoch_subquery()
     image_counts = _image_count_subquery()
@@ -170,7 +174,7 @@ async def _run_with_epoch(
             .outerjoin(image_counts, image_counts.c.run_id == TrainingRun.id)
             .where(
                 TrainingRun.id == run_id,
-                TrainingRun.owner_id == owner_id,
+                TrainingRun.workspace_id == workspace_id,
             )
         )
     ).one_or_none()
@@ -187,13 +191,13 @@ async def _run_with_epoch(
 async def _owned_run_or_404(
     session: AsyncSession,
     run_id: int,
-    owner_id: int,
+    workspace_id: int,
     *,
     for_update: bool = False,
 ) -> TrainingRun:
     query = select(TrainingRun).where(
         TrainingRun.id == run_id,
-        TrainingRun.owner_id == owner_id,
+        TrainingRun.workspace_id == workspace_id,
     )
     if for_update:
         query = query.with_for_update()
@@ -206,12 +210,12 @@ async def _owned_run_or_404(
 async def _owned_dataset_or_404(
     session: AsyncSession,
     dataset_id: int,
-    owner_id: int,
+    workspace_id: int,
 ) -> None:
     exists = await session.scalar(
         select(Dataset.id).where(
             Dataset.id == dataset_id,
-            Dataset.owner_id == owner_id,
+            Dataset.workspace_id == workspace_id,
         )
     )
     if exists is None:
@@ -287,29 +291,29 @@ def _ensure_run_can_infer(run: TrainingRun) -> None:
 @router.get("", response_model=RunPage)
 async def list_runs(
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
     dataset_id: int | None = None,
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> RunPage:
     latest_epoch = _epoch_subquery()
-    owner_predicate = TrainingRun.owner_id == current_user.id
+    workspace_predicate = TrainingRun.workspace_id == current_workspace.id
     page_query = select(
         TrainingRun,
         func.coalesce(latest_epoch.c.epoch, 0).label("epoch"),
     ).outerjoin(latest_epoch, latest_epoch.c.run_id == TrainingRun.id).where(
-        owner_predicate
+        workspace_predicate
     )
     count_query = (
         select(func.count())
         .select_from(TrainingRun)
-        .where(owner_predicate)
+        .where(workspace_predicate)
     )
     if dataset_id is not None:
         await _owned_dataset_or_404(
             session,
             dataset_id,
-            current_user.id,
+            current_workspace.id,
         )
         predicate = TrainingRun.dataset_id == dataset_id
         page_query = page_query.where(predicate)
@@ -335,12 +339,12 @@ async def list_runs(
 async def get_run(
     run_id: int,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
 ) -> RunDetail:
     run, epoch, image_counts = await _run_with_epoch(
         session,
         run_id,
-        current_user.id,
+        current_workspace.id,
     )
     return RunDetail(
         **_summary(run, epoch).model_dump(),
@@ -359,9 +363,9 @@ async def get_run(
 async def get_run_metrics(
     run_id: int,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
 ) -> list[MetricRow]:
-    await _owned_run_or_404(session, run_id, current_user.id)
+    await _owned_run_or_404(session, run_id, current_workspace.id)
     metrics = (
         await session.scalars(
             select(RunMetric)
@@ -388,10 +392,10 @@ async def get_run_log(
     run_id: int,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
     tail: Annotated[int, Query(ge=1, le=5_000)] = 200,
 ) -> Response:
-    run = await _owned_run_or_404(session, run_id, current_user.id)
+    run = await _owned_run_or_404(session, run_id, current_workspace.id)
     if run.artifacts_deleted_at is not None:
         content = ""
     else:
@@ -416,12 +420,12 @@ async def delete_run_artifacts(
     run_id: int,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: AdminWorkspaceDep,
 ) -> Response:
     run = await _owned_run_or_404(
         session,
         run_id,
-        current_user.id,
+        current_workspace.id,
         for_update=True,
     )
     if run.state in {"running", "canceling"}:
@@ -465,7 +469,7 @@ async def delete_run_artifacts(
             )
         raise
     await asyncio.to_thread(finalize_staged_deletion, staged)
-    await decrease_bytes_used(session, run.owner_id, artifact_bytes)
+    await decrease_bytes_used(session, run.workspace_id, artifact_bytes)
     await session.commit()
     return Response(status_code=204)
 
@@ -475,13 +479,13 @@ async def delete_run(
     run_id: int,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: AdminWorkspaceDep,
     confirm: Annotated[bool, Query()] = False,
 ) -> Response:
     run = await _owned_run_or_404(
         session,
         run_id,
-        current_user.id,
+        current_workspace.id,
         for_update=True,
     )
     if run.state in ACTIVE_RUN_DELETE_STATES:
@@ -530,7 +534,7 @@ async def delete_run(
                     run_dir / "artifacts",
                 )
 
-    owner_id = run.owner_id
+    workspace_id = run.workspace_id
     staged = await stage_training_run_deletion_async(
         request.app.state.settings.storage_dir,
         run.out_dir,
@@ -551,7 +555,7 @@ async def delete_run(
 
     await asyncio.to_thread(finalize_staged_deletion, staged)
     if artifact_bytes:
-        await decrease_bytes_used(session, owner_id, artifact_bytes)
+        await decrease_bytes_used(session, workspace_id, artifact_bytes)
         await session.commit()
     return Response(status_code=204)
 
@@ -567,11 +571,11 @@ async def reject_artifact_directory_download(run_id: int) -> None:
 async def list_run_inference_images(
     run_id: int,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
     cursor: Annotated[int | None, Query(ge=1)] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 48,
 ) -> InferenceImagePage:
-    run = await _owned_run_or_404(session, run_id, current_user.id)
+    run = await _owned_run_or_404(session, run_id, current_workspace.id)
     _ensure_run_can_infer(run)
     split = _inference_split(run)
 
@@ -627,9 +631,9 @@ async def infer_run_image(
     run_image_id: int,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: ViewerWorkspaceDep,
 ) -> Response:
-    run = await _owned_run_or_404(session, run_id, current_user.id)
+    run = await _owned_run_or_404(session, run_id, current_workspace.id)
     _ensure_run_can_infer(run)
     split = _inference_split(run)
 
@@ -705,11 +709,11 @@ async def download_run_artifact(
     name: str,
     request: Request,
     session: Session,
-    current_user: CurrentUserDep,
+    current_workspace: CurrentWorkspaceDep,
 ) -> FileResponse:
     if name not in ARTIFACT_NAMES:
         raise HTTPException(status_code=404, detail="산출물을 찾을 수 없습니다.")
-    run = await _owned_run_or_404(session, run_id, current_user.id)
+    run = await _owned_run_or_404(session, run_id, current_workspace.id)
     if run.artifacts_deleted_at is not None:
         raise HTTPException(status_code=410, detail="산출물이 삭제되었습니다.")
 

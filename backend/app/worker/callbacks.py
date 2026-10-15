@@ -15,7 +15,7 @@ INSERT INTO run_metrics (
 ) SELECT %s, %s, %s, %s, %s, %s, %s, %s
 FROM training_runs AS owned_run
 WHERE owned_run.id=%s
-  AND owned_run.owner_id=%s
+  AND owned_run.workspace_id=%s
   AND owned_run.state='running'
 ON CONFLICT (run_id, epoch) DO UPDATE SET
     box_loss = EXCLUDED.box_loss,
@@ -33,7 +33,7 @@ def _optional_float(value: Any) -> float | None:
 
 def make_epoch_callback(
     run_id: int,
-    owner_id: int,
+    workspace_id: int,
     dsn: str,
 ) -> Callable[[Any], None]:
     """Build a failure-isolated on_fit_epoch_end metric writer."""
@@ -57,7 +57,7 @@ def make_epoch_callback(
                 _optional_float(metrics.get("metrics/mAP50-95(B)")),
                 Json(lr),
                 run_id,
-                owner_id,
+                workspace_id,
             )
             with psycopg.connect(dsn, connect_timeout=5) as connection:
                 with connection.cursor() as cursor:

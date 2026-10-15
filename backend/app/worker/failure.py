@@ -143,7 +143,7 @@ def classify_failure(
 
 def persist_worker_failure(
     run_id: int,
-    owner_id: int,
+    workspace_id: int,
     dsn: str,
     report: FailureReport,
     *,
@@ -170,13 +170,13 @@ def persist_worker_failure(
                         finished_at=COALESCE(finished_at, now()),
                         error=COALESCE(error, %s),
                         artifact_bytes=%s
-                    WHERE id=%s AND owner_id=%s AND state='running'
+                    WHERE id=%s AND workspace_id=%s AND state='running'
                     """,
-                    (report.reason, artifact_bytes, run_id, owner_id),
+                    (report.reason, artifact_bytes, run_id, workspace_id),
                 )
                 updated = cursor.rowcount == 1
                 if updated:
-                    increase_bytes_used_sync(cursor, owner_id, artifact_bytes)
+                    increase_bytes_used_sync(cursor, workspace_id, artifact_bytes)
     except BaseException:
         restore_staged_deletion(staged)
         raise

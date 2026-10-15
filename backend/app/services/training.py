@@ -141,7 +141,7 @@ def _weight_is_available(weights: str) -> bool:
 
 def spawn_worker(
     run_id: int,
-    owner_id: int,
+    workspace_id: int,
     out_dir: str | Path,
     database_url: str,
 ) -> SpawnedWorker:
@@ -156,8 +156,8 @@ def spawn_worker(
         "app.worker.train_worker",
         "--run-id",
         str(run_id),
-        "--owner-id",
-        str(owner_id),
+        "--workspace-id",
+        str(workspace_id),
     ]
     environment = {
         **os.environ,
@@ -186,7 +186,7 @@ def spawn_worker(
 async def _mark_spawn_failed(
     session: AsyncSession,
     run_id: int,
-    owner_id: int,
+    workspace_id: int,
     error: Exception,
     *,
     storage_dir: Path,
@@ -195,7 +195,7 @@ async def _mark_spawn_failed(
         session,
         run_id,
         f"워커 시작 실패: {error}",
-        owner_id=owner_id,
+        workspace_id=workspace_id,
         storage_dir=storage_dir,
     )
 
@@ -205,7 +205,7 @@ async def mark_training_failed(
     run_id: int,
     reason: str,
     *,
-    owner_id: int | None = None,
+    workspace_id: int | None = None,
     active_states: tuple[str, ...] = ("running",),
     storage_dir: Path | None = None,
 ) -> bool:
@@ -214,8 +214,8 @@ async def mark_training_failed(
         TrainingRun.id == run_id,
         TrainingRun.state.in_(active_states),
     ]
-    if owner_id is not None:
-        predicates.append(TrainingRun.owner_id == owner_id)
+    if workspace_id is not None:
+        predicates.append(TrainingRun.workspace_id == workspace_id)
     run = await session.scalar(
         select(TrainingRun).where(*predicates).with_for_update()
     )
@@ -252,7 +252,7 @@ async def mark_training_failed(
     if run.error is None:
         run.error = reason
     run.artifact_bytes = artifact_bytes
-    await increase_bytes_used(session, run.owner_id, artifact_bytes)
+    await increase_bytes_used(session, run.workspace_id, artifact_bytes)
     try:
         await session.commit()
     except BaseException as error:
@@ -273,8 +273,10 @@ async def start_training(
     session: AsyncSession,
     settings: Settings,
     dataset_id: int,
-    owner_id: int,
+    workspace_id: int,
     config: TrainingConfig,
+    *,
+    created_by: int,
 ) -> StartTrainingResult:
     """Validate, atomically claim the GPU slot, split, and materialize a run."""
     # Serialize run submission with dataset deletion and class rename. This
@@ -283,7 +285,7 @@ async def start_training(
         select(Dataset)
         .where(
             Dataset.id == dataset_id,
-            Dataset.owner_id == owner_id,
+            Dataset.workspace_id == workspace_id,
         )
         .with_for_update()
     )
@@ -298,7 +300,7 @@ async def start_training(
     )
     status = await quota_status(
         session,
-        owner_id,
+        workspace_id,
         limit_bytes=settings.quota_bytes_per_user,
         required_bytes=expected_artifact_bytes,
     )
@@ -374,7 +376,8 @@ async def start_training(
     if dataset.is_merged:
         dataset.merge_purpose = "train"
     run = TrainingRun(
-        owner_id=owner_id,
+        workspace_id=workspace_id,
+        created_by=created_by,
         dataset_id=dataset.id,
         dataset_name=dataset.name,
         weights=config.weights,
@@ -420,7 +423,7 @@ async def start_training(
         spawned = await asyncio.to_thread(
             spawn_worker,
             run.id,
-            owner_id,
+            workspace_id,
             out_dir,
             settings.database_url,
         )
@@ -428,7 +431,7 @@ async def start_training(
         changed = await _mark_spawn_failed(
             session,
             run.id,
-            owner_id,
+            workspace_id,
             error,
             storage_dir=settings.storage_dir,
         )
@@ -439,7 +442,7 @@ async def start_training(
         update(TrainingRun)
         .where(
             TrainingRun.id == run.id,
-            TrainingRun.owner_id == owner_id,
+            TrainingRun.workspace_id == workspace_id,
             TrainingRun.state == "running",
         )
         .values(

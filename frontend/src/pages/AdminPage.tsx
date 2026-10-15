@@ -1,20 +1,24 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 
 import {
   ApiError,
   deleteAdminUser,
   getAdminOverview,
   getAdminUsers,
+  getAdminWorkspaces,
   invalidateStorageQuotaCache,
   type AdminOverview,
   type AdminUserRow,
+  type AdminWorkspaceRow,
   updateAdminUserQuota,
+  updateAdminWorkspaceQuota,
 } from "../api/client";
 import { AppShell } from "../components/AppShell";
 import { Icon } from "../components/Icon";
 import { probeAdminOverview } from "../utils/adminAccess";
 import { formatBytes } from "../utils/formatBytes";
 import { quotaBytesFromGiB, quotaGiBFromBytes } from "../utils/quotaLimit";
+import { WORKSPACE_ROLE_LABELS } from "../store/workspace";
 
 function formatDate(iso: string): string {
   const date = new Date(iso);
@@ -47,7 +51,21 @@ type AdminState =
   | { phase: "loading" }
   | { phase: "denied" }
   | { phase: "error"; message: string }
-  | { phase: "ready"; overview: AdminOverview; users: AdminUserRow[] };
+  | { phase: "ready"; overview: AdminOverview; users: AdminUserRow[]; workspaces: AdminWorkspaceRow[] };
+
+interface TeamOwnershipBlock {
+  user: AdminUserRow;
+  workspaces: { id: number; name: string }[];
+}
+
+function ownedTeamsFrom(error: unknown): TeamOwnershipBlock["workspaces"] | null {
+  if (!(error instanceof ApiError) || error.status !== 409) return null;
+  const detail = error.detail as { code?: unknown; workspaces?: unknown } | null;
+  if (!detail || detail.code !== "admin-user-team-owner" || !Array.isArray(detail.workspaces)) return null;
+  if (!detail.workspaces.every((row: unknown) => row && typeof row === "object"
+    && "id" in row && typeof row.id === "number" && "name" in row && typeof row.name === "string")) return null;
+  return detail.workspaces;
+}
 
 interface AdminUserDeleteConfirmation {
   code: "admin-user-delete-confirmation-required";
@@ -122,7 +140,10 @@ export function AdminPage() {
   >(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
-  const [quotaTarget, setQuotaTarget] = useState<AdminUserRow | null>(null);
+  const [quotaTarget, setQuotaTarget] = useState<AdminUserRow | AdminWorkspaceRow | null>(null);
+  const [view, setView] = useState<"users" | "workspaces">("users");
+  const [expandedUsers, setExpandedUsers] = useState<Set<number>>(new Set());
+  const [ownershipBlock, setOwnershipBlock] = useState<TeamOwnershipBlock | null>(null);
   const [updatingQuota, setUpdatingQuota] = useState(false);
   const [quotaError, setQuotaError] = useState<string | null>(null);
 
@@ -136,9 +157,9 @@ export function AdminPage() {
           setState({ phase: "denied" });
           return;
         }
-        const { users } = await getAdminUsers();
+        const [{ users }, { workspaces }] = await Promise.all([getAdminUsers(), getAdminWorkspaces()]);
         if (!alive) return;
-        setState({ phase: "ready", overview, users });
+        setState({ phase: "ready", overview, users, workspaces });
       } catch (error) {
         if (!alive) return;
         if (error instanceof ApiError && error.status === 404) {
@@ -147,7 +168,7 @@ export function AdminPage() {
         }
         const message = error instanceof Error
           ? error.message
-          : "관리자 정보를 불러오지 못했습니다.";
+          : "사이트 관리 정보를 불러오지 못했습니다.";
         setState({ phase: "error", message });
       }
     })();
@@ -157,11 +178,12 @@ export function AdminPage() {
   }, []);
 
   const refresh = async () => {
-    const [overview, { users }] = await Promise.all([
+    const [overview, { users }, { workspaces }] = await Promise.all([
       getAdminOverview(),
       getAdminUsers(),
+      getAdminWorkspaces(),
     ]);
-    setState({ phase: "ready", overview, users });
+    setState({ phase: "ready", overview, users, workspaces });
     const availableUserIds = new Set(users.map((user) => user.id));
     setSelectedUserIds((current) => new Set(
       [...current].filter((userId) => availableUserIds.has(userId)),
@@ -182,7 +204,8 @@ export function AdminPage() {
     setUpdatingQuota(true);
     setQuotaError(null);
     try {
-      await updateAdminUserQuota(quotaTarget.id, limitBytes);
+      if ("kind" in quotaTarget) await updateAdminWorkspaceQuota(quotaTarget.id, limitBytes);
+      else await updateAdminUserQuota(quotaTarget.id, limitBytes);
       invalidateStorageQuotaCache();
       await refresh();
       setQuotaTarget(null);
@@ -207,6 +230,12 @@ export function AdminPage() {
           await deleteAdminUser(user.id);
           throw new Error("삭제 확인 정보를 불러오지 못했습니다.");
         } catch (error) {
+          const teams = ownedTeamsFrom(error);
+          if (teams) {
+            setOwnershipBlock({ user, workspaces: teams });
+            setConfirmations(null);
+            return;
+          }
           const detail = userDeleteConfirmationFrom(error);
           if (!detail) throw error;
           pending.push({ user, detail });
@@ -228,11 +257,20 @@ export function AdminPage() {
     const targets = [...confirmations];
     const completedIds = new Set<number>();
     let deletedCount = 0;
+    let blockedByOwnership = false;
     setDeleting(true);
     setDeleteError(null);
     try {
       for (const target of targets) {
-        await deleteAdminUser(target.user.id, true);
+        try {
+          await deleteAdminUser(target.user.id, true);
+        } catch (error) {
+          const teams = ownedTeamsFrom(error);
+          if (!teams) throw error;
+          blockedByOwnership = true;
+          setOwnershipBlock({ user: target.user, workspaces: teams });
+          break;
+        }
         completedIds.add(target.user.id);
         deletedCount += 1;
       }
@@ -261,7 +299,7 @@ export function AdminPage() {
       const remaining = targets.filter(
         (target) => !completedIds.has(target.user.id),
       );
-      setConfirmations(remaining.length > 0 ? remaining : null);
+      setConfirmations(!blockedByOwnership && remaining.length > 0 ? remaining : null);
       setDeleting(false);
     }
   };
@@ -273,20 +311,21 @@ export function AdminPage() {
   if (state.phase === "loading") return null;
   if (state.phase === "error") {
     return (
-      <AppShell active="admin" breadcrumb="관리자">
+      <AppShell active="admin" breadcrumb="사이트 관리">
         <p className="card-meta" role="alert">{state.message}</p>
       </AppShell>
     );
   }
 
-  const { overview, users } = state;
+  const { overview, users, workspaces } = state;
+  const emails = new Map(users.map((user) => [user.id, user.email]));
   const selectedUsers = users.filter((user) => selectedUserIds.has(user.id));
   const allUsersSelected = users.length > 0
     && selectedUsers.length === users.length;
   const someUsersSelected = selectedUsers.length > 0 && !allUsersSelected;
   const operationBusy = deleting || updatingQuota;
   return (
-    <AppShell active="admin" breadcrumb="관리자">
+    <AppShell active="admin" breadcrumb="사이트 관리">
       <div style={STACK_STYLE}>
         <section style={STAT_ROW_STYLE} aria-label="서비스 현황">
           <div className="card" style={STAT_CARD_STYLE}>
@@ -303,11 +342,18 @@ export function AdminPage() {
           </div>
         </section>
 
-        <section className="card admin-users-card" aria-label="전체 사용자">
+        <section className="card admin-users-card" aria-label={view === "users" ? "전체 사용자" : "전체 워크스페이스"}>
           <header className="admin-users-header">
-            <h2 className="card-title">전체 사용자 (용량 내림차순)</h2>
-            <button
+            <h2 className="card-title">{view === "users" ? "전체 사용자" : "전체 워크스페이스"} (용량 내림차순)</h2>
+            <div className="seg" role="group" aria-label="관리 보기" style={{ marginLeft: "auto" }}>
+              <button type="button" className="seg-opt"
+                aria-pressed={view === "users"} onClick={() => setView("users")}>사용자</button>
+              <button type="button" className="seg-opt"
+                aria-pressed={view === "workspaces"} onClick={() => setView("workspaces")}>워크스페이스</button>
+            </div>
+            {view === "users" ? <button
               className="btn btn-danger btn-sm"
+              style={{ marginLeft: 0 }}
               type="button"
               aria-label="선택한 사용자 삭제"
               disabled={selectedUsers.length === 0 || operationBusy}
@@ -315,12 +361,12 @@ export function AdminPage() {
             >
               <Icon name="trash" size={14} />
               {deleting && confirmations === null ? "확인 중…" : "삭제"}
-            </button>
+            </button> : null}
           </header>
           {deleteError && !confirmations ? (
             <p className="error-text" role="alert">{deleteError}</p>
           ) : null}
-          <table className="table admin-users-table">
+          {view === "users" ? <table className="table admin-users-table">
             <colgroup>
               <col className="admin-user-select-column" />
               <col />
@@ -357,7 +403,7 @@ export function AdminPage() {
             </thead>
             <tbody>
               {users.map((user) => (
-                <tr key={user.id} aria-selected={selectedUserIds.has(user.id)}>
+                <Fragment key={user.id}><tr aria-selected={selectedUserIds.has(user.id)}>
                   <td className="admin-user-select-cell">
                     <button
                       className={`checkbox${selectedUserIds.has(user.id) ? " is-on" : ""}`}
@@ -373,7 +419,13 @@ export function AdminPage() {
                         : null}
                     </button>
                   </td>
-                  <td>{displayName(user)}</td>
+                  <td><button className="btn btn-ghost btn-sm" type="button"
+                    aria-label={`${displayName(user)} 워크스페이스`} aria-expanded={expandedUsers.has(user.id)}
+                    onClick={() => setExpandedUsers((current) => {
+                      const next = new Set(current);
+                      if (next.has(user.id)) next.delete(user.id); else next.add(user.id);
+                      return next;
+                    })}>{expandedUsers.has(user.id) ? "▾" : "▸"}</button>{displayName(user)}</td>
                   <td>{user.login_methods.length ? user.login_methods.join(" · ") : "—"}</td>
                   <td className="mono">{formatDate(user.created_at)}</td>
                   <td className="mono">{formatBytes(user.bytes_used)}</td>
@@ -393,14 +445,37 @@ export function AdminPage() {
                     </div>
                   </td>
                 </tr>
+                {expandedUsers.has(user.id) ? user.workspaces.map((workspace) => <tr className="subrow" key={workspace.id}>
+                  <td />
+                  <td>{workspace.name}</td>
+                  <td>{workspace.kind === "personal" ? "개인" : "팀"}</td>
+                  <td>{WORKSPACE_ROLE_LABELS[workspace.role]}</td>
+                  <td className="mono">{workspace.bytes_used == null ? "—" : formatBytes(workspace.bytes_used)}</td>
+                  <td className="mono">{workspace.limit_bytes == null ? "—" : formatBytes(workspace.limit_bytes)}</td>
+                </tr>) : null}</Fragment>
               ))}
               {users.length === 0 ? (
                 <tr><td colSpan={6}>등록된 사용자가 없습니다.</td></tr>
               ) : null}
             </tbody>
-          </table>
+          </table> : <table className="table admin-users-table">
+            <thead><tr><th>이름</th><th>종류</th><th>소유자</th><th>멤버</th><th>사용 용량</th><th>할당 용량</th><th>변경</th></tr></thead>
+            <tbody>{workspaces.map((workspace) => <tr key={workspace.id}>
+              <td>{workspace.name}</td>
+              <td>{workspace.kind === "personal" ? "개인" : "팀"}</td>
+              <td>{workspace.owner_user_id == null ? "—" : emails.get(workspace.owner_user_id) ?? "—"}</td>
+              <td className="mono">{workspace.member_count?.toLocaleString() ?? "—"}</td>
+              <td className="mono">{workspace.bytes_used == null ? "—" : formatBytes(workspace.bytes_used)}</td>
+              <td className="mono">{workspace.limit_bytes == null ? "—" : formatBytes(workspace.limit_bytes)}{workspace.quota_override ? " *" : ""}</td>
+              <td><button type="button" className="btn btn-primary btn-sm" disabled={operationBusy}
+                aria-label={`${workspace.name} 할당 용량 변경`}
+                onClick={() => { setQuotaError(null); setQuotaTarget(workspace); }}>변경</button></td>
+            </tr>)}{workspaces.length === 0 ? <tr><td colSpan={7}>등록된 워크스페이스가 없습니다.</td></tr> : null}</tbody>
+          </table>}
         </section>
       </div>
+
+      {ownershipBlock ? <TeamOwnerDeleteDialog target={ownershipBlock} onClose={() => setOwnershipBlock(null)} /> : null}
 
       {confirmations ? (
         <DeleteUsersDialog
@@ -419,7 +494,7 @@ export function AdminPage() {
 
       {quotaTarget ? (
         <QuotaLimitDialog
-          key={quotaTarget.id}
+          key={`${"kind" in quotaTarget ? "workspace" : "user"}:${quotaTarget.id}`}
           user={quotaTarget}
           busy={updatingQuota}
           error={quotaError}
@@ -436,8 +511,30 @@ export function AdminPage() {
   );
 }
 
+function TeamOwnerDeleteDialog({ target, onClose }: { target: TeamOwnershipBlock; onClose: () => void }) {
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => { confirmRef.current?.focus(); }, []);
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => {
+    if (event.target === event.currentTarget) onClose();
+  }}>
+    <section className="dialog project-action-dialog" role="dialog" aria-modal="true" aria-labelledby="admin-owner-block-title">
+      <h2 className="dialog-title" id="admin-owner-block-title">삭제할 수 없어요</h2>
+      <p>{displayName(target.user)} 님은 아래 팀의 소유자예요. 먼저 소유권을 다른 멤버에게 넘겨야 삭제할 수 있어요.</p>
+      <ul>{target.workspaces.map((workspace) => <li key={workspace.id}>{workspace.name}</li>)}</ul>
+      <div className="dialog-actions"><button className="btn btn-primary" type="button" ref={confirmRef} onClick={onClose}>확인</button></div>
+    </section>
+  </div>;
+}
+
 interface QuotaLimitDialogProps {
-  user: AdminUserRow;
+  user: AdminUserRow | AdminWorkspaceRow;
   busy: boolean;
   error: string | null;
   onClose: () => void;
@@ -451,10 +548,10 @@ function QuotaLimitDialog({
   onClose,
   onConfirm,
 }: QuotaLimitDialogProps) {
-  const [value, setValue] = useState(() => quotaGiBFromBytes(user.limit_bytes));
+  const [value, setValue] = useState(() => user.limit_bytes == null ? "" : quotaGiBFromBytes(user.limit_bytes));
   const inputRef = useRef<HTMLInputElement>(null);
   const limitBytes = quotaBytesFromGiB(value);
-  const belowCurrentUsage = limitBytes !== null && limitBytes < user.bytes_used;
+  const belowCurrentUsage = limitBytes !== null && user.bytes_used != null && limitBytes < user.bytes_used;
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -486,7 +583,7 @@ function QuotaLimitDialog({
       >
         <h2 className="dialog-title" id="quota-limit-title">할당 용량 변경</h2>
         <p id="quota-limit-description">
-          <strong>{displayName(user)}</strong> 계정에 사용할 수 있는 최대 저장
+          <strong>{"kind" in user ? user.name : displayName(user)}</strong> {"kind" in user ? "워크스페이스" : "계정"}에 사용할 수 있는 최대 저장
           용량을 설정합니다.
         </p>
         <form
@@ -520,8 +617,8 @@ function QuotaLimitDialog({
             ) : null}
           </div>
           <dl className="quota-limit-summary">
-            <div><dt>현재 사용량</dt><dd>{formatBytes(user.bytes_used)}</dd></div>
-            <div><dt>현재 할당량</dt><dd>{formatBytes(user.limit_bytes)}</dd></div>
+            <div><dt>현재 사용량</dt><dd>{user.bytes_used == null ? "—" : formatBytes(user.bytes_used)}</dd></div>
+            <div><dt>현재 할당량</dt><dd>{user.limit_bytes == null ? "—" : formatBytes(user.limit_bytes)}</dd></div>
           </dl>
           <p className="hint">
             사용량보다 작게 설정해도 기존 데이터는 유지되며, 용량을 확보할

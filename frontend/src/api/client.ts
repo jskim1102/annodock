@@ -1,5 +1,14 @@
 import { refreshAuthSession } from "./auth";
 import { getAuthSnapshot } from "../store/auth";
+import { getActiveWorkspaceId } from "../store/workspace";
+
+export interface ApiRequestInit extends RequestInit {
+  workspaceId?: number | null;
+}
+
+export function captureWorkspaceId(): number | null {
+  return getActiveWorkspaceId();
+}
 
 export type DatasetStatus = "pending" | "processing" | "ready" | "failed" | "archived";
 export type JobState =
@@ -108,6 +117,8 @@ export interface DatasetMergeOverlap {
 }
 
 export interface DatasetDetail extends DatasetRow {
+  workspace_id: number;
+  my_role: "viewer" | "editor" | "admin" | "owner";
   splits: { split: string; image_count: number }[];
 }
 
@@ -188,7 +199,15 @@ export interface ProjectDeleteConfirmation {
   datasets: ProjectDeleteDataset[];
 }
 
-export interface ImageRow {
+export interface AnnotationState {
+  version: number;
+  label_status: "unlabeled" | "in_progress" | "labeled";
+  assignee_id: number | null;
+}
+
+export interface ImageRow extends AnnotationState {
+  labeled_by: number | null;
+  labeled_at: string | null;
   id: number;
   stem: string;
   filename: string;
@@ -208,7 +227,17 @@ export interface BoxDto {
   h: number;
 }
 
-export interface AnnotationResponse {
+export interface DatasetCatalogVersion {
+  dataset_id: number;
+  catalog_version: number;
+}
+
+export interface ClassCatalog {
+  classes: ClassRow[];
+  catalog_version: number;
+}
+
+export interface AnnotationResponse extends AnnotationState, ClassCatalog {
   image_id: number;
   width: number;
   height: number;
@@ -229,7 +258,8 @@ export type IssueKind =
   | "rejected_file"
   | "duplicate_skipped"
   | "ignored_file"
-  | "class_conflict";
+  | "class_conflict"
+  | "upload_lock_retry";
 
 export interface IssueRow {
   kind: IssueKind;
@@ -264,7 +294,14 @@ async function errorFromResponse(response: Response): Promise<ApiError> {
   try {
     const body = await response.json() as { detail?: unknown };
     detail = body.detail;
-    if (typeof detail === "string") {
+    if (response.status === 403 && detail && typeof detail === "object"
+      && "code" in detail && detail.code === "insufficient_role") {
+      const roles: Record<string, string> = { owner: "소유자", admin: "관리자", editor: "라벨러" };
+      const { required, actual } = detail as { required?: string; actual?: string };
+      const currentRole = roles[actual ?? ""];
+      message = `이 작업은 ${roles[required ?? ""] ?? "권한이 있는 사용자"} 이상만 할 수 있어요${currentRole ? ` (지금: ${currentRole})` : ""}`;
+      window.dispatchEvent(new CustomEvent("annodock:role-error", { detail: message }));
+    } else if (typeof detail === "string") {
       message = detail;
     } else if (detail && typeof detail === "object" && "message" in detail) {
       const candidate = (detail as { message?: unknown }).message;
@@ -369,16 +406,25 @@ async function retryApiOnce(
 
 export async function apiFetch(
   path: string,
-  init?: RequestInit,
+  init?: ApiRequestInit,
 ): Promise<Response> {
+  const { workspaceId = captureWorkspaceId(), ...requestInit } = init ?? {};
+  const headers = new Headers(requestInit.headers);
+  if (init?.workspaceId !== undefined || !headers.has("X-Workspace-Id")) {
+    if (workspaceId === null) headers.delete("X-Workspace-Id");
+    else headers.set("X-Workspace-Id", String(workspaceId));
+  }
+  // Every retry uses this immutable request scope, even if the user switches
+  // workspaces while token refresh or another request is still in flight.
+  const scopedInit = { ...requestInit, headers };
   const tokenUsed = getAuthSnapshot().accessToken;
-  const response = await fetchApiOnce(path, init, tokenUsed);
+  const response = await fetchApiOnce(path, scopedInit, tokenUsed);
   if (response.status !== 401) return response;
 
   const current = getAuthSnapshot();
   if (current.accessToken && current.accessToken !== tokenUsed) {
     // Another request already rotated the pair while this request was in flight.
-    return retryApiOnce(path, init, current.accessToken);
+    return retryApiOnce(path, scopedInit, current.accessToken);
   }
   // The refresh credential lives in an httpOnly cookie, so recovery remains
   // possible even if this tab's JavaScript/localStorage copy disappeared.
@@ -387,12 +433,12 @@ export async function apiFetch(
   const refreshedAccess = await refreshAuthSession(tokenUsed);
   // The original request is retried exactly once. A second 401 is returned to
   // the caller rather than entering another refresh loop.
-  return retryApiOnce(path, init, refreshedAccess);
+  return retryApiOnce(path, scopedInit, refreshedAccess);
 }
 
 export async function requestJson<T>(
   path: string,
-  init?: RequestInit,
+  init?: ApiRequestInit,
 ): Promise<T> {
   const response = await responseOrThrow(await apiFetch(path, init));
   if (response.status === 204) return undefined as T;
@@ -438,6 +484,21 @@ export function createProject(project: ProjectCreateInput): Promise<ProjectRow> 
   return requestJson("/api/projects", jsonInit("POST", project));
 }
 
+export interface ProjectTransferResult {
+  project_id: number;
+  workspace_id: number;
+  moved_bytes: number;
+}
+
+export function transferProject(
+  projectId: number, targetWorkspaceId: number, sourceWorkspaceId: number,
+): Promise<ProjectTransferResult> {
+  return requestJson(`/api/projects/${projectId}/transfer`, {
+    ...jsonInit("POST", { target_workspace_id: targetWorkspaceId }),
+    workspaceId: sourceWorkspaceId,
+  });
+}
+
 export function mergeProjects(input: ProjectMergeInput): Promise<ProjectRow> {
   return requestJson<ProjectRow>("/api/projects/merge", jsonInit("POST", input));
 }
@@ -465,8 +526,8 @@ export function updateProjectClass(
   projectId: number,
   classId: number,
   input: { name?: string; color?: string },
-): Promise<ProjectClassRow> {
-  return requestJson<ProjectClassRow>(
+): Promise<ProjectClassRow & { catalog_versions: DatasetCatalogVersion[] }> {
+  return requestJson<ProjectClassRow & { catalog_versions: DatasetCatalogVersion[] }>(
     `/api/projects/${projectId}/classes/${classId}`,
     jsonInit("PATCH", input),
   );
@@ -476,8 +537,8 @@ export function updateProjectClasses(
   projectId: number,
   expectedUpdatedAt: string,
   classes: readonly ProjectClassRow[],
-): Promise<{ classes: ProjectClassRow[] }> {
-  return requestJson<{ classes: ProjectClassRow[] }>(
+): Promise<{ classes: ProjectClassRow[]; catalog_versions: DatasetCatalogVersion[] }> {
+  return requestJson<{ classes: ProjectClassRow[]; catalog_versions: DatasetCatalogVersion[] }>(
     `/api/projects/${projectId}/classes`,
     jsonInit("PUT", { expected_updated_at: expectedUpdatedAt, classes }),
   );
@@ -499,16 +560,17 @@ function waitForNextJobPoll(): Promise<void> {
 
 async function waitForMergedDataset(
   queued: DatasetListItem,
+  workspaceId: number | null,
 ): Promise<DatasetListItem> {
   const jobId = queued.active_job?.job_id;
   if (jobId === undefined) return queued;
 
   while (true) {
-    const job = await getJob(jobId);
+    const job = await getJob(jobId, workspaceId);
     if (job.state === "failed") {
       let detail = "데이터셋 병합 작업에 실패했습니다.";
       try {
-        const issues = await getAllIssues(queued.id);
+        const issues = await getAllIssues(queued.id, workspaceId);
         detail = issues[0]?.detail || detail;
       } catch {
         // Preserve the terminal job failure when issue details are unavailable.
@@ -536,12 +598,13 @@ async function waitForMergedDataset(
 
 export async function mergeDatasets(
   input: DatasetMergeInput,
+  workspaceId: number | null = captureWorkspaceId(),
 ): Promise<DatasetListItem> {
   const queued = await requestJson<DatasetListItem>(
     "/api/datasets/merge",
-    jsonInit("POST", input),
+    { ...jsonInit("POST", input), workspaceId },
   );
-  return waitForMergedDataset(queued);
+  return waitForMergedDataset(queued, workspaceId);
 }
 
 export function extractDatasetClasses(
@@ -553,21 +616,23 @@ export function extractDatasetClasses(
 export function extendMergedDataset(
   mergedDatasetId: number,
   input: DatasetMergeSourcesInput,
+  workspaceId?: number | null,
 ): Promise<DatasetListItem> {
   return requestJson<DatasetListItem>(
     `/api/datasets/${mergedDatasetId}/merge-sources`,
-    jsonInit("POST", input),
+    { ...jsonInit("POST", input), workspaceId },
   );
 }
 
-export function getDataset(datasetId: number): Promise<DatasetDetail> {
-  return requestJson(`/api/datasets/${datasetId}`);
+export function getDataset(datasetId: number, workspaceId?: number | null): Promise<DatasetDetail> {
+  return requestJson(`/api/datasets/${datasetId}`, { workspaceId });
 }
 
 export function getDatasetClasses(
   datasetId: number,
-): Promise<{ classes: ClassRow[] }> {
-  return requestJson(`/api/datasets/${datasetId}/classes`);
+  workspaceId?: number | null,
+): Promise<ClassCatalog> {
+  return requestJson(`/api/datasets/${datasetId}/classes`, { workspaceId });
 }
 
 export function getDatasetImages(
@@ -587,20 +652,24 @@ export function getDatasetImages(
 export function getImageAnnotations(
   imageId: number,
   signal?: AbortSignal,
+  workspaceId?: number | null,
 ): Promise<AnnotationResponse> {
   return requestJson(
     `/api/images/${imageId}/annotations`,
-    signal ? { signal } : undefined,
+    { signal, workspaceId },
   );
 }
 
 export function saveImageAnnotations(
   imageId: number,
   boxes: Array<Omit<BoxDto, "id">>,
-): Promise<{ image_id: number; boxes: BoxDto[]; is_modified: boolean }> {
+  workspaceId: number | null | undefined,
+  expectedVersion: number,
+  expectedCatalogVersion: number,
+): Promise<AnnotationState & ClassCatalog & { image_id: number; boxes: BoxDto[]; is_modified: boolean }> {
   return requestJson(
     `/api/images/${imageId}/annotations`,
-    jsonInit("PUT", { boxes }),
+    { ...jsonInit("PUT", { boxes, expected_version: expectedVersion, expected_catalog_version: expectedCatalogVersion }), workspaceId },
   );
 }
 
@@ -608,10 +677,12 @@ export function renameDatasetClass(
   datasetId: number,
   classId: number,
   name: string,
-): Promise<ClassRow> {
+  expectedCatalogVersion?: number,
+  workspaceId?: number | null,
+): Promise<ClassRow & ClassCatalog> {
   return requestJson(
     `/api/datasets/${datasetId}/classes/${classId}`,
-    jsonInit("PATCH", { name }),
+    { ...jsonInit("PATCH", { name, expected_catalog_version: expectedCatalogVersion }), workspaceId },
   );
 }
 
@@ -619,26 +690,28 @@ export function imageResourceUrl(imageId: number, kind: "file" | "thumb" = "file
   return `/api/images/${imageId}/${kind}`;
 }
 
-export function getJob(jobId: number): Promise<Job> {
-  return requestJson(`/api/jobs/${jobId}`);
+export function getJob(jobId: number, workspaceId?: number | null): Promise<Job> {
+  return requestJson(`/api/jobs/${jobId}`, { workspaceId });
 }
 
 export function resolveJobClassConflicts(
   jobId: number,
   resolution: ClassResolutionRequest,
+  workspaceId?: number | null,
 ): Promise<{ job_id: number }> {
   return requestJson(
     `/api/jobs/${jobId}/class-resolution`,
-    jsonInit("POST", resolution),
+    { ...jsonInit("POST", resolution), workspaceId },
   );
 }
 
-export async function getAllIssues(datasetId: number): Promise<IssueRow[]> {
+export async function getAllIssues(datasetId: number, workspaceId: number | null = captureWorkspaceId()): Promise<IssueRow[]> {
   const items: IssueRow[] = [];
   let total = 1;
   while (items.length < total) {
     const page = await requestJson<PageResponse<IssueRow>>(
       `/api/datasets/${datasetId}/issues?offset=${items.length}&limit=1000`,
+      { workspaceId },
     );
     total = page.total;
     items.push(...page.items);
@@ -649,10 +722,28 @@ export async function getAllIssues(datasetId: number): Promise<IssueRow[]> {
 
 export async function downloadResponse(
   path: string,
-  init?: RequestInit,
+  init?: ApiRequestInit,
 ): Promise<Blob> {
   const response = await responseOrThrow(await apiFetch(path, init));
   return response.blob();
+}
+
+export interface AdminWorkspaceUsage {
+  id: number;
+  kind: "personal" | "team";
+  name: string;
+  bytes_used: number;
+  limit_bytes: number;
+  quota_override: boolean;
+}
+
+export interface AdminUserWorkspaceRow extends AdminWorkspaceUsage {
+  role: "owner" | "admin" | "editor" | "viewer";
+}
+
+export interface AdminWorkspaceRow extends AdminWorkspaceUsage {
+  owner_user_id: number | null;
+  member_count: number;
 }
 
 export interface AdminUserRow {
@@ -663,6 +754,7 @@ export interface AdminUserRow {
   login_methods: string[];
   bytes_used: number;
   limit_bytes: number;
+  workspaces: AdminUserWorkspaceRow[];
 }
 
 export interface AdminQuotaUpdateResponse {
@@ -683,17 +775,20 @@ export interface StorageQuota {
 
 let storageQuotaCache: {
   tokenKey: string;
+  workspaceId: number | null;
   request: Promise<StorageQuota>;
 } | null = null;
 
 export const STORAGE_QUOTA_INVALIDATED_EVENT = "annodock:storage-quota-invalidated";
 
-export function getStorageQuota(tokenKey: string): Promise<StorageQuota> {
-  if (storageQuotaCache?.tokenKey === tokenKey) {
+export function getStorageQuota(
+  tokenKey: string, workspaceId: number | null = captureWorkspaceId(),
+): Promise<StorageQuota> {
+  if (storageQuotaCache?.tokenKey === tokenKey && storageQuotaCache.workspaceId === workspaceId) {
     return storageQuotaCache.request;
   }
-  const request = requestJson<StorageQuota>("/api/storage");
-  storageQuotaCache = { tokenKey, request };
+  const request = requestJson<StorageQuota>("/api/storage", { workspaceId });
+  storageQuotaCache = { tokenKey, workspaceId, request };
   void request.catch(() => {
     if (storageQuotaCache?.request === request) storageQuotaCache = null;
   });
@@ -717,6 +812,16 @@ export function getAdminUsers(): Promise<{ users: AdminUserRow[] }> {
   return requestJson("/api/admin/users");
 }
 
+export function getAdminWorkspaces(): Promise<{ workspaces: AdminWorkspaceRow[] }> {
+  return requestJson("/api/admin/workspaces");
+}
+
+export function updateAdminWorkspaceQuota(
+  workspaceId: number, limitBytes: number,
+): Promise<{ workspace_id: number; limit_bytes: number }> {
+  return requestJson(`/api/admin/workspaces/${workspaceId}/quota`, jsonInit("PATCH", { limit_bytes: limitBytes }));
+}
+
 export function updateAdminUserQuota(
   userId: number,
   limitBytes: number,
@@ -730,4 +835,38 @@ export function updateAdminUserQuota(
 export function deleteAdminUser(userId: number, confirm = false): Promise<void> {
   const suffix = confirm ? "?confirm=true" : "";
   return requestJson(`/api/admin/users/${userId}${suffix}`, jsonInit("DELETE"));
+}
+
+
+export function getImage(imageId: number, workspaceId?: number | null): Promise<ImageRow> {
+  return requestJson(`/api/images/${imageId}`, { workspaceId });
+}
+export function claimDatasetImage(datasetId: number, split: string | null, workspaceId: number): Promise<{image: ImageRow | null; position?: number}> {
+  return requestJson(`/api/datasets/${datasetId}/claim`, { ...jsonInit("POST", { split }), workspaceId });
+}
+export function completeImage(imageId: number, workspaceId: number): Promise<ImageRow> {
+  return requestJson(`/api/images/${imageId}/complete`, { method: "POST", workspaceId });
+}
+export function uncompleteImage(imageId: number, workspaceId: number): Promise<ImageRow> {
+  return requestJson(`/api/images/${imageId}/uncomplete`, { method: "POST", workspaceId });
+}
+export function assignImage(imageId: number, assigneeId: number | null, workspaceId: number): Promise<ImageRow> {
+  return requestJson(`/api/images/${imageId}/assignment`, { ...jsonInit("PATCH", { assignee_id: assigneeId }), workspaceId });
+}
+export interface DatasetProgress {
+  total: number;
+  unlabeled: number;
+  in_progress: number;
+  labeled: number;
+  imported_labeled: number;
+  members: Array<{user_id: number; in_progress: number; labeled: number}>;
+}
+export function getDatasetProgress(id: number, workspaceId: number): Promise<DatasetProgress> {
+  return requestJson(`/api/datasets/${id}/progress`, { workspaceId });
+}
+export function distributeDatasetAssignments(id: number, userIds: number[], workspaceId: number): Promise<{assigned: Record<string, number>}> {
+  return requestJson(`/api/datasets/${id}/assignments/distribute`, { ...jsonInit("POST", { user_ids: userIds }), workspaceId });
+}
+export function reclaimDatasetAssignments(id: number, userId: number, workspaceId: number): Promise<{reclaimed: number}> {
+  return requestJson(`/api/datasets/${id}/assignments/reclaim`, { ...jsonInit("POST", { user_id: userId }), workspaceId });
 }

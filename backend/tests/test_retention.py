@@ -10,7 +10,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import delete
 
-from app.models import Dataset, Project, TrainingRun, UserStorage
+from app.models import Dataset, Project, TrainingRun, Workspace, WorkspaceMember, WorkspaceStorage
 from app.services import cleanup
 
 
@@ -26,14 +26,15 @@ def _name(kind: str) -> str:
 
 
 def _run(
-    owner_id: int,
+    workspace_id: int,
     *,
     state: str,
     finished_at: datetime | None,
     dataset_id: int | None = None,
 ) -> TrainingRun:
     return TrainingRun(
-        owner_id=owner_id,
+        workspace_id=workspace_id,
+        created_by=workspace_id,
         dataset_id=dataset_id,
         dataset_name=_name("run"),
         weights="yolo26n.pt",
@@ -50,16 +51,16 @@ def _run(
     )
 
 
-async def _persist_dataset(app, owner_id: int, payload: bytes) -> tuple[int, Path]:
+async def _persist_dataset(app, workspace_id: int, payload: bytes) -> tuple[int, Path]:
     async with app.state.session_factory() as session:
         project = Project(
-            owner_id=owner_id,
+            workspace_id=workspace_id,
             name=_name("project"),
         )
         session.add(project)
         await session.flush()
         dataset = Dataset(
-            owner_id=owner_id,
+            workspace_id=workspace_id,
             project_id=project.id,
             name=_name("dataset"),
             status="ready",
@@ -110,27 +111,36 @@ async def _persist_run(
     return run_id, out_dir, sum(len(payload) for payload in artifact_parts)
 
 
-async def _set_usage(app, owner_id: int, bytes_used: int) -> None:
+async def _set_usage(app, workspace_id: int, bytes_used: int) -> None:
     async with app.state.session_factory() as session:
-        session.add(UserStorage(owner_id=owner_id, bytes_used=bytes_used))
+        session.add(WorkspaceStorage(workspace_id=workspace_id, bytes_used=bytes_used))
         await session.commit()
 
 
-async def _run_and_usage(app, run_id: int, owner_id: int):
+async def _run_and_usage(app, run_id: int, workspace_id: int):
     async with app.state.session_factory() as session:
         return (
             await session.get(TrainingRun, run_id),
-            await session.get(UserStorage, owner_id),
+            await session.get(WorkspaceStorage, workspace_id),
         )
 
 
 @pytest_asyncio.fixture(autouse=True)
 async def cleanup_retention_users(app):
+    async with app.state.session_factory() as session:
+        for user_id in (OWNER_A, OWNER_B):
+            session.add(Workspace(
+                id=user_id, kind="personal", name="개인", created_by=user_id,
+            ))
+            await session.flush()
+            session.add(WorkspaceMember(workspace_id=user_id, user_id=user_id, role="owner"))
+        await session.commit()
+
     async def remove_rows() -> None:
         async with app.state.session_factory() as session:
             await session.execute(
-                delete(UserStorage).where(
-                    UserStorage.owner_id.in_((OWNER_A, OWNER_B))
+                delete(WorkspaceStorage).where(
+                    WorkspaceStorage.workspace_id.in_((OWNER_A, OWNER_B))
                 )
             )
             await session.commit()

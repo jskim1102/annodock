@@ -23,7 +23,8 @@ def _run(
     artifacts_deleted_at: datetime | None = None,
 ) -> TrainingRun:
     return TrainingRun(
-        owner_id=1,
+        workspace_id=1,
+        created_by=1,
         dataset_id=dataset_id,
         dataset_name=f"test-runs-api-{uuid4().hex}",
         weights="yolo26n.pt",
@@ -95,13 +96,13 @@ async def test_runs_api_list_aggregates_epoch_without_n_plus_one(
 ) -> None:
     async with app.state.session_factory() as session:
         project = Project(
-            owner_id=1,
+            workspace_id=1,
             name=f"test-runs-api-project-{uuid4().hex}",
         )
         session.add(project)
         await session.flush()
         dataset = Dataset(
-            owner_id=1,
+            workspace_id=1,
             project_id=project.id,
             name=f"test-runs-api-dataset-{uuid4().hex}",
             status="ready",
@@ -169,7 +170,9 @@ async def test_runs_api_list_aggregates_epoch_without_n_plus_one(
         "finished_at",
         "artifacts_deleted_at",
     }
-    assert len(statements) == 2
+    assert len(statements) == 3
+    assert sum("FROM workspaces" in statement for statement in statements) == 1
+    assert sum("FROM training_runs" in statement for statement in statements) == 2
     assert sum("run_metrics" in statement for statement in statements) == 1
 
     filtered = await client.get(

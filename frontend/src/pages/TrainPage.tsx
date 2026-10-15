@@ -1,3 +1,4 @@
+import { useWorkspace } from "../store/workspace";
 import { type FormEvent, useEffect, useState } from "react";
 
 import {
@@ -36,6 +37,8 @@ const RATIO_FIELD_BY_KEY: Record<SplitKey, TrainingNumericField> = {
 };
 
 export function TrainPage({ datasetId }: { datasetId: number }) {
+  const { active } = useWorkspace();
+  const canManage = active?.role === "admin" || active?.role === "owner";
   const [dataset, setDataset] = useState<DatasetDetail | null>(null);
   const [classImageCounts, setClassImageCounts] = useState<ProjectClassImageCount[]>([]);
   const [classImageCountsLoading, setClassImageCountsLoading] = useState(true);
@@ -267,6 +270,7 @@ export function TrainPage({ datasetId }: { datasetId: number }) {
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (!canManage) return;
     const numericErrors = validateTrainingFormNumericValues({
       trainRatio: ratioInputs.train,
       validRatio: ratioInputs.valid,
@@ -359,6 +363,8 @@ export function TrainPage({ datasetId }: { datasetId: number }) {
       setSubmitting(false);
     }
   };
+
+  if (!canManage) return <AppShell active="projects" breadcrumb="학습"><p className="banner-info">관리자 이상만 학습을 시작할 수 있어요</p></AppShell>;
 
   return (
     <AppShell

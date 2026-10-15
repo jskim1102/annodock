@@ -33,7 +33,8 @@ def _run(
     state: str = "running",
 ) -> TrainingRun:
     return TrainingRun(
-        owner_id=1,
+        workspace_id=1,
+        created_by=1,
         dataset_id=None,
         dataset_name=f"test-reaper-{uuid4().hex}",
         weights="yolo26n.pt",

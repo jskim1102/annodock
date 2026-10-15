@@ -19,8 +19,9 @@ async function apiModules() {
     }).outputText.replace(/from "([^"]+)"/g, (_match, name) => `from "${dependencies[name]}"`));
   };
   const authModule = await compile("../src/api/auth.ts", { "../store/auth": storeModule });
+  const workspaceModule = moduleUrl(`export const getActiveWorkspaceId = () => null;`);
   const clientModule = await compile("../src/api/client.ts", {
-    "./auth": authModule, "../store/auth": storeModule,
+    "./auth": authModule, "../store/auth": storeModule, "../store/workspace": workspaceModule,
   });
   return { authModule, clientModule, ...await import(clientModule), ...await import(authModule) };
 }
@@ -114,6 +115,12 @@ async function harness(t, save) {
   globalThis[key].getEdit = getEdit;
   const componentModule = moduleUrl(`
     const h = globalThis[${JSON.stringify(key)}];
+    export { ApiError } from "${api.clientModule}";
+    export const useAuthSession = () => ({ user: { id: 1 } });
+    export const getWorkspaceMembers = async () => ({ items: [] });
+    export const WorkspaceDialog = () => {};
+    export const assignImage = () => {}, claimDatasetImage = () => {}, completeImage = () => {},
+      uncompleteImage = () => {}, getImage = () => {};
     export const useAnnotationEdit = () => h.getEdit();
     export const jsx = (type, props) => ({ type, props });
     export const jsxs = jsx;

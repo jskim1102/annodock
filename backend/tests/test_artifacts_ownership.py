@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+from app.deps import ensure_personal_workspace
 from app.models import Dataset, Project, RunMetric, TrainingRun
 from app.services.storage import storage_relative_path
 
@@ -17,18 +18,19 @@ pytestmark = pytest.mark.asyncio
 async def _persist_run(
     app,
     *,
-    owner_id: int,
+    user_id: int,
     state: str = "done",
 ) -> tuple[int, int, Path]:
     async with app.state.session_factory() as session:
+        workspace_id = (await ensure_personal_workspace(session, user_id)).id
         project = Project(
-            owner_id=owner_id,
+            workspace_id=workspace_id,
             name=f"test-artifact-project-{uuid4().hex}",
         )
         session.add(project)
         await session.flush()
         dataset = Dataset(
-            owner_id=owner_id,
+            workspace_id=workspace_id,
             project_id=project.id,
             name=f"test-artifact-dataset-{uuid4().hex}",
             status="ready",
@@ -48,7 +50,8 @@ async def _persist_run(
         (artifacts / "log").write_text("private training log\n")
 
         run = TrainingRun(
-            owner_id=owner_id,
+            workspace_id=workspace_id,
+            created_by=user_id,
             dataset_id=dataset.id,
             dataset_name=f"test-artifact-run-{uuid4().hex}",
             weights="yolo26n.pt",
@@ -89,13 +92,13 @@ async def test_run_surfaces_and_artifacts_are_hidden_from_other_owner(
     app,
     auth_headers: Callable[[int], dict[str, str]],
 ) -> None:
-    owner_id = 101
+    user_id = 101
     other_id = 202
     run_id, dataset_id, _run_directory = await _persist_run(
         app,
-        owner_id=owner_id,
+        user_id=user_id,
     )
-    owner = auth_headers(owner_id)
+    owner = auth_headers(user_id)
     other = auth_headers(other_id)
 
     owner_listing = await client.get("/api/runs", headers=owner)
@@ -141,11 +144,11 @@ async def test_foreign_cancel_is_404_and_does_not_mutate_run(
     app,
     auth_headers: Callable[[int], dict[str, str]],
 ) -> None:
-    owner_id = 303
+    user_id = 303
     other_id = 404
     run_id, _dataset_id, _run_directory = await _persist_run(
         app,
-        owner_id=owner_id,
+        user_id=user_id,
         state="running",
     )
 
@@ -161,7 +164,7 @@ async def test_foreign_cancel_is_404_and_does_not_mutate_run(
 
     canceled = await client.post(
         f"/api/runs/{run_id}/cancel",
-        headers=auth_headers(owner_id),
+        headers=auth_headers(user_id),
     )
     assert canceled.status_code == 202
     assert canceled.json() == {"run_id": run_id, "state": "canceled"}

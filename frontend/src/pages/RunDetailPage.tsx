@@ -1,3 +1,4 @@
+import { useWorkspace } from "../store/workspace";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { imageResourceUrl, invalidateStorageQuotaCache } from "../api/client";
@@ -235,6 +236,8 @@ function parseLog(log: string): ParsedLogLine[] {
 }
 
 export function RunDetailPage({ runId }: { runId: number }) {
+  const { active } = useWorkspace();
+  const canManage = active?.role === "admin" || active?.role === "owner";
   const [run, setRun] = useState<RunDetail | null>(null);
   const [metrics, setMetrics] = useState<RunMetric[]>([]);
   const [log, setLog] = useState("");
@@ -425,9 +428,9 @@ export function RunDetailPage({ runId }: { runId: number }) {
   const progress = run && run.epochs > 0
     ? Math.min(100, Math.max(0, Math.round(run.epoch / run.epochs * 100)))
     : 0;
-  const canCancel = run !== null && (run.state === "queued" || run.state === "running");
+  const canCancel = canManage && run !== null && (run.state === "queued" || run.state === "running");
   const canDownload = run?.state === "done" && run.artifacts_deleted_at === null;
-  const canClean = run !== null
+  const canClean = canManage && run !== null
     && !ACTIVE_STATES.has(run.state)
     && run.artifacts_deleted_at === null;
 
@@ -555,9 +558,9 @@ export function RunDetailPage({ runId }: { runId: number }) {
           <span>{timingText(run)}</span>
         </div>
         <div className="run-detail-actions">
-          <button className="btn btn-secondary" type="button" disabled={!canCancel || canceling} onClick={() => void handleCancel()}>{canceling ? "취소 중…" : "취소"}</button>
+          {canManage ? <button className="btn btn-secondary" type="button" disabled={!canCancel || canceling} onClick={() => void handleCancel()}>{canceling ? "취소 중…" : "취소"}</button> : null}
           <button className="btn btn-primary" type="button" disabled={!canDownload || downloading} onClick={() => void handleDownload()}><Icon name="download" size={14} />{downloading ? "다운로드 중…" : "best.pt 다운로드"}</button>
-          <button className="btn btn-ghost" type="button" disabled={!canClean || cleaning} onClick={() => void handleCleanup()}><Icon name="broom" size={14} />{run?.artifacts_deleted_at ? "정리됨" : cleaning ? "정리 중…" : "산출물 정리"}</button>
+          {canManage ? <button className="btn btn-ghost" type="button" disabled={!canClean || cleaning} onClick={() => void handleCleanup()}><Icon name="broom" size={14} />{run?.artifacts_deleted_at ? "정리됨" : cleaning ? "정리 중…" : "산출물 정리"}</button> : null}
         </div>
       </section>
 

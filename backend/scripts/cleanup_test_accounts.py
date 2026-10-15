@@ -7,7 +7,7 @@ Targets accounts that look machine-generated (QA/smoke signups):
 Safety gates — an account is deleted only when ALL hold:
   - not in KEEP_EMAILS
   - signed up more than GRACE_HOURS ago
-  - owns nothing in annodock (no projects, no datasets, zero bytes_used)
+  - has no personal-workspace resources or accounted storage in annodock
 
 Usage:
     .venv/bin/python scripts/cleanup_test_accounts.py [--dry-run]
@@ -77,19 +77,38 @@ async def main() -> None:
         ]
         deleted = 0
         for row in candidates:
-            owner_id = row["id"]
+            user_id = row["id"]
             owns = await app.fetchval(
-                "SELECT (SELECT count(*) FROM projects WHERE owner_id = $1)"
-                " + (SELECT count(*) FROM datasets WHERE owner_id = $1)"
-                " + (SELECT coalesce(sum(bytes_used), 0)"
-                "    FROM user_storage WHERE owner_id = $1)",
-                owner_id,
+                """
+                WITH personal_workspaces AS (
+                    SELECT id FROM workspaces
+                    WHERE kind = 'personal' AND created_by = $1
+                )
+                SELECT EXISTS (
+                    SELECT 1 FROM projects
+                    WHERE workspace_id IN (SELECT id FROM personal_workspaces)
+                ) OR EXISTS (
+                    SELECT 1 FROM datasets
+                    WHERE workspace_id IN (SELECT id FROM personal_workspaces)
+                ) OR EXISTS (
+                    SELECT 1 FROM training_runs
+                    WHERE workspace_id IN (SELECT id FROM personal_workspaces)
+                ) OR EXISTS (
+                    SELECT 1 FROM media_objects
+                    WHERE workspace_id IN (SELECT id FROM personal_workspaces)
+                ) OR EXISTS (
+                    SELECT 1 FROM workspace_storage
+                    WHERE workspace_id IN (SELECT id FROM personal_workspaces)
+                      AND bytes_used > 0
+                )
+                """,
+                user_id,
             )
             if owns:
-                print(f"skip {row['email']} (id={owner_id}): owns data")
+                print(f"skip {row['email']} (id={user_id}): owns data")
                 continue
             if args.dry_run:
-                print(f"would delete {row['email']} (id={owner_id})")
+                print(f"would delete {row['email']} (id={user_id})")
                 deleted += 1
                 continue
             async with auth.transaction():
@@ -100,10 +119,10 @@ async def main() -> None:
                     "refresh_tokens",
                 ):
                     await auth.execute(
-                        f"DELETE FROM {table} WHERE user_id = $1", owner_id
+                        f"DELETE FROM {table} WHERE user_id = $1", user_id
                     )
-                await auth.execute("DELETE FROM users WHERE id = $1", owner_id)
-            print(f"deleted {row['email']} (id={owner_id})")
+                await auth.execute("DELETE FROM users WHERE id = $1", user_id)
+            print(f"deleted {row['email']} (id={user_id})")
             deleted += 1
         print(f"{'candidates' if args.dry_run else 'deleted'}: {deleted}")
     finally:

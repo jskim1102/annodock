@@ -17,7 +17,7 @@ from app.models import (
     RunMetric,
     TrainingRun,
     UploadJob,
-    UserStorage,
+    WorkspaceStorage,
 )
 from app.services.storage import (
     contained_storage_path,
@@ -108,7 +108,7 @@ async def test_delete_empty_project_cleans_hidden_placeholder_without_confirmati
     project_id = int(project["id"])
     async with app.state.session_factory() as session:
         placeholder = Dataset(
-            owner_id=1,
+            workspace_id=1,
             project_id=project_id,
             name=unique_name("hidden"),
             status="pending",
@@ -197,7 +197,8 @@ async def test_delete_rejects_running_or_canceling_training_runs(
     dataset_id = int(dataset["id"])
     async with app.state.session_factory() as session:
         run = TrainingRun(
-            owner_id=1,
+            workspace_id=1,
+            created_by=1,
             dataset_id=dataset_id,
             dataset_name=str(dataset["name"]),
             weights="yolo26n.pt",
@@ -294,7 +295,7 @@ async def test_confirmed_delete_reclaims_files_runs_and_exact_accounting(
             path.write_bytes(content)
 
         image = image_with_media(
-            owner_id=target.owner_id,
+            workspace_id=target.workspace_id,
             dataset_id=target_dataset_id,
             stem="sample",
             filename="sample.jpg",
@@ -348,7 +349,7 @@ async def test_confirmed_delete_reclaims_files_runs_and_exact_accounting(
         survivor_original.write_bytes(b"survivor-original")
         survivor_thumb.write_bytes(b"survivor-thumb")
         survivor_image = image_with_media(
-            owner_id=survivor.owner_id,
+            workspace_id=survivor.workspace_id,
             dataset_id=survivor_dataset_id,
             stem="keep",
             filename="keep.jpg",
@@ -367,7 +368,8 @@ async def test_confirmed_delete_reclaims_files_runs_and_exact_accounting(
         await session.flush()
 
         run = TrainingRun(
-            owner_id=1,
+            workspace_id=1,
+            created_by=1,
             dataset_id=target_dataset_id,
             dataset_name=target.name,
             weights="yolo26n.pt",
@@ -417,8 +419,8 @@ async def test_confirmed_delete_reclaims_files_runs_and_exact_accounting(
             survivor_original.stat().st_size + survivor_thumb.stat().st_size
         )
         session.add(
-            UserStorage(
-                owner_id=1,
+            WorkspaceStorage(
+                workspace_id=1,
                 bytes_used=target_bytes + survivor_bytes,
             )
         )
@@ -439,7 +441,7 @@ async def test_confirmed_delete_reclaims_files_runs_and_exact_accounting(
     assert not run_root.exists()
     assert survivor_root.is_dir()
     async with app.state.session_factory() as session:
-        usage = await session.get(UserStorage, 1)
+        usage = await session.get(WorkspaceStorage, 1)
         assert usage is not None and usage.bytes_used == survivor_bytes
         assert await session.get(Project, target_project_id) is None
         assert await session.get(ProjectClass, (target_project_id, 0)) is None

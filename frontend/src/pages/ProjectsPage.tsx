@@ -1,3 +1,5 @@
+import { useWorkspace, type WorkspaceRow } from "../store/workspace";
+import { DatasetProgressCell, DatasetProgressPanel } from "../components/DatasetProgressPanel";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -21,7 +23,6 @@ import {
   type ProjectDeleteConfirmation,
   type ProjectClassImageCount,
   type ProjectDatasetRow,
-  type ProjectDatasetSourceRow,
   type ProjectMergeInput,
   type ProjectRow,
 } from "../api/client";
@@ -30,6 +31,7 @@ import { AuthenticatedImage } from "../components/AuthenticatedImage";
 import { Icon } from "../components/Icon";
 import { ClassColorPicker } from "../components/ClassColorPicker";
 import { NewProjectDialog } from "../components/NewProjectDialog";
+import { ProjectTransferDialog } from "../components/ProjectTransferDialog";
 import { SelectMenu } from "../components/SelectMenu";
 import { appHref, navigate } from "../navigation";
 import {
@@ -40,21 +42,6 @@ import {
 import { getProjectSummary } from "../utils/projectSummary";
 import { sortProjects, type ProjectSortOrder } from "../utils/projectSort";
 import { formatBytes } from "../utils/formatBytes";
-
-function progressPercentage(row: ProjectDatasetSourceRow) {
-  if (row.active_job) {
-    return row.active_job.total > 0
-      ? Math.round(row.active_job.processed / row.active_job.total * 100)
-      : 0;
-  }
-  if (row.status === "ready") {
-    // ready 이후 진행률 = 라벨링 현황 (라벨 있는 이미지 / 전체 이미지)
-    return row.image_count > 0
-      ? Math.round(row.labeled_image_count / row.image_count * 100)
-      : 0;
-  }
-  return 0;
-}
 
 function dateLabel(value: string) {
   return new Intl.DateTimeFormat("ko-KR", {
@@ -229,6 +216,15 @@ function buildProjectMergeClasses(
 }
 
 export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?: boolean }) {
+  const { active, items } = useWorkspace();
+  const canManage = active?.role === "admin" || active?.role === "owner";
+  const canUpload = canManage || active?.role === "editor";
+  const canTransfer = active?.role === "owner";
+  const hasTransferTarget = items.some((item) => item.id !== active?.id && ["owner", "admin"].includes(item.role));
+  const [transferTarget, setTransferTarget] = useState<ProjectRow | null>(null);
+  const [transferredTo, setTransferredTo] = useState<WorkspaceRow | null>(null);
+  const [progressDataset, setProgressDataset] = useState<{id: number; name: string} | null>(null);
+  const [progressRevision, setProgressRevision] = useState(0);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [selectedProjectIds, setSelectedProjectIds] = useState<Set<number>>(new Set());
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
@@ -700,7 +696,8 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
     }
   };
 
-  const anyDialogOpen = dialogOpen
+  const anyDialogOpen = canManage && (dialogOpen
+    || transferTarget !== null
     || mergeTarget !== null
     || projectMergeTarget !== null
     || classExtractionTarget !== null
@@ -708,7 +705,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
     || deleteConfirmation !== null
     || deleteDatasetTarget !== null
     || renameDatasetTarget !== null
-    || classEditTarget !== null;
+    || classEditTarget !== null);
 
   return (
     <>
@@ -719,12 +716,15 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
               <h1>프로젝트</h1>
               <p>데이터셋 {allDatasets.length.toLocaleString()} · 이미지 {totalImages.toLocaleString()} · 라벨 {totalAnnotations.toLocaleString()}</p>
             </div>
-            <button className="btn btn-primary" type="button" onClick={() => setDialogOpen(true)}>
+            {canManage ? <button className="btn btn-primary" type="button" onClick={() => setDialogOpen(true)}>
               <Icon name="plus" size={15} /> 새 프로젝트
-            </button>
+            </button> : null}
           </div>
 
           {createdProject ? <div className="created-toast" role="status"><span className="tag tag-ok"><span className="dot" />생성됨</span>{createdProject}</div> : null}
+          {transferredTo ? <div className="created-toast" role="status">
+            {transferredTo.name}으로 옮겼어요 · <a href={appHref(`/projects?ws=${transferredTo.id}`)}>{transferredTo.name}에서 보기 →</a>
+          </div> : null}
           {error && projects.length > 0 ? <div className="created-toast" role="alert">{error}</div> : null}
 
           <section className="project-stats" aria-label="프로젝트 요약">
@@ -760,13 +760,13 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
                 <label className="search-field"><Icon name="search" size={15} /><span className="sr-only">프로젝트 또는 데이터셋 이름 검색</span><input value={search} placeholder="이름 검색" onChange={(event) => setSearch(event.target.value)} /></label>
                 <button className={`btn btn-secondary btn-sm${filterOn ? " is-active" : ""}`} type="button" aria-pressed={filterOn} onClick={() => setFilterOn((current) => !current)}><Icon name="filter" size={14} /> 필터</button>
                 <div className="project-toolbar-end">
-                  <button
+                  {canManage ? <button
                     className="btn btn-secondary btn-sm project-merge-button"
                     type="button"
                     disabled={selectedProjectIds.size < 2}
                     aria-label={`선택한 프로젝트 ${selectedProjectIds.size}개 통합`}
                     onClick={openProjectMergeDialog}
-                  ><Icon name="layers" size={14} /> 통합</button>
+                  ><Icon name="layers" size={14} /> 통합</button> : null}
                   <SelectMenu className="sort-select" value={sortOrder} onChange={(value) => setSortOrder(value as ProjectSortOrder)} ariaLabel="정렬" options={[{ value: "recent", label: "최근 생성순" }, { value: "name", label: "이름순" }]} />
                 </div>
               </div>
@@ -777,6 +777,11 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
                     .filter((dataset) => selected.has(dataset.id) && dataset.status === "ready");
                   return (
                     <ProjectRows
+                      canManage={canManage}
+                      canUpload={canUpload}
+                      workspaceId={active?.id ?? 0}
+                      progressRevision={progressRevision}
+                      onProgress={setProgressDataset}
                       key={project.id}
                       project={project}
                       expanded={isExpanded}
@@ -809,6 +814,8 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
                         setClassEditTarget(project);
                       }}
                       onDelete={() => void requestProjectDelete(project)}
+                      onTransfer={canTransfer ? () => setTransferTarget(project) : undefined}
+                      transferDisabledReason={hasTransferTarget ? undefined : "옮길 수 있는 팀이 없어요"}
                       deletingDatasetId={deletingDatasetId}
                       onDeleteDataset={(dataset) => {
                         setDatasetMutationError(null);
@@ -831,7 +838,19 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
         </AppShell>
       </div>
 
-      {dialogOpen ? <NewProjectDialog projects={projects} onClose={() => setDialogOpen(false)} onCreate={(projectInput) => {
+      {active && progressDataset ? <DatasetProgressPanel key={`${active.id}:${progressDataset.id}`} dataset={progressDataset}
+        workspaceId={active.id} canManage={canManage} onClose={() => setProgressDataset(null)}
+        onChanged={() => setProgressRevision((value) => value + 1)} /> : null}
+      {canTransfer && transferTarget ? <ProjectTransferDialog project={transferTarget}
+        onClose={() => setTransferTarget(null)} onTransferred={(result, target) => {
+          setProjects((current) => current.filter((project) => project.id !== result.project_id));
+          setSelectedProjectIds((current) => new Set([...current].filter((id) => id !== result.project_id)));
+          const movedDatasetIds = new Set(transferTarget.datasets.flatMap((dataset) => [dataset.id, ...dataset.source_datasets.map((row) => row.id)]));
+          setSelected((current) => new Set([...current].filter((id) => !movedDatasetIds.has(id))));
+          setTransferTarget(null);
+          setTransferredTo(target);
+        }} /> : null}
+      {canManage && dialogOpen ? <NewProjectDialog projects={projects} onClose={() => setDialogOpen(false)} onCreate={(projectInput) => {
         void createProject(projectInput).then((project) => {
           setProjects((current) => [project, ...current]);
           setExpanded(new Set([project.id]));
@@ -839,7 +858,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
           setDialogOpen(false);
         }).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "생성하지 못했습니다."));
       }} /> : null}
-      {projectMergeTarget ? (
+      {canManage && projectMergeTarget ? (
         <MergeProjectsDialog
           projects={projectMergeTarget}
           busy={projectMergeBusy}
@@ -852,7 +871,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
           onSubmit={(input) => void submitProjectMerge(input)}
         />
       ) : null}
-      {mergeTarget ? (
+      {canManage && mergeTarget ? (
         <MergeDatasetsDialog
           target={mergeTarget}
           busy={mergeBusy}
@@ -868,7 +887,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
           onUseExisting={() => void useExistingMergedDataset()}
         />
       ) : null}
-      {classExtractionTarget ? (
+      {canManage && classExtractionTarget ? (
         <ClassExtractionDialog
           target={classExtractionTarget}
           busy={classExtractionBusy}
@@ -881,7 +900,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
           onSubmit={(name, classIds) => void submitClassExtraction(name, classIds)}
         />
       ) : null}
-      {classEditTarget ? (
+      {canManage && classEditTarget ? (
         <EditProjectClassesDialog
           project={classEditTarget}
           onClose={() => setClassEditTarget(null)}
@@ -898,7 +917,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
           }}
         />
       ) : null}
-      {renameTarget ? (
+      {canManage && renameTarget ? (
         <RenameProjectDialog
           project={renameTarget}
           busy={mutatingProjectId === renameTarget.id}
@@ -909,7 +928,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
           onRename={(name) => void submitRename(renameTarget, name)}
         />
       ) : null}
-      {deleteConfirmation ? (
+      {canManage && deleteConfirmation ? (
         <DeleteProjectDialog
           deleteConfirmation={deleteConfirmation}
           busy={mutatingProjectId === deleteConfirmation.project.id}
@@ -920,7 +939,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
           onConfirm={() => void requestProjectDelete(deleteConfirmation.project, true)}
         />
       ) : null}
-      {renameDatasetTarget ? (
+      {canManage && renameDatasetTarget ? (
         <RenameDatasetDialog
           dataset={renameDatasetTarget}
           busy={renamingDatasetId === renameDatasetTarget.id}
@@ -931,7 +950,7 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
           onRename={(name) => void requestDatasetRename(renameDatasetTarget, name)}
         />
       ) : null}
-      {deleteDatasetTarget ? (
+      {canManage && deleteDatasetTarget ? (
         <DeleteDatasetDialog
           dataset={deleteDatasetTarget}
           busy={deletingDatasetId === deleteDatasetTarget.id}
@@ -947,6 +966,13 @@ export function ProjectsPage({ initialDialogOpen = false }: { initialDialogOpen?
 }
 
 interface ProjectRowsProps {
+  onTransfer?: () => void;
+  transferDisabledReason?: string;
+  canManage: boolean;
+  canUpload: boolean;
+  workspaceId: number;
+  progressRevision: number;
+  onProgress: (dataset: {id: number; name: string}) => void;
   project: ProjectRow;
   expanded: boolean;
   projectSelected: boolean;
@@ -975,6 +1001,8 @@ interface ClassImageCountResult {
 }
 
 function ProjectRows({
+  onTransfer, transferDisabledReason,
+  canManage, canUpload, workspaceId, progressRevision, onProgress,
   project,
   expanded: isExpanded,
   projectSelected,
@@ -1104,7 +1132,7 @@ function ProjectRows({
         </div>
         {isExpanded ? (
           <span className="dataset-actions">
-            {selectedRows.length === 0 ? (
+            {canManage ? <>{selectedRows.length === 0 ? (
               <button className="btn btn-primary btn-sm" type="button" disabled><Icon name="cpu" size={13} />AI 학습</button>
             ) : selectedRows.length === 1 ? (
               <a className="btn btn-primary btn-sm" href={appHref(`/datasets/${selectedRows[0].id}/train`)}><Icon name="cpu" size={13} />AI 학습</a>
@@ -1122,18 +1150,20 @@ function ProjectRows({
               type="button"
               disabled={selectedRows.length === 0 || project.classes.length === 0}
               onClick={onExtractAction}
-            ><Icon name="filter" size={13} />분리</button>
-            <a className="btn btn-secondary btn-sm" href={appHref(`/upload?project_id=${project.id}`)}><Icon name="plus" size={13} />데이터셋</a>
+            ><Icon name="filter" size={13} />분리</button></> : null}
+            {canUpload ? <a className="btn btn-secondary btn-sm" href={appHref(`/upload?project_id=${project.id}`)}><Icon name="plus" size={13} />데이터셋</a> : null}
           </span>
         ) : null}
-        <ProjectRowMenu
+        {canManage ? <ProjectRowMenu
+          onTransfer={onTransfer}
+          transferDisabledReason={transferDisabledReason}
           projectId={project.id}
           projectName={project.name}
           busy={busy}
           onRename={onRename}
           onEditClasses={onEditClasses}
           onDelete={onDelete}
-        />
+        /> : null}
       </header>
       {isExpanded ? (
         <div
@@ -1208,7 +1238,6 @@ function ProjectRows({
               </thead>
               <tbody>
                 {project.datasets.map((dataset) => {
-                  const progress = progressPercentage(dataset);
                   const ready = dataset.status === "ready";
                   const hasMergeSources = dataset.is_merged && dataset.source_datasets.length > 0;
                   const selectedSourceIds = dataset.source_datasets
@@ -1278,15 +1307,15 @@ function ProjectRows({
                             <span><small>실제 점유</small><strong className="mono">{formatBytes(dataset.physical_storage_bytes)}</strong></span>
                           </span>
                         </td>
-                        <td><span className="dataset-progress"><span className="dataset-progress-track"><span className="bar"><i style={{ width: `${progress}%` }} /></span><span className="dataset-progress-fraction mono">{dataset.labeled_image_count.toLocaleString()}/{dataset.image_count.toLocaleString()}</span></span><span className="mono">{progress}%</span></span></td>
+                        <td><DatasetProgressCell dataset={dataset} workspaceId={workspaceId} revision={progressRevision} onOpen={() => onProgress(dataset)} /></td>
                         <td className="dataset-menu-cell">
-                          <DatasetRowMenu
+                          {canManage ? <DatasetRowMenu
                             datasetId={dataset.id}
                             datasetName={dataset.name}
                             busy={deletingDatasetId === dataset.id}
                             onRename={() => onRenameDataset(dataset)}
                             onDelete={() => onDeleteDataset(dataset)}
-                          />
+                          /> : null}
                         </td>
                       </tr>
                       {mergeSourcesExpanded ? (
@@ -1348,21 +1377,16 @@ function ProjectRows({
                                       </span>
                                     </td>
                                     <td>
-                                      {(() => {
-                                        const sourceProgress = progressPercentage(source);
-                                        return (
-                                          <span className="dataset-progress"><span className="dataset-progress-track"><span className="bar"><i style={{ width: `${sourceProgress}%` }} /></span><span className="dataset-progress-fraction mono">{source.labeled_image_count.toLocaleString()}/{source.image_count.toLocaleString()}</span></span><span className="mono">{sourceProgress}%</span></span>
-                                        );
-                                      })()}
+                                      <DatasetProgressCell dataset={source} workspaceId={workspaceId} revision={progressRevision} onOpen={() => onProgress(source)} />
                                     </td>
                                     <td className="dataset-menu-cell">
-                                      <DatasetRowMenu
+                                      {canManage ? <DatasetRowMenu
                                         datasetId={source.id}
                                         datasetName={source.name}
                                         busy={deletingDatasetId === source.id}
                                         onRename={() => onRenameDataset({ ...source, source_datasets: [] })}
                                         onDelete={() => onDeleteDataset({ ...source, source_datasets: [] })}
-                                      />
+                                      /> : null}
                                     </td>
                                   </tr>
                                   );
@@ -1385,6 +1409,8 @@ function ProjectRows({
 }
 
 interface ProjectRowMenuProps {
+  onTransfer?: () => void;
+  transferDisabledReason?: string;
   projectId: number;
   projectName: string;
   busy: boolean;
@@ -1394,6 +1420,7 @@ interface ProjectRowMenuProps {
 }
 
 function ProjectRowMenu({
+  onTransfer, transferDisabledReason,
   projectId,
   projectName,
   busy,
@@ -1466,6 +1493,9 @@ function ProjectRowMenu({
               onEditClasses();
             }}
           >클래스 수정</button>
+          {onTransfer ? <button className="project-row-menu-item" type="button" role="menuitem"
+            disabled={Boolean(transferDisabledReason)} title={transferDisabledReason}
+            onClick={() => { setOpen(false); onTransfer(); }}>프로젝트 옮기기</button> : null}
           <button
             className="project-row-menu-item is-danger"
             type="button"

@@ -54,19 +54,38 @@ async def extract_dataset_snapshot(
     name: str,
     dataset_ids: list[int],
     class_ids: list[int],
-    owner_id: int,
+    workspace_id: int,
 ) -> DatasetExtractResult:
+    # Parent first: ingestion and catalog triggers can touch sibling datasets.
+    references = (await session.execute(select(Dataset.id, Dataset.project_id).where(
+        Dataset.id.in_(dataset_ids), Dataset.workspace_id == workspace_id,
+        Dataset.is_placeholder.is_(False),
+    ))).all()
+    if len(references) != len(set(dataset_ids)):
+        raise DatasetExtractNotFound("선택한 데이터셋을 찾을 수 없습니다.")
+    project_ids = {row.project_id for row in references}
+    if len(project_ids) != 1:
+        raise DatasetExtractConflict("같은 프로젝트의 데이터셋에서만 클래스를 추출할 수 있습니다.")
+    project_id = next(iter(project_ids))
+    project = await session.scalar(select(Project).where(
+        Project.id == project_id, Project.workspace_id == workspace_id,
+    ).with_for_update())
+    if project is None:
+        raise DatasetExtractNotFound("프로젝트를 찾을 수 없습니다.")
+
     source_rows = list(
         (
             await session.scalars(
                 select(Dataset)
                 .where(
                     Dataset.id.in_(dataset_ids),
-                    Dataset.owner_id == owner_id,
+                    Dataset.workspace_id == workspace_id,
+                    Dataset.project_id == project_id,
                     Dataset.is_placeholder.is_(False),
                 )
                 .order_by(Dataset.id)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
         ).all()
     )
@@ -78,20 +97,6 @@ async def extract_dataset_snapshot(
         raise DatasetExtractConflict(
             "사용 가능한 데이터셋에서만 클래스를 추출할 수 있습니다."
         )
-
-    project_ids = {dataset.project_id for dataset in sources}
-    if len(project_ids) != 1:
-        raise DatasetExtractConflict(
-            "같은 프로젝트의 데이터셋에서만 클래스를 추출할 수 있습니다."
-        )
-    project_id = sources[0].project_id
-    project = await session.scalar(
-        select(Project)
-        .where(Project.id == project_id, Project.owner_id == owner_id)
-        .with_for_update()
-    )
-    if project is None:
-        raise DatasetExtractNotFound("프로젝트를 찾을 수 없습니다.")
 
     active_job = await session.scalar(
         select(UploadJob.id)
@@ -166,7 +171,7 @@ async def extract_dataset_snapshot(
         (image.split, image.stem) for image in image_rows
     }
     dataset = Dataset(
-        owner_id=owner_id,
+        workspace_id=workspace_id,
         project_id=project_id,
         name=name,
         status="pending",
@@ -187,7 +192,7 @@ async def extract_dataset_snapshot(
             copied = copy_source_images(
                 settings,
                 target_dataset_id=dataset.id,
-                owner_id=owner_id,
+                workspace_id=workspace_id,
                 target_storage=storage_path,
                 sources=sources,
                 images_by_dataset=images_by_dataset,
@@ -206,7 +211,7 @@ async def extract_dataset_snapshot(
         with session.no_autoflush:
             quota = await quota_status(
                 session,
-                owner_id,
+                workspace_id,
                 limit_bytes=settings.quota_bytes_per_user,
                 required_bytes=copied.accounted_bytes,
             )
@@ -229,7 +234,7 @@ async def extract_dataset_snapshot(
         dataset.class_count = len(selected_project_class_rows)
         dataset.status = "ready"
         project.updated_at = func.now()
-        await increase_bytes_used(session, owner_id, copied.accounted_bytes)
+        await increase_bytes_used(session, workspace_id, copied.accounted_bytes)
         await session.commit()
         await session.refresh(dataset)
         return DatasetExtractResult(dataset=dataset)

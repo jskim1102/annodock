@@ -15,7 +15,7 @@ from app.models import (
     Project,
     TrainingRun,
     UploadSession,
-    UserStorage,
+    WorkspaceStorage,
 )
 from tests.factories import image_with_media
 
@@ -66,6 +66,151 @@ async def create_dataset(
     return response.json()
 
 
+async def merge_with_annotation_versions(client: httpx.AsyncClient, app) -> dict:
+    """Merge swapped catalogs alongside a source whose class IDs stay intact."""
+    colors = {"cat": "#EF4444", "dog": "#3B82F6", "bird": "#84CC16"}
+    changed = await create_project(client, "version-remap", [
+        {"name": name, "color": colors[name]} for name in ("cat", "dog", "bird")
+    ])
+    unchanged = await create_project(client, "version-identity", [
+        {"name": name, "color": colors[name]} for name in ("dog", "cat", "bird")
+    ])
+    datasets = [
+        await create_dataset(client, changed["id"], "version-first"),
+        await create_dataset(client, changed["id"], "version-second"),
+        await create_dataset(client, unchanged["id"], "version-identity"),
+    ]
+    image_ids = {}
+    async with app.state.session_factory() as session:
+        for index, dataset in enumerate(datasets):
+            row = await session.get(Dataset, dataset["id"])
+            assert row is not None
+            row.status = "ready"
+            row.image_count = 3
+            row.annotation_count = row.labeled_image_count = 2
+            for offset, (name, class_id) in enumerate((
+                ("cat", 0 if index < 2 else 1), ("bird", 2), ("blank", None),
+            )):
+                stem = f"version-{index}-{name}"
+                image = image_with_media(
+                    workspace_id=1, dataset_id=row.id, stem=stem,
+                    filename=f"{stem}.jpg", rel_path=f"images/{stem}.jpg",
+                    width=64, height=48, file_path=f"datasets/{row.id}/{stem}.jpg",
+                    thumb_path=f"datasets/{row.id}/{stem}-thumb.jpg",
+                    box_count=int(class_id is not None), version=3 + index * 10 + offset,
+                    label_status="labeled" if class_id is not None else "unlabeled",
+                )
+                session.add(image)
+                await session.flush()
+                image_ids[index, name] = image.id
+                if class_id is not None:
+                    session.add(Annotation(
+                        image_id=image.id, class_id=class_id,
+                        cx=0.2, cy=0.3, w=0.1, h=0.2,
+                    ))
+        await session.commit()
+
+    before = {}
+    for key, image_id in image_ids.items():
+        response = await client.get(f"/api/images/{image_id}/annotations")
+        assert response.status_code == 200, response.text
+        before[key] = response.json()
+    revisions = []
+    for project in (changed, unchanged):
+        response = await client.get(f"/api/projects/{project['id']}")
+        assert response.status_code == 200, response.text
+        revisions.append(response.json())
+    response = await client.post("/api/projects/merge", json={
+        "name": unique_name("version-result"),
+        "projects": project_revisions(*revisions),
+        "classes": [
+            {"name": name, "color": colors[name], "sources": [
+                {"project_id": changed["id"], "class_id": old_id},
+                {"project_id": unchanged["id"], "class_id": new_id},
+            ]}
+            for new_id, (name, old_id) in enumerate((("dog", 1), ("cat", 0), ("bird", 2)))
+        ],
+    })
+    assert response.status_code == 201, response.text
+    return {"image_ids": image_ids, "before": before, "project": response.json()}
+
+
+async def test_project_merge_bumps_every_remapped_image_but_keeps_identity_versions(
+    client: httpx.AsyncClient, app,
+) -> None:
+    case = await merge_with_annotation_versions(client, app)
+    for (dataset_index, name), image_id in case["image_ids"].items():
+        before = case["before"][dataset_index, name]
+        response = await client.get(f"/api/images/{image_id}/annotations")
+        assert response.status_code == 200, response.text
+        after = response.json()
+        # Rebuilding DatasetClass rows advances the catalog even for identity maps.
+        assert after["catalog_version"] > before["catalog_version"]
+        if dataset_index == 2:
+            # An identity mapping must leave versions, boxes and status intact.
+            assert after == {**before, "catalog_version": after["catalog_version"]}
+            continue
+        assert after["version"] == before["version"] + 1, (dataset_index, name)
+        assert after["label_status"] == before["label_status"]
+        assert after["assignee_id"] == before["assignee_id"]
+        expected_boxes = [
+            {**box, "class_id": 1 if box["class_id"] == 0 else box["class_id"]}
+            for box in before["boxes"]
+        ]
+        assert after["boxes"] == expected_boxes
+        # The unchanged bird box and boxless image still share the new catalog.
+        if name == "blank":
+            assert after["boxes"] == []
+
+
+@pytest.mark.parametrize("dataset_index,name", [(0, "cat"), (1, "bird"), (1, "blank")])
+async def test_project_merge_rejects_stale_annotations_and_accepts_current_class_ids(
+    client: httpx.AsyncClient, app, dataset_index: int, name: str,
+) -> None:
+    case = await merge_with_annotation_versions(client, app)
+    image_id = case["image_ids"][dataset_index, name]
+    before = case["before"][dataset_index, name]
+    stale = await client.put(f"/api/images/{image_id}/annotations", json={
+        "expected_version": before["version"], "boxes": before["boxes"],
+        "expected_catalog_version": before["catalog_version"],
+    })
+    assert stale.status_code == 409, stale.text
+    conflict = stale.json()["detail"]
+    assert conflict["code"] == "version_conflict"
+    current = conflict["current"]
+    assert current["version"] == before["version"] + 1
+    assert current["label_status"] == before["label_status"]
+    assert current["assignee_id"] == before["assignee_id"]
+    assert current["boxes"] == [
+        {**box, "class_id": 1 if box["class_id"] == 0 else box["class_id"]}
+        for box in before["boxes"]
+    ]
+    persisted = await client.get(f"/api/images/{image_id}/annotations")
+    assert persisted.status_code == 200, persisted.text
+    assert persisted.json()["version"] == current["version"]
+    assert persisted.json()["boxes"] == current["boxes"]
+
+    # cat is now ID 1; reusing its old ID 0 would silently mean dog.
+    new_cat = {"class_id": 1, "cx": 0.7, "cy": 0.3, "w": 0.1, "h": 0.2}
+    saved = await client.put(f"/api/images/{image_id}/annotations", json={
+        "expected_version": current["version"], "boxes": [new_cat],
+        "expected_catalog_version": current["catalog_version"],
+    })
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["version"] == current["version"] + 1
+    assert [{key: box[key] for key in new_cat} for box in saved.json()["boxes"]] == [new_cat]
+    persisted = await client.get(f"/api/images/{image_id}/annotations")
+    assert persisted.status_code == 200, persisted.text
+    assert persisted.json()["boxes"] == saved.json()["boxes"]
+    async with app.state.session_factory() as session:
+        image = await session.get(Image, image_id)
+        assert image is not None
+        saved_class = await session.scalar(select(DatasetClass.name).where(
+            DatasetClass.dataset_id == image.dataset_id, DatasetClass.class_id == 1,
+        ))
+        assert saved_class == "cat"
+
+
 async def test_project_merge_moves_datasets_and_remaps_classes_without_copying(
     client: httpx.AsyncClient,
     app,
@@ -107,7 +252,7 @@ async def test_project_merge_moves_datasets_and_remaps_classes_without_copying(
         second_row.status = "ready"
 
         first_image = image_with_media(
-            owner_id=1,
+            workspace_id=1,
             dataset_id=merged_row.id,
             stem="project-merge-first",
             filename="project-merge-first.jpg",
@@ -124,7 +269,7 @@ async def test_project_merge_moves_datasets_and_remaps_classes_without_copying(
             box_count=1,
         )
         second_image = image_with_media(
-            owner_id=1,
+            workspace_id=1,
             dataset_id=second_row.id,
             stem="project-merge-second",
             filename="project-merge-second.jpg",
@@ -173,7 +318,8 @@ async def test_project_merge_moves_datasets_and_remaps_classes_without_copying(
                     position=0,
                 ),
                 TrainingRun(
-                    owner_id=1,
+                    workspace_id=1,
+                    created_by=1,
                     dataset_id=merged_row.id,
                     dataset_name=merged_row.name,
                     weights="yolo11n.pt",
@@ -187,7 +333,7 @@ async def test_project_merge_moves_datasets_and_remaps_classes_without_copying(
                     state="done",
                     out_dir="runs/project-merge",
                 ),
-                UserStorage(owner_id=1, bytes_used=9_999),
+                WorkspaceStorage(workspace_id=1, bytes_used=9_999),
             ]
         )
         await session.commit()
@@ -326,7 +472,7 @@ async def test_project_merge_moves_datasets_and_remaps_classes_without_copying(
             )
             for image in images
         } == image_snapshot
-        assert (await session.get(UserStorage, 1)).bytes_used == 9_999
+        assert (await session.get(WorkspaceStorage, 1)).bytes_used == 9_999
         run = await session.scalar(
             select(TrainingRun).where(TrainingRun.dataset_id == merged_child["id"])
         )

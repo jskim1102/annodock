@@ -5,7 +5,7 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from app.models import UploadSession, UserStorage
+from app.models import UploadSession, WorkspaceStorage
 from app.services.quota import get_bytes_used
 from app.services.uploads import upload_directory
 
@@ -48,7 +48,7 @@ async def test_abort_reclaims_files_rejects_resume_and_keeps_quota(
     upload_id = await _upload(client, dataset_id)
     path = upload_directory(app.state.settings, upload_id)
     async with app.state.session_factory() as session:
-        session.add(UserStorage(owner_id=1, bytes_used=321))
+        session.add(WorkspaceStorage(workspace_id=1, bytes_used=321))
         await session.commit()
 
     response = await client.delete(f"/api/uploads/{upload_id}")

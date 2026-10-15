@@ -9,6 +9,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CHAR,
     CheckConstraint,
     DateTime,
     Float,
@@ -27,16 +28,77 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db import Base
 
 
-class Project(Base):
-    __tablename__ = "projects"
+class Workspace(Base):
+    __tablename__ = "workspaces"
     __table_args__ = (
-        UniqueConstraint("owner_id", "name", name="uq_projects_owner_name"),
+        CheckConstraint("kind IN ('personal','team')", name="ck_workspaces_kind"),
+        Index("uq_workspaces_personal_creator", "created_by", unique=True,
+              postgresql_where=text("kind = 'personal'")),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    # auth-service lives in a separate database, so this remains a logical
-    # reference instead of a cross-database foreign key.
-    owner_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_by: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class WorkspaceMember(Base):
+    __tablename__ = "workspace_members"
+    __table_args__ = (
+        CheckConstraint("role IN ('owner','admin','editor','viewer')",
+                        name="ck_workspace_members_role"),
+        Index("ix_workspace_members_user_id", "user_id"),
+        Index("uq_workspace_members_owner", "workspace_id", unique=True,
+              postgresql_where=text("role = 'owner'")),
+    )
+
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class WorkspaceInvite(Base):
+    __tablename__ = "workspace_invites"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_workspace_invites_token_hash"),
+        CheckConstraint("role IN ('admin','editor','viewer')", name="ck_workspace_invites_role"),
+        CheckConstraint("uses >= 0", name="ck_workspace_invites_uses_nonnegative"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    token_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    created_by: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    max_uses: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    uses: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Project(Base):
+    __tablename__ = "projects"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "name", name="uq_projects_workspace_name"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="RESTRICT"), nullable=False
+    )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     archived_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -82,7 +144,7 @@ class ProjectClass(Base):
 class Dataset(Base):
     __tablename__ = "datasets"
     __table_args__ = (
-        UniqueConstraint("owner_id", "name", name="uq_datasets_owner_name"),
+        UniqueConstraint("workspace_id", "name", name="uq_datasets_workspace_name"),
         CheckConstraint(
             "(upload_group_id IS NULL AND upload_part_index IS NULL "
             "AND upload_part_count IS NULL) OR "
@@ -97,7 +159,7 @@ class Dataset(Base):
             name="ck_datasets_merge_purpose",
         ),
         UniqueConstraint(
-            "owner_id",
+            "workspace_id",
             "upload_group_id",
             "upload_part_index",
             name="uq_datasets_upload_group_part",
@@ -106,9 +168,9 @@ class Dataset(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    # auth-service lives in a separate database, so this is deliberately a
-    # logical reference instead of a cross-database foreign key.
-    owner_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="RESTRICT"), nullable=False
+    )
     project_id: Mapped[int] = mapped_column(
         ForeignKey("projects.id"), nullable=False, index=True
     )
@@ -124,6 +186,9 @@ class Dataset(Base):
         Integer, nullable=False, default=0, server_default="0"
     )
     class_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    class_catalog_version: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
     is_merged: Mapped[bool] = mapped_column(
@@ -213,14 +278,16 @@ class MediaObject(Base):
             "original_bytes >= 0 AND display_bytes >= 0 AND thumb_bytes >= 0",
             name="ck_media_objects_bytes_nonnegative",
         ),
-        Index("ix_media_objects_owner_id", "owner_id"),
+        Index("ix_media_objects_workspace_id", "workspace_id"),
         Index("ix_media_objects_created_by_dataset_id", "created_by_dataset_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     # Auth users live in another database, so this remains a logical owner
     # boundary.  Media is never shared across owners.
-    owner_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="RESTRICT"), nullable=False
+    )
     # Attribute each physical bundle to exactly one current dataset for the
     # per-dataset "actual occupancy" display.  Deletion transfers this pointer
     # to a surviving reference and the final reference removes the object.
@@ -259,6 +326,15 @@ class Image(Base):
             postgresql_nulls_not_distinct=True,
         ),
         Index("ix_images_dataset_split_stem", "dataset_id", "split", "stem"),
+        CheckConstraint(
+            "label_status IN ('unlabeled', 'in_progress', 'labeled')",
+            name="ck_images_label_status",
+        ),
+        CheckConstraint(
+            "label_status != 'in_progress' OR assignee_id IS NOT NULL",
+            name="ck_images_in_progress_assignee",
+        ),
+        Index("ix_images_dataset_label_status_assignee", "dataset_id", "label_status", "assignee_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -301,6 +377,14 @@ class Image(Base):
     has_label_source: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true"
     )
+    label_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unlabeled", server_default="unlabeled"
+    )
+    assignee_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    assigned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    labeled_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    labeled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     is_modified: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
@@ -581,22 +665,21 @@ class ExportArtifact(Base):
     dataset: Mapped[Dataset] = relationship(back_populates="exports")
 
 
-class UserStorage(Base):
-    __tablename__ = "user_storage"
+class WorkspaceStorage(Base):
+    __tablename__ = "workspace_storage"
     __table_args__ = (
         CheckConstraint(
             "bytes_used >= 0",
-            name="ck_user_storage_bytes_used_nonnegative",
+            name="ck_workspace_storage_bytes_used_nonnegative",
         ),
         CheckConstraint(
             "quota_limit_bytes IS NULL OR quota_limit_bytes > 0",
-            name="ck_user_storage_quota_limit_positive",
+            name="ck_workspace_storage_quota_limit_positive",
         ),
     )
 
-    # Logical auth-service user reference; no cross-database FK is possible.
-    owner_id: Mapped[int] = mapped_column(
-        Integer, primary_key=True, autoincrement=False
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True, autoincrement=False
     )
     bytes_used: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0, server_default="0"
@@ -612,84 +695,6 @@ class UserStorage(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
-
-
-class Organization(Base):
-    __tablename__ = "orgs"
-    __table_args__ = (
-        UniqueConstraint("owner_id", "name", name="uq_orgs_owner_name"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    # Logical auth-service user reference; no cross-database FK is possible.
-    owner_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-
-    teams: Mapped[list[Team]] = relationship(
-        back_populates="organization",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
-
-
-class Team(Base):
-    __tablename__ = "teams"
-    __table_args__ = (
-        UniqueConstraint("org_id", "name", name="uq_teams_org_name"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    org_id: Mapped[int] = mapped_column(
-        ForeignKey("orgs.id", ondelete="CASCADE"), nullable=False
-    )
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-
-    organization: Mapped[Organization] = relationship(back_populates="teams")
-    memberships: Mapped[list[Membership]] = relationship(
-        back_populates="team",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
-
-
-class Membership(Base):
-    __tablename__ = "memberships"
-    __table_args__ = (
-        CheckConstraint(
-            "role IN ('owner','admin','editor','viewer')",
-            name="ck_memberships_role",
-        ),
-        Index("ix_memberships_user_id", "user_id"),
-    )
-
-    team_id: Mapped[int] = mapped_column(
-        ForeignKey("teams.id", ondelete="CASCADE"), primary_key=True
-    )
-    # Logical auth-service user reference; no cross-database FK is possible.
-    user_id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    role: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="viewer", server_default="viewer"
-    )
-    can_view: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True, server_default="true"
-    )
-    can_edit: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="false"
-    )
-    can_manage: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="false"
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-
-    team: Mapped[Team] = relationship(back_populates="memberships")
 
 
 class TrainingRun(Base):
@@ -715,12 +720,14 @@ class TrainingRun(Base):
             unique=True,
             postgresql_where=text("state IN ('running','canceling')"),
         ),
-        Index("ix_training_runs_owner_id", "owner_id"),
+        Index("ix_training_runs_workspace_id", "workspace_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    # Logical auth-service user reference; no cross-database FK is possible.
-    owner_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="RESTRICT"), nullable=False
+    )
+    created_by: Mapped[int] = mapped_column(Integer, nullable=False)
     dataset_id: Mapped[int | None] = mapped_column(
         ForeignKey("datasets.id", ondelete="SET NULL"), nullable=True
     )
@@ -825,8 +832,7 @@ class AdminUser(Base):
 
     __tablename__ = "admin_users"
 
-    # Logical auth-service user reference; no cross-database FK is possible.
-    owner_id: Mapped[int] = mapped_column(
+    user_id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=False
     )
     granted_at: Mapped[datetime] = mapped_column(

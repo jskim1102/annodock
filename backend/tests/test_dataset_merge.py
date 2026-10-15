@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
 import httpx
 import pytest
 from sqlalchemy import delete, event, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
     Annotation,
@@ -18,7 +20,7 @@ from app.models import (
     RunImage,
     TrainingRun,
     UploadJob,
-    UserStorage,
+    WorkspaceStorage,
 )
 from app.services import dataset_merge as dataset_merge_service
 from app.services import jobs as jobs_service
@@ -78,7 +80,7 @@ async def create_ready_dataset(
             thumb_bytes = thumbnail.stat().st_size
             physical_bytes += original_bytes + thumb_bytes
             image = image_with_media(
-                owner_id=dataset.owner_id,
+                workspace_id=dataset.workspace_id,
                 dataset_id=dataset_id,
                 stem=stem,
                 filename=f"{stem}.jpg",
@@ -125,7 +127,7 @@ async def create_ready_dataset(
                 for class_id, name in classes.items()
             ]
         )
-        await increase_bytes_used(session, dataset.owner_id, physical_bytes)
+        await increase_bytes_used(session, dataset.workspace_id, physical_bytes)
         await session.commit()
     return dataset_id
 
@@ -218,7 +220,12 @@ async def test_merge_creates_trainable_copy_and_groups_originals(
     ]
 
     classes = await client.get(f"/api/datasets/{merged_id}/classes")
+    async with app.state.session_factory() as session:
+        catalog_version = await session.scalar(select(Dataset.class_catalog_version).where(
+            Dataset.id == merged_id,
+        ))
     assert classes.json() == {
+        "catalog_version": catalog_version,
         "classes": [
             {"class_id": 0, "name": "forklift"},
             {"class_id": 1, "name": "person"},
@@ -246,7 +253,7 @@ async def test_merge_creates_trainable_copy_and_groups_originals(
                 .where(Image.dataset_id == merged_id)
             )
         ).all()
-        usage = await session.get(UserStorage, 1)
+        usage = await session.get(WorkspaceStorage, 1)
 
     assert [image.stem for image in merged_images] == ["same", "same (1)"]
     assert {image.filename for image in merged_images} == {
@@ -339,7 +346,7 @@ async def test_merge_creates_trainable_copy_and_groups_originals(
     deleted = await client.delete(f"/api/datasets/{merged_id}")
     assert deleted.status_code == 204
     async with app.state.session_factory() as session:
-        usage = await session.get(UserStorage, 1)
+        usage = await session.get(WorkspaceStorage, 1)
         assert usage is not None and usage.bytes_used == merged_bytes
         remaining_ids = (await session.scalars(select(Dataset.id))).all()
         assert set(remaining_ids) == {first_id, second_id}
@@ -353,10 +360,14 @@ async def test_merge_creates_trainable_copy_and_groups_originals(
     }
 
 
+@pytest.mark.parametrize(
+    "active_state", ["queued", "running", "awaiting_class_resolution"]
+)
 async def test_large_merge_is_durable_and_completes_through_a_polled_job(
     client: httpx.AsyncClient,
     app,
     monkeypatch: pytest.MonkeyPatch,
+    active_state: str,
 ) -> None:
     project = await client.post(
         "/api/projects",
@@ -400,6 +411,12 @@ async def test_large_merge_is_durable_and_completes_through_a_polled_job(
     assert [row["id"] for row in queued_row["source_datasets"]] == source_ids
     job_id = queued_row["active_job"]["job_id"]
 
+    async with app.state.session_factory() as session:
+        active_job = await session.get(UploadJob, job_id)
+        assert active_job is not None
+        active_job.state = active_state
+        await session.commit()
+
     replayed = await client.post(
         "/api/datasets/merge",
         json={"name": queued_name, "dataset_ids": source_ids},
@@ -407,6 +424,7 @@ async def test_large_merge_is_durable_and_completes_through_a_polled_job(
     assert replayed.status_code == 200
     assert replayed.json()["id"] == queued_row["id"]
     assert replayed.json()["active_job"]["job_id"] == job_id
+    assert replayed.json()["active_job"]["state"] == active_state
 
     async with app.state.session_factory() as session:
         interrupted_job = await session.get(UploadJob, job_id)
@@ -496,7 +514,12 @@ async def test_merge_uses_complete_project_catalog_and_name_based_annotation_ids
     assert merged.status_code == 201
     merged_id = merged.json()["id"]
     classes = await client.get(f"/api/datasets/{merged_id}/classes")
+    async with app.state.session_factory() as session:
+        catalog_version = await session.scalar(select(Dataset.class_catalog_version).where(
+            Dataset.id == merged_id,
+        ))
     assert classes.json() == {
+        "catalog_version": catalog_version,
         "classes": [
             {"class_id": 0, "name": "person"},
             {"class_id": 1, "name": "forklift"},
@@ -534,7 +557,12 @@ async def test_merge_uses_complete_project_catalog_and_name_based_annotation_ids
     )
     assert renamed.status_code == 200
     renamed_classes = await client.get(f"/api/datasets/{merged_id}/classes")
+    async with app.state.session_factory() as session:
+        catalog_version = await session.scalar(select(Dataset.class_catalog_version).where(
+            Dataset.id == merged_id,
+        ))
     assert renamed_classes.json() == {
+        "catalog_version": catalog_version,
         "classes": [
             {"class_id": 0, "name": "person"},
             {"class_id": 1, "name": "lift"},
@@ -670,7 +698,7 @@ async def test_merge_reuses_exact_source_set_without_new_rows_storage_or_quota(
         membership_count_before = await session.scalar(
             select(func.count()).select_from(DatasetMergeSource)
         )
-        usage_before = await session.get(UserStorage, 1)
+        usage_before = await session.get(WorkspaceStorage, 1)
         assert usage_before is not None
         bytes_before = usage_before.bytes_used
     dataset_root = app.state.settings.storage_dir / "datasets"
@@ -699,7 +727,7 @@ async def test_merge_reuses_exact_source_set_without_new_rows_storage_or_quota(
         assert await session.scalar(
             select(func.count()).select_from(DatasetMergeSource)
         ) == membership_count_before
-        usage_after = await session.get(UserStorage, 1)
+        usage_after = await session.get(WorkspaceStorage, 1)
         assert usage_after is not None and usage_after.bytes_used == bytes_before
     assert {path.name for path in dataset_root.iterdir()} == directories_before
 
@@ -713,6 +741,252 @@ async def test_merge_reuses_exact_source_set_without_new_rows_storage_or_quota(
     )
     assert ordinary_reuse.status_code == 200
     assert ordinary_reuse.json()["merge_purpose"] == "train"
+
+
+async def _create_merge_reuse_case(
+    client: httpx.AsyncClient,
+    app,
+    *,
+    source_count: int = 2,
+) -> tuple[list[int], int]:
+    project = await client.post(
+        "/api/projects",
+        json={"name": f"test-merge-reuse-case-{uuid4().hex}", "classes": []},
+    )
+    assert project.status_code == 201
+    source_ids = [
+        await create_ready_dataset(
+            client,
+            app,
+            project_id=project.json()["id"],
+            suffix=f"reuse-case-{index}",
+            classes={0: "person"},
+            annotation_class_id=0,
+            content=f"source-{index}".encode(),
+        )
+        for index in range(source_count)
+    ]
+    merged = await client.post(
+        "/api/datasets/merge",
+        json={
+            "name": f"test-merge-reuse-case-result-{uuid4().hex}",
+            "dataset_ids": source_ids,
+        },
+    )
+    assert merged.status_code == 201
+    return source_ids, merged.json()["id"]
+
+
+async def test_source_deletion_detaches_merge_without_changing_snapshot(
+    client: httpx.AsyncClient,
+    app,
+) -> None:
+    source_ids, merged_id = await _create_merge_reuse_case(
+        client, app, source_count=3,
+    )
+    snapshot_query = (
+        select(
+            Image.id, Image.file_path, Image.thumb_path, Image.training_source_key,
+        )
+        .where(Image.dataset_id == merged_id)
+        .order_by(Image.id)
+    )
+    async with app.state.session_factory() as session:
+        snapshot_before = (await session.execute(snapshot_query)).all()
+        usage = await session.get(WorkspaceStorage, 1)
+        assert usage is not None
+        bytes_before = usage.bytes_used
+        old_dataset = await session.get(Dataset, merged_id)
+        assert old_dataset is not None
+        storage_path_before = old_dataset.storage_path
+    files_before = {
+        path: contained_storage_path(
+            app.state.settings.storage_dir, path,
+        ).read_bytes()
+        for _image_id, file_path, thumb_path, _source_key in snapshot_before
+        for path in (file_path, thumb_path)
+    }
+    assert len(snapshot_before) == 3
+
+    deleted = await client.delete(f"/api/datasets/{source_ids[2]}")
+
+    assert deleted.status_code == 204
+    async with app.state.session_factory() as session:
+        assert await session.get(Dataset, source_ids[2]) is None
+        assert await session.scalar(
+            select(func.count()).select_from(DatasetMergeSource).where(
+                DatasetMergeSource.merged_dataset_id == merged_id,
+            )
+        ) == 0
+        old_dataset = await session.get(Dataset, merged_id)
+        assert old_dataset is not None
+        assert old_dataset.status == "ready"
+        assert old_dataset.image_count == 3
+        assert old_dataset.storage_path == storage_path_before
+        assert (await session.execute(snapshot_query)).all() == snapshot_before
+        usage = await session.get(WorkspaceStorage, 1)
+        # The snapshot still references all three immutable media bundles.
+        assert usage is not None and usage.bytes_used == bytes_before
+    for path, content in files_before.items():
+        assert contained_storage_path(
+            app.state.settings.storage_dir, path,
+        ).read_bytes() == content
+
+    new_merge = await client.post(
+        "/api/datasets/merge",
+        json={
+            "name": f"test-merge-after-source-delete-{uuid4().hex}",
+            "dataset_ids": source_ids[:2],
+        },
+    )
+
+    assert new_merge.status_code == 201
+    assert new_merge.json()["id"] != merged_id
+    assert new_merge.json()["image_count"] == 2
+    assert [
+        source["id"] for source in new_merge.json()["source_datasets"]
+    ] == source_ids[:2]
+    async with app.state.session_factory() as session:
+        assert (await session.execute(snapshot_query)).all() == snapshot_before
+        old_dataset = await session.get(Dataset, merged_id)
+        assert old_dataset is not None and old_dataset.image_count == 3
+        assert await session.scalar(
+            select(func.count()).select_from(DatasetMergeSource).where(
+                DatasetMergeSource.merged_dataset_id == merged_id,
+            )
+        ) == 0
+    for path, content in files_before.items():
+        assert contained_storage_path(
+            app.state.settings.storage_dir, path,
+        ).read_bytes() == content
+
+
+@pytest.mark.parametrize(
+    ("dataset_status", "job_state"),
+    [
+        ("failed", None),
+        ("failed", "queued"),
+        ("pending", None),
+        ("pending", "done"),
+        ("pending", "failed"),
+    ],
+)
+async def test_merge_rejects_unusable_exact_match_without_side_effects(
+    client: httpx.AsyncClient,
+    app,
+    dataset_status: str,
+    job_state: str | None,
+) -> None:
+    source_ids, merged_id = await _create_merge_reuse_case(client, app)
+    async with app.state.session_factory() as session:
+        merged = await session.get(Dataset, merged_id)
+        assert merged is not None
+        merged.status = dataset_status
+        if job_state is not None:
+            session.add(UploadJob(
+                dataset_id=merged_id,
+                kind="dataset_merge",
+                state=job_state,
+                upload_ids=[],
+            ))
+        await session.commit()
+        dataset_count_before = await session.scalar(
+            select(func.count(Dataset.id))
+        )
+        membership_count_before = await session.scalar(
+            select(func.count()).select_from(DatasetMergeSource)
+        )
+        usage = await session.get(WorkspaceStorage, 1)
+        assert usage is not None
+        bytes_before = usage.bytes_used
+    dataset_root = app.state.settings.storage_dir / "datasets"
+    files_before = {
+        path.relative_to(dataset_root): path.read_bytes()
+        for path in dataset_root.rglob("*")
+        if path.is_file()
+    }
+    directories_before = {path.name for path in dataset_root.iterdir()}
+
+    rejected = await client.post(
+        "/api/datasets/merge",
+        json={
+            "name": f"test-merge-unusable-retry-{uuid4().hex}",
+            "dataset_ids": list(reversed(source_ids)),
+            "purpose": "train",
+        },
+    )
+
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"] == (
+        "실패한 병합 작업은 삭제한 뒤 다시 시도해 주세요."
+    )
+    async with app.state.session_factory() as session:
+        assert await session.scalar(select(func.count(Dataset.id))) == (
+            dataset_count_before
+        )
+        assert await session.scalar(
+            select(func.count()).select_from(DatasetMergeSource)
+        ) == membership_count_before
+        merged = await session.get(Dataset, merged_id)
+        assert merged is not None and merged.status == dataset_status
+        assert merged.merge_purpose == "merge"
+        usage = await session.get(WorkspaceStorage, 1)
+        assert usage is not None and usage.bytes_used == bytes_before
+    assert {path.name for path in dataset_root.iterdir()} == directories_before
+    assert {
+        path.relative_to(dataset_root): path.read_bytes()
+        for path in dataset_root.rglob("*")
+        if path.is_file()
+    } == files_before
+
+
+async def test_source_delete_commit_failure_preserves_merge_membership_and_files(
+    client: httpx.AsyncClient,
+    app,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_ids, merged_id = await _create_merge_reuse_case(
+        client, app, source_count=3,
+    )
+    async with app.state.session_factory() as session:
+        usage = await session.get(WorkspaceStorage, 1)
+        assert usage is not None
+        bytes_before = usage.bytes_used
+    dataset_root = app.state.settings.storage_dir / "datasets"
+    files_before = {
+        path.relative_to(dataset_root): path.read_bytes()
+        for path in dataset_root.rglob("*")
+        if path.is_file()
+    }
+
+    async def fail_commit(_session: AsyncSession) -> None:
+        raise RuntimeError("forced source delete commit failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(AsyncSession, "commit", fail_commit)
+        with pytest.raises(
+            RuntimeError, match="forced source delete commit failure",
+        ):
+            await client.delete(f"/api/datasets/{source_ids[2]}")
+
+    async with app.state.session_factory() as session:
+        assert await session.get(Dataset, source_ids[2]) is not None
+        old_dataset = await session.get(Dataset, merged_id)
+        assert old_dataset is not None and old_dataset.image_count == 3
+        assert list(
+            await session.scalars(
+                select(DatasetMergeSource.source_dataset_id)
+                .where(DatasetMergeSource.merged_dataset_id == merged_id)
+                .order_by(DatasetMergeSource.position)
+            )
+        ) == source_ids
+        usage = await session.get(WorkspaceStorage, 1)
+        assert usage is not None and usage.bytes_used == bytes_before
+    assert {
+        path.relative_to(dataset_root): path.read_bytes()
+        for path in dataset_root.rglob("*")
+        if path.is_file()
+    } == files_before
 
 
 async def test_merge_partial_overlap_returns_structured_conflict_without_side_effects(
@@ -747,7 +1021,7 @@ async def test_merge_partial_overlap_returns_structured_conflict_without_side_ef
     existing = first.json()
     async with app.state.session_factory() as session:
         dataset_count_before = await session.scalar(select(func.count(Dataset.id)))
-        usage = await session.get(UserStorage, 1)
+        usage = await session.get(WorkspaceStorage, 1)
         assert usage is not None
         bytes_before = usage.bytes_used
     dataset_root = app.state.settings.storage_dir / "datasets"
@@ -774,7 +1048,7 @@ async def test_merge_partial_overlap_returns_structured_conflict_without_side_ef
         assert await session.scalar(select(func.count(Dataset.id))) == (
             dataset_count_before
         )
-        usage_after = await session.get(UserStorage, 1)
+        usage_after = await session.get(WorkspaceStorage, 1)
         assert usage_after is not None and usage_after.bytes_used == bytes_before
     assert {path.name for path in dataset_root.iterdir()} == directories_before
 
@@ -1051,7 +1325,7 @@ async def test_extend_merged_dataset_appends_sources_without_mutating_existing_s
             existing_annotation.id,
             existing_annotation.cx,
         )
-        usage_before = await session.get(UserStorage, 1)
+        usage_before = await session.get(WorkspaceStorage, 1)
         assert usage_before is not None
         bytes_before = usage_before.bytes_used
 
@@ -1082,7 +1356,7 @@ async def test_extend_merged_dataset_appends_sources_without_mutating_existing_s
         )
         assert appended is not None
         assert appended.original_bytes + appended.thumb_bytes > 0
-        usage_after = await session.get(UserStorage, 1)
+        usage_after = await session.get(WorkspaceStorage, 1)
         assert usage_after is not None
         assert usage_after.bytes_used == bytes_before
 
@@ -1151,7 +1425,7 @@ async def test_extend_merged_dataset_consolidates_merged_snapshots_and_preserves
             loser_dataset.storage_path,
         )
         await session.commit()
-        usage_before = await session.get(UserStorage, 1)
+        usage_before = await session.get(WorkspaceStorage, 1)
         assert usage_before is not None
         bytes_before = usage_before.bytes_used
 
@@ -1192,7 +1466,7 @@ async def test_extend_merged_dataset_consolidates_merged_snapshots_and_preserves
             )
         ).one()
         assert copied_edits == (True, 0.9375, 0.1875)
-        usage_after = await session.get(UserStorage, 1)
+        usage_after = await session.get(WorkspaceStorage, 1)
         assert usage_after is not None
         assert usage_after.bytes_used == bytes_before
 
@@ -1348,7 +1622,7 @@ async def test_extend_merged_dataset_cancellation_restores_files_before_failed_r
                     session,
                     merged_dataset_id=target_id,
                     dataset_ids=losing_ids,
-                    owner_id=1,
+                    workspace_id=1,
                 )
         await session.rollback()
 
@@ -1414,7 +1688,8 @@ async def test_extend_merged_dataset_rejects_losing_merge_with_active_training(
     async with app.state.session_factory() as session:
         session.add(
             TrainingRun(
-                owner_id=1,
+                workspace_id=1,
+                created_by=1,
                 dataset_id=losing_id,
                 dataset_name=losing.json()["name"],
                 weights="yolo26n.pt",
@@ -1535,3 +1810,89 @@ async def test_extend_merged_dataset_rejects_invalid_target_and_cross_project_so
     assert foreign_owner.json()["detail"] == "선택한 데이터셋을 찾을 수 없습니다."
     assert cross_project.status_code == 409
     assert cross_project.json()["detail"] == "같은 프로젝트의 데이터셋만 합칠 수 있습니다."
+
+
+@pytest.mark.parametrize("operation", ["merge", "extract"])
+async def test_new_snapshot_labels_preserve_content_without_copying_assignment_or_actor_history(
+    client: httpx.AsyncClient, app, operation: str,
+) -> None:
+    project = await client.post("/api/projects", json={
+        "name": f"test-merge-label-state-{uuid4().hex}",
+        "classes": [{"name": "person", "color": "#EF4444"}],
+    })
+    assert project.status_code == 201, project.text
+    project_id = project.json()["id"]
+    source_ids = [
+        await create_ready_dataset(
+            client, app, project_id=project_id, suffix=f"label-state-{index}",
+            classes={0: "person"}, annotation_class_id=0,
+            content=f"label-state-{index}".encode(), count=5 if index == 0 else 1,
+        ) for index in range(2)
+    ]
+    timestamp = datetime(2026, 10, 14, tzinfo=timezone.utc)
+    # Positive boxes, explicit empty completion, missing labels, empty active
+    # work, and an imported empty label exercise distinct snapshot semantics.
+    cases = [
+        (False, 1, "in_progress", True),
+        (False, 0, "labeled", True),
+        (False, 0, "unlabeled", False),
+        (False, 0, "in_progress", True),
+        (True, 0, "labeled", False),
+    ]
+    def snapshot(image: Image) -> tuple:
+        return (image.has_label_source, image.box_count, image.is_modified,
+                image.label_status, image.assignee_id, image.assigned_at,
+                image.labeled_by, image.labeled_at, image.version)
+
+    async with app.state.session_factory() as session:
+        first_images = list(await session.scalars(select(Image).where(
+            Image.dataset_id == source_ids[0]).order_by(Image.id)))
+        assert len(first_images) == len(cases)
+        for image, (has_source, count, status, modified) in zip(first_images, cases, strict=True):
+            image.has_label_source = has_source
+            image.box_count = count
+            image.is_modified = modified
+            image.label_status = status
+            image.assignee_id = 1 if status == "in_progress" else None
+            image.assigned_at = timestamp if status == "in_progress" else None
+            image.labeled_by = 1 if status == "labeled" and modified else None
+            image.labeled_at = timestamp if image.labeled_by is not None else None
+            image.version = 7 if modified else 0
+            if count == 0:
+                await session.execute(delete(Annotation).where(Annotation.image_id == image.id))
+        first_dataset = await session.get(Dataset, source_ids[0])
+        first_dataset.annotation_count = sum(case[1] for case in cases)
+        second_image = await session.scalar(select(Image).where(Image.dataset_id == source_ids[1]))
+        assert second_image is not None
+        second_image.label_status = "labeled"
+        second_image.labeled_by = 1
+        second_image.labeled_at = timestamp
+        second_image.version = 9
+        await session.commit()
+        sources = [*first_images, second_image]
+        before = {image.id: snapshot(image) for image in sources}
+        expected_labels = ("labeled", "labeled", "unlabeled", "unlabeled", "labeled", "labeled")
+        expected = {
+            image.stem: (status, image.box_count, image.has_label_source, image.is_modified)
+            for image, status in zip(sources, expected_labels, strict=True)
+            if operation == "merge" or image.box_count > 0
+        }
+
+    body = {"name": f"test-merge-label-snapshot-{operation}-{uuid4().hex}", "dataset_ids": source_ids}
+    if operation == "extract":
+        body["class_ids"] = [0]
+    response = await client.post(f"/api/datasets/{operation}", json=body)
+    assert response.status_code == 201, response.text
+    target_id = response.json()["id"]
+    async with app.state.session_factory() as session:
+        copies = list(await session.scalars(select(Image).where(Image.dataset_id == target_id)))
+        assert {image.stem for image in copies} == set(expected)
+        for image in copies:
+            assert (image.label_status, image.box_count, image.has_label_source,
+                    image.is_modified) == expected[image.stem]
+            assert (image.assignee_id, image.assigned_at, image.labeled_by,
+                    image.labeled_at, image.version) == (None, None, None, None, 0)
+        unchanged_sources = list(await session.scalars(select(Image).where(Image.id.in_(before))))
+        assert {image.id: snapshot(image) for image in unchanged_sources} == before
+        assert await session.scalar(select(func.count()).select_from(Annotation).join(
+            Image, Annotation.image_id == Image.id).where(Image.dataset_id == target_id)) == 2

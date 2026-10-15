@@ -41,7 +41,7 @@ AUTOBATCH_FLOOR_DETAIL = (
 @dataclass(frozen=True)
 class RunConfig:
     run_id: int
-    owner_id: int
+    workspace_id: int
     weights: str
     epochs: int
     imgsz: int
@@ -61,7 +61,7 @@ def database_dsn() -> str:
     return database_url.replace("+asyncpg", "", 1)
 
 
-def load_run_config(run_id: int, owner_id: int, dsn: str) -> RunConfig:
+def load_run_config(run_id: int, workspace_id: int, dsn: str) -> RunConfig:
     with psycopg.connect(
         dsn,
         connect_timeout=5,
@@ -70,19 +70,19 @@ def load_run_config(run_id: int, owner_id: int, dsn: str) -> RunConfig:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, owner_id, weights, epochs, imgsz, batch,
+                SELECT id, workspace_id, weights, epochs, imgsz, batch,
                        training_args, out_dir
                 FROM training_runs
-                WHERE id=%s AND owner_id=%s AND state='running'
+                WHERE id=%s AND workspace_id=%s AND state='running'
                 """,
-                (run_id, owner_id),
+                (run_id, workspace_id),
             )
             row = cursor.fetchone()
     if row is None:
         raise LookupError(f"training run {run_id} is unavailable")
     return RunConfig(
         run_id=row["id"],
-        owner_id=row["owner_id"],
+        workspace_id=row["workspace_id"],
         weights=row["weights"],
         epochs=row["epochs"],
         imgsz=row["imgsz"],
@@ -114,7 +114,7 @@ def make_autobatch_floor_callback(
 
 def mark_run_failed(
     run_id: int,
-    owner_id: int,
+    workspace_id: int,
     dsn: str,
     error: str,
     *,
@@ -124,7 +124,7 @@ def mark_run_failed(
     """Compatibility wrapper around the shared idempotent failure recorder."""
     return persist_worker_failure(
         run_id,
-        owner_id,
+        workspace_id,
         dsn,
         FailureReport(
             reason=error,
@@ -139,7 +139,7 @@ def mark_run_failed(
 
 def complete_run(
     run_id: int,
-    owner_id: int,
+    workspace_id: int,
     dsn: str,
     out_dir: Path,
     trainer: Any,
@@ -177,15 +177,15 @@ def complete_run(
                     SET state='done',
                         finished_at=COALESCE(finished_at, now()),
                         artifact_bytes=%s
-                    WHERE id=%s AND owner_id=%s AND state='running'
+                    WHERE id=%s AND workspace_id=%s AND state='running'
                     """,
-                    (artifact_bytes, run_id, owner_id),
+                    (artifact_bytes, run_id, workspace_id),
                 )
                 updated = cursor.rowcount == 1
                 if updated:
                     increase_bytes_used_sync(
                         cursor,
-                        owner_id,
+                        workspace_id,
                         artifact_bytes,
                     )
     except BaseException:
@@ -198,10 +198,10 @@ def complete_run(
     return True
 
 
-def run_training(run_id: int, owner_id: int, dsn: str) -> None:
+def run_training(run_id: int, workspace_id: int, dsn: str) -> None:
     config: RunConfig | None = None
     try:
-        config = load_run_config(run_id, owner_id, dsn)
+        config = load_run_config(run_id, workspace_id, dsn)
         data_yaml = (config.out_dir / "workdir" / "data.yaml").resolve()
         weights_path = (WEIGHTS_DIR / config.weights).resolve()
         model = YOLO(str(weights_path))
@@ -211,7 +211,7 @@ def run_training(run_id: int, owner_id: int, dsn: str) -> None:
         )
         model.add_callback(
             "on_fit_epoch_end",
-            make_epoch_callback(run_id, config.owner_id, dsn),
+            make_epoch_callback(run_id, config.workspace_id, dsn),
         )
         model.train(
             data=str(data_yaml),
@@ -225,7 +225,7 @@ def run_training(run_id: int, owner_id: int, dsn: str) -> None:
         )
         complete_run(
             run_id,
-            config.owner_id,
+            config.workspace_id,
             dsn,
             config.out_dir,
             model.trainer,
@@ -238,7 +238,7 @@ def run_training(run_id: int, owner_id: int, dsn: str) -> None:
             )
             mark_run_failed(
                 run_id,
-                owner_id,
+                workspace_id,
                 dsn,
                 report.reason,
                 out_dir=config.out_dir if config is not None else None,
@@ -252,9 +252,9 @@ def run_training(run_id: int, owner_id: int, dsn: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id", type=int, required=True)
-    parser.add_argument("--owner-id", type=int, required=True)
+    parser.add_argument("--workspace-id", type=int, required=True)
     args = parser.parse_args()
-    run_training(args.run_id, args.owner_id, database_dsn())
+    run_training(args.run_id, args.workspace_id, database_dsn())
 
 
 if __name__ == "__main__":

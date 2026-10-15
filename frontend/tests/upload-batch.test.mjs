@@ -42,6 +42,7 @@ async function loadUploadApi(overrides = {}) {
   }
   const clientModule = moduleUrl(`
     const harness = globalThis[${JSON.stringify(harnessKey)}];
+    export const captureWorkspaceId = () => 1;
     export const apiFetch = (...args) => harness.apiFetch(...args);
     export const requestJson = (...args) => harness.requestJson(...args);
     export const responseOrThrow = (...args) => harness.responseOrThrow(...args);
@@ -59,6 +60,7 @@ async function loadUploadApi(overrides = {}) {
     },
   }).outputText
     .replace('from "./client"', `from "${clientModule}"`)
+    .replace('from "../store/workspace"', `from "${moduleUrl("export const getWorkspaceKind = () => 'personal';")}"`)
     .replace('from "../utils/storage"', `from "${storageModule}"`);
   const api = await import(`${moduleUrl(javascript)}#${Math.random()}`);
   return { api, calls, writes, removals, storage };
@@ -381,7 +383,7 @@ test("the upload page renders preparation counts while sessions are created", as
     "utf8",
   );
 
-  assert.match(uploadPage, /prepareUploadBatch\(targetId, batchFiles, \(\{/);
+  assert.match(uploadPage, /prepareUploadBatch\(targetId, batchFiles, transferState\.operation, \(\{/);
   assert.match(uploadPage, /preparedFiles/);
   assert.match(uploadPage, /totalFiles/);
   assert.match(uploadPage, /준비 중/);

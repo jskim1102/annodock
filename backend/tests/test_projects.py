@@ -26,6 +26,13 @@ def unique_name(suffix: str) -> str:
     return f"test-{suffix}-{uuid4().hex}"
 
 
+async def catalog_versions(app, dataset_ids: list[int]) -> dict[int, int]:
+    async with app.state.session_factory() as session:
+        rows = await session.execute(select(Dataset.id, Dataset.class_catalog_version)
+                                     .where(Dataset.id.in_(dataset_ids)).order_by(Dataset.id))
+        return dict(rows.all())
+
+
 async def test_project_creation_keeps_the_project_empty_and_persists_classes(
     client: httpx.AsyncClient,
 ) -> None:
@@ -59,6 +66,7 @@ async def test_project_creation_keeps_the_project_empty_and_persists_classes(
 
 async def test_dataset_is_created_inside_a_project_and_inherits_project_classes(
     client: httpx.AsyncClient,
+    app,
 ) -> None:
     project_name = unique_name("dataset-parent")
     dataset_name = unique_name("child-dataset")
@@ -84,7 +92,9 @@ async def test_dataset_is_created_inside_a_project_and_inherits_project_classes(
     assert dataset["project_id"] == project_id
     classes = await client.get(f"/api/datasets/{dataset['id']}/classes")
     assert classes.status_code == 200
+    versions = await catalog_versions(app, [dataset["id"]])
     assert classes.json() == {
+        "catalog_version": versions[dataset["id"]],
         "classes": [
             {"class_id": 0, "name": "person"},
             {"class_id": 1, "name": "vehicle"},
@@ -126,7 +136,7 @@ async def test_project_dataset_rows_report_actual_accounted_storage_bytes(
         dataset.image_count = 1
         session.add(
             image_with_media(
-                owner_id=dataset.owner_id,
+                workspace_id=dataset.workspace_id,
                 dataset_id=dataset_id,
                 stem="storage-sample",
                 filename="storage-sample.jpg",
@@ -210,7 +220,7 @@ async def test_selected_dataset_class_image_counts_count_each_image_once(
         second.image_count = 1
         images = [
             image_with_media(
-                owner_id=first.owner_id,
+                workspace_id=first.workspace_id,
                 dataset_id=first_id,
                 stem="first-a",
                 filename="first-a.jpg",
@@ -224,7 +234,7 @@ async def test_selected_dataset_class_image_counts_count_each_image_once(
                 box_count=3,
             ),
             image_with_media(
-                owner_id=first.owner_id,
+                workspace_id=first.workspace_id,
                 dataset_id=first_id,
                 stem="first-b",
                 filename="first-b.jpg",
@@ -238,7 +248,7 @@ async def test_selected_dataset_class_image_counts_count_each_image_once(
                 box_count=1,
             ),
             image_with_media(
-                owner_id=second.owner_id,
+                workspace_id=second.workspace_id,
                 dataset_id=second_id,
                 stem="second-a",
                 filename="second-a.jpg",
@@ -429,7 +439,7 @@ async def test_class_image_counts_accept_hidden_merged_source_datasets(
         original_path.write_bytes(b"hidden-source-original")
         thumb_path.write_bytes(b"hidden-source-thumb")
         source_image = image_with_media(
-            owner_id=first_source.owner_id,
+            workspace_id=first_source.workspace_id,
             dataset_id=source_ids[0],
             stem="hidden-source-image",
             filename="hidden-source-image.jpg",
@@ -523,6 +533,7 @@ async def test_projects_are_owner_scoped_and_foreign_projects_return_404(
 
 async def test_class_rename_updates_the_project_catalog_and_sibling_datasets(
     client: httpx.AsyncClient,
+    app,
 ) -> None:
     project_response = await client.post(
         "/api/projects",
@@ -547,6 +558,12 @@ async def test_class_rename_updates_the_project_catalog_and_sibling_datasets(
     )
 
     assert renamed.status_code == 200
+    versions = await catalog_versions(app, [first.json()["id"], second.json()["id"]])
+    assert renamed.json() == {
+        "class_id": 0, "name": "human",
+        "catalog_version": versions[first.json()["id"]],
+        "classes": [{"class_id": 0, "name": "human"}],
+    }
     detail = await client.get(f"/api/projects/{project_id}")
     sibling_classes = await client.get(
         f"/api/datasets/{second.json()['id']}/classes"
@@ -555,12 +572,14 @@ async def test_class_rename_updates_the_project_catalog_and_sibling_datasets(
         {"class_id": 0, "name": "human", "color": "#8B5CF6"}
     ]
     assert sibling_classes.json() == {
+        "catalog_version": versions[second.json()["id"]],
         "classes": [{"class_id": 0, "name": "human"}]
     }
 
 
 async def test_project_class_update_changes_name_color_and_propagates(
     client: httpx.AsyncClient,
+    app,
 ) -> None:
     project_response = await client.post(
         "/api/projects",
@@ -584,10 +603,12 @@ async def test_project_class_update_changes_name_color_and_propagates(
         json={"name": "human", "color": "#ef4444"},
     )
     assert updated.status_code == 200
+    versions = await catalog_versions(app, [child_id])
     assert updated.json() == {
         "class_id": 0,
         "name": "human",
         "color": "#EF4444",
+        "catalog_versions": [{"dataset_id": child_id, "catalog_version": versions[child_id]}],
     }
 
     detail = await client.get(f"/api/projects/{project_id}")
@@ -598,6 +619,7 @@ async def test_project_class_update_changes_name_color_and_propagates(
     }
     child_classes = await client.get(f"/api/datasets/{child_id}/classes")
     assert {"class_id": 0, "name": "human"} in child_classes.json()["classes"]
+    assert child_classes.json()["catalog_version"] == versions[child_id]
 
     # 색만 변경 — 이름 전파 없음
     color_only = await client.patch(
@@ -606,6 +628,10 @@ async def test_project_class_update_changes_name_color_and_propagates(
     )
     assert color_only.status_code == 200
     assert color_only.json()["name"] == "forklift"
+    assert color_only.json()["catalog_versions"] == updated.json()["catalog_versions"]
+    after_color = await client.get(f"/api/datasets/{child_id}/classes")
+    assert after_color.status_code == 200
+    assert after_color.json() == child_classes.json()
 
     # 중복 이름 409
     duplicate = await client.patch(
@@ -659,7 +685,7 @@ async def test_project_class_bulk_update_reorders_ids_across_every_dataset(
             assert dataset is not None
             dataset.status = "ready"
             image = image_with_media(
-                owner_id=dataset.owner_id,
+                workspace_id=dataset.workspace_id,
                 dataset_id=dataset_id,
                 stem=f"reorder-{index}",
                 filename=f"reorder-{index}.jpg",
@@ -725,12 +751,18 @@ async def test_project_class_bulk_update_reorders_ids_across_every_dataset(
         {"class_id": 1, "name": "helmet", "color": "#84CC16"},
         {"class_id": 2, "name": "human", "color": "#EF4444"},
     ]
-    assert reordered.json() == {"classes": expected_classes}
+    versions = await catalog_versions(app, dataset_ids)
+    assert reordered.json() == {
+        "classes": expected_classes,
+        "catalog_versions": [{"dataset_id": dataset_id, "catalog_version": version}
+                             for dataset_id, version in versions.items()],
+    }
     detail = await client.get(f"/api/projects/{project_id}")
     assert detail.json()["classes"] == expected_classes
     for dataset_id in dataset_ids:
         classes = await client.get(f"/api/datasets/{dataset_id}/classes")
         assert classes.json() == {
+            "catalog_version": versions[dataset_id],
             "classes": [
                 {"class_id": 0, "name": "forklift"},
                 {"class_id": 1, "name": "helmet"},

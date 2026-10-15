@@ -268,18 +268,71 @@ async def test_chunk_validation_and_aborted_sessions_fail_closed(
         )
     ).status_code == 416
 
-    async with app.state.session_factory() as session:
-        upload = await session.get(UploadSession, upload_id)
-        assert upload is not None
-        upload.state = "aborted"
-        await session.commit()
+    assert (await client.delete(f"/api/uploads/{upload_id}")).status_code == 204
 
     rejected = await client.put(
         f"/api/uploads/{upload_id}/chunks/0",
         content=b"abcd",
     )
     assert rejected.status_code == 409
-    assert "처음부터" in rejected.json()["detail"]
+    assert rejected.json()["detail"] == {
+        "code": "upload_session_aborted",
+        "message": "이전 업로드 기록이 만료되었습니다. 새로 시작합니다.",
+    }
+    assert not uploads_service.upload_directory(app.state.settings, upload_id).exists()
+    async with app.state.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None and upload.state == "aborted"
+        assert upload.received_chunks == []
+
+
+@pytest.mark.parametrize("state", ["done", "complete"])
+async def test_closed_sessions_preserve_string_conflicts_for_chunk_writes(
+    client: httpx.AsyncClient,
+    app,
+    state: str,
+) -> None:
+    dataset_id = await create_dataset(client)
+    created = await client.post(
+        f"/api/datasets/{dataset_id}/uploads",
+        json={
+            "filename": "sample.jpg",
+            "size": 4,
+            "chunk_size": 4,
+            "kind": "file",
+        },
+    )
+    assert created.status_code == 201
+    upload_id = created.json()["upload_id"]
+    chunk_url = f"/api/uploads/{upload_id}/chunks/0"
+    assert (await client.put(chunk_url, content=b"abcd")).status_code == 204
+    assert (await client.post(f"/api/uploads/{upload_id}/complete")).status_code == 202
+    if state == "done":
+        async with app.state.session_factory() as session:
+            upload = await session.get(UploadSession, upload_id)
+            assert upload is not None
+            upload.state = state
+            await session.commit()
+
+    single = await client.put(chunk_url, content=b"oops")
+    batch = await client.post(
+        f"/api/datasets/{dataset_id}/uploads/chunks/batch",
+        data={"metadata": json.dumps({
+            "chunks": [{"upload_id": upload_id, "chunk_number": 0, "size": 4}],
+        })},
+        files=[("chunks", ("sample.part", b"oops", "application/octet-stream"))],
+    )
+
+    assert single.status_code == batch.status_code == 409
+    assert single.json()["detail"] == batch.json()["detail"] == (
+        "이미 완료된 업로드입니다."
+    )
+    chunk = uploads_service.upload_directory(app.state.settings, upload_id) / "chunks" / "0.part"
+    assert chunk.read_bytes() == b"abcd"
+    async with app.state.session_factory() as session:
+        upload = await session.get(UploadSession, upload_id)
+        assert upload is not None and upload.state == state
+        assert upload.received_chunks == [0]
 
 
 async def test_upload_session_rejects_missing_dataset(
@@ -309,11 +362,11 @@ async def test_batch_upload_session_creation_preserves_order_and_checks_totals_o
     def observe_capacity(_request, **values: int) -> None:
         capacity_calls.append(values)
 
-    async def observe_quota(_session, _request, owner_id: int, required: int) -> None:
-        quota_calls.append((owner_id, required))
+    async def observe_quota(_session, _request, workspace_id: int, required: int) -> None:
+        quota_calls.append((workspace_id, required))
 
     monkeypatch.setattr(uploads_router, "_check_capacity", observe_capacity)
-    monkeypatch.setattr(uploads_router, "_check_user_quota", observe_quota)
+    monkeypatch.setattr(uploads_router, "_check_workspace_quota", observe_quota)
     response = await client.post(
         f"/api/datasets/{dataset_id}/uploads/batch",
         json={
@@ -560,6 +613,72 @@ async def test_chunk_batch_rejects_invalid_part_before_publishing_any_chunk(
         ).exists()
         for upload_id in upload_ids
     )
+
+
+async def test_chunk_batch_aborted_session_returns_code_without_partial_writes(
+    client: httpx.AsyncClient,
+    app,
+) -> None:
+    dataset_id = await create_dataset(client)
+    created = await client.post(
+        f"/api/datasets/{dataset_id}/uploads/batch",
+        json={
+            "files": [
+                {"filename": name, "size": 8, "chunk_size": 4, "kind": "file"}
+                for name in ("active.jpg", "aborted.jpg")
+            ],
+        },
+    )
+    assert created.status_code == 201
+    active_id, aborted_id = [item["upload_id"] for item in created.json()["uploads"]]
+    assert (
+        await client.put(f"/api/uploads/{active_id}/chunks/0", content=b"keep")
+    ).status_code == 204
+    assert (await client.delete(f"/api/uploads/{aborted_id}")).status_code == 204
+    page_url = f"/api/datasets/{dataset_id}/uploads/chunks/batch"
+    active_metadata = {"upload_id": active_id, "chunk_number": 1, "size": 4}
+
+    rejected = await client.post(
+        page_url,
+        data={"metadata": json.dumps({
+            "chunks": [
+                active_metadata,
+                {"upload_id": aborted_id, "chunk_number": 0, "size": 4},
+            ],
+        })},
+        files=[
+            ("chunks", ("active.part", b"next", "application/octet-stream")),
+            ("chunks", ("aborted.part", b"gone", "application/octet-stream")),
+        ],
+    )
+
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"] == {
+        "code": "upload_session_aborted",
+        "message": "이전 업로드 기록이 만료되었습니다. 새로 시작합니다.",
+    }
+    active_directory = uploads_service.upload_directory(app.state.settings, active_id)
+    assert (active_directory / "chunks" / "0.part").read_bytes() == b"keep"
+    assert sorted(path.name for path in (active_directory / "chunks").iterdir()) == [
+        "0.part",
+    ]
+    assert not uploads_service.upload_directory(app.state.settings, aborted_id).exists()
+    async with app.state.session_factory() as session:
+        active = await session.get(UploadSession, active_id)
+        aborted = await session.get(UploadSession, aborted_id)
+        assert active is not None and active.state == "open"
+        assert active.received_chunks == [0]
+        assert aborted is not None and aborted.state == "aborted"
+        assert aborted.received_chunks == []
+
+    resumed = await client.post(
+        page_url,
+        data={"metadata": json.dumps({"chunks": [active_metadata]})},
+        files=[("chunks", ("active.part", b"next", "application/octet-stream"))],
+    )
+    assert resumed.status_code == 204
+    assert (active_directory / "chunks" / "1.part").read_bytes() == b"next"
+    assert (await client.post(f"/api/uploads/{active_id}/complete")).status_code == 202
 
 
 async def test_chunk_batch_hides_foreign_sessions_and_rejects_oversized_body(

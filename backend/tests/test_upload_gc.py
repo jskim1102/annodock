@@ -21,7 +21,7 @@ from app.routers import datasets as datasets_router
 from app.routers import uploads as uploads_router
 from app.services import ingest as ingest_service
 from app.services import cleanup as cleanup_service
-from app.models import Dataset, Image, UploadJob, UploadSession, UserStorage
+from app.models import Dataset, Image, UploadJob, UploadSession, WorkspaceStorage
 from app.services.collect import CollectedFile
 from app.services.cleanup import sweep_upload_storage
 from app.services.ingest import ingest_collected, run_upload_batch_job
@@ -128,7 +128,7 @@ async def test_gc_removes_orphans_and_stale_open_but_preserves_recent_upload(
     orphan.mkdir(parents=True)
     (orphan / "payload").write_bytes(b"untracked")
     async with app.state.session_factory() as session:
-        session.add(UserStorage(owner_id=1, bytes_used=777))
+        session.add(WorkspaceStorage(workspace_id=1, bytes_used=777))
         await session.commit()
 
     result = await sweep_upload_storage(

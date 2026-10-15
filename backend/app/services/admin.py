@@ -13,11 +13,39 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
-from app.models import AdminUser
+from app.models import AdminUser, Workspace, WorkspaceMember, WorkspaceStorage
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceUsageRow:
+    id: int
+    kind: str
+    name: str
+    user_id: int | None
+    role: str | None
+    bytes_used: int
+    quota_limit_bytes: int | None
+
+
+async def load_workspace_usage(session: AsyncSession) -> list[WorkspaceUsageRow]:
+    """One joined read for both user memberships and workspace totals.
+
+    A missing storage row is a new, unused workspace; reporting must not
+    create it. Keep directory-orphan workspaces in the platform totals.
+    """
+    rows = await session.execute(select(
+        Workspace.id, Workspace.kind, Workspace.name,
+        WorkspaceMember.user_id, WorkspaceMember.role,
+        func.coalesce(WorkspaceStorage.bytes_used, 0),
+        WorkspaceStorage.quota_limit_bytes,
+    ).outerjoin(WorkspaceMember, WorkspaceMember.workspace_id == Workspace.id)
+     .outerjoin(WorkspaceStorage, WorkspaceStorage.workspace_id == Workspace.id)
+     .order_by(Workspace.id, WorkspaceMember.user_id))
+    return [WorkspaceUsageRow(*row) for row in rows]
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,11 +75,11 @@ _auth_engine: AsyncEngine | None = None
 _auth_engine_url: str | None = None
 
 
-async def is_admin(session: AsyncSession, owner_id: int) -> bool:
+async def is_admin(session: AsyncSession, user_id: int) -> bool:
     """Return whether the requesting user holds an admin grant."""
 
     grant = await session.scalar(
-        select(AdminUser.owner_id).where(AdminUser.owner_id == owner_id)
+        select(AdminUser.user_id).where(AdminUser.user_id == user_id)
     )
     return grant is not None
 

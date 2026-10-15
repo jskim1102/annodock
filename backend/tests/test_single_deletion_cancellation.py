@@ -22,13 +22,13 @@ async def _persist_terminal_run(app) -> tuple[int, Path]:
     storage_dir = app.state.settings.storage_dir
     async with app.state.session_factory() as session:
         project = Project(
-            owner_id=1,
+            workspace_id=1,
             name=f"test-single-delete-project-{uuid4().hex}",
         )
         session.add(project)
         await session.flush()
         dataset = Dataset(
-            owner_id=1,
+            workspace_id=1,
             project_id=project.id,
             name=f"test-single-delete-dataset-{uuid4().hex}",
             status="ready",
@@ -37,7 +37,8 @@ async def _persist_terminal_run(app) -> tuple[int, Path]:
         session.add(dataset)
         await session.flush()
         run = TrainingRun(
-            owner_id=1,
+            workspace_id=1,
+            created_by=1,
             dataset_id=dataset.id,
             dataset_name=dataset.name,
             weights="yolo26n.pt",

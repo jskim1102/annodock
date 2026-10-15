@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from app.deps import ensure_personal_workspace
 from app.services.quota import increase_bytes_used, set_quota_limit
 
 
@@ -58,9 +59,10 @@ async def test_storage_quota_reflects_the_persisted_counter(
 ) -> None:
     _set_quota_limit(app)
     async with app.state.session_factory() as session:
+        workspace = await ensure_personal_workspace(session, ACCOUNTED_OWNER_ID)
         used_bytes = await increase_bytes_used(
             session,
-            ACCOUNTED_OWNER_ID,
+            workspace.id,
             ACCOUNTED_BYTES,
         )
         await session.commit()
@@ -87,7 +89,8 @@ async def test_storage_quota_returns_the_users_persisted_override(
     _set_quota_limit(app)
     override = 12 * 1024**3
     async with app.state.session_factory() as session:
-        await set_quota_limit(session, ACCOUNTED_OWNER_ID, override)
+        workspace = await ensure_personal_workspace(session, ACCOUNTED_OWNER_ID)
+        await set_quota_limit(session, workspace.id, override)
         await session.commit()
 
     response = await client.get(

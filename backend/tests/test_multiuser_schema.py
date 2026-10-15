@@ -14,13 +14,13 @@ from app.models import (
     Dataset,
     ExportArtifact,
     Image,
-    Membership,
+    WorkspaceMember,
     MediaObject,
-    Organization,
+    Workspace,
     Project,
-    Team,
+    WorkspaceInvite,
     TrainingRun,
-    UserStorage,
+    WorkspaceStorage,
 )
 
 
@@ -51,18 +51,19 @@ def _check_names(model: type[object]) -> set[str]:
     }
 
 
-def test_owner_ids_match_auth_integer_subject_without_cross_database_fks() -> None:
-    for model in (Dataset, MediaObject, TrainingRun, Organization):
-        owner = model.__table__.c.owner_id
-        assert isinstance(owner.type, Integer)
-        assert owner.nullable is False
-        assert not owner.foreign_keys
-
-    user_id = Membership.__table__.c.user_id
-    assert isinstance(user_id.type, Integer)
-    assert user_id.nullable is False
-    assert not user_id.foreign_keys
-    assert UserStorage.__table__.c.owner_id.autoincrement is False
+def test_workspace_foreign_keys_and_logical_user_references() -> None:
+    for model in (Project, Dataset, MediaObject, TrainingRun):
+        workspace = model.__table__.c.workspace_id
+        assert isinstance(workspace.type, Integer)
+        assert workspace.nullable is False
+        assert {fk.target_fullname for fk in workspace.foreign_keys} == {"workspaces.id"}
+        assert all(fk.ondelete == "RESTRICT" for fk in workspace.foreign_keys)
+    for column in (Workspace.__table__.c.created_by, WorkspaceMember.__table__.c.user_id,
+                   TrainingRun.__table__.c.created_by):
+        assert isinstance(column.type, Integer)
+        assert column.nullable is False
+        assert not column.foreign_keys
+    assert WorkspaceStorage.__table__.c.workspace_id.autoincrement is False
 
 
 def test_accounting_columns_are_non_nullable_bigints() -> None:
@@ -75,7 +76,7 @@ def test_accounting_columns_are_non_nullable_bigints() -> None:
         MediaObject.__table__.c.thumb_bytes,
         Annotation.__table__.c.serialized_bytes,
         ExportArtifact.__table__.c.archive_bytes,
-        UserStorage.__table__.c.bytes_used,
+        WorkspaceStorage.__table__.c.bytes_used,
     )
     for column in accounting_columns:
         assert isinstance(column.type, BigInteger)
@@ -87,30 +88,25 @@ def test_accounting_columns_are_non_nullable_bigints() -> None:
     assert "ck_media_objects_bytes_nonnegative" in _check_names(MediaObject)
     assert "ck_annotations_serialized_bytes_nonnegative" in _check_names(Annotation)
     assert "ck_exports_archive_bytes_nonnegative" in _check_names(ExportArtifact)
-    assert "ck_user_storage_bytes_used_nonnegative" in _check_names(UserStorage)
-    quota_limit = UserStorage.__table__.c.quota_limit_bytes
+    assert "ck_workspace_storage_bytes_used_nonnegative" in _check_names(WorkspaceStorage)
+    quota_limit = WorkspaceStorage.__table__.c.quota_limit_bytes
     assert isinstance(quota_limit.type, BigInteger)
     assert quota_limit.nullable is True
     assert quota_limit.server_default is None
-    assert "ck_user_storage_quota_limit_positive" in _check_names(UserStorage)
+    assert "ck_workspace_storage_quota_limit_positive" in _check_names(WorkspaceStorage)
     assert "ck_training_runs_artifact_bytes_nonnegative" in _check_names(
         TrainingRun
     )
 
 
-def test_organization_team_membership_skeleton_has_explicit_permissions() -> None:
-    assert Team.__table__.c.org_id.foreign_keys
-    assert Membership.__table__.c.team_id.foreign_keys
-    assert tuple(
-        column.name for column in Membership.__table__.primary_key.columns
-    ) == ("team_id", "user_id")
-    assert {
-        "role",
-        "can_view",
-        "can_edit",
-        "can_manage",
-    } <= set(Membership.__table__.columns.keys())
-    assert "ck_memberships_role" in _check_names(Membership)
+def test_workspace_membership_and_invites_have_explicit_roles() -> None:
+    assert WorkspaceMember.__table__.c.workspace_id.foreign_keys
+    assert tuple(column.name for column in WorkspaceMember.__table__.primary_key.columns) == (
+        "workspace_id", "user_id",
+    )
+    assert "ck_workspace_members_role" in _check_names(WorkspaceMember)
+    assert "ck_workspace_invites_role" in _check_names(WorkspaceInvite)
+    assert "email" not in WorkspaceInvite.__table__.columns
 
 
 @pytest.mark.asyncio
@@ -118,11 +114,11 @@ async def test_migrated_database_enforces_owner_scoped_dataset_names(app) -> Non
     name = f"test-owner-scope-{uuid4().hex}"
     async with app.state.session_factory() as session:
         owner_one_project = Project(
-            owner_id=1,
+            workspace_id=1,
             name=f"test-owner-one-project-{uuid4().hex}",
         )
         owner_two_project = Project(
-            owner_id=2,
+            workspace_id=2,
             name=f"test-owner-two-project-{uuid4().hex}",
         )
         session.add_all([owner_one_project, owner_two_project])
@@ -130,14 +126,14 @@ async def test_migrated_database_enforces_owner_scoped_dataset_names(app) -> Non
         session.add_all(
             [
                 Dataset(
-                    owner_id=1,
+                    workspace_id=1,
                     project_id=owner_one_project.id,
                     name=name,
                     status="pending",
                     storage_path="a",
                 ),
                 Dataset(
-                    owner_id=2,
+                    workspace_id=2,
                     project_id=owner_two_project.id,
                     name=name,
                     status="pending",
@@ -149,7 +145,7 @@ async def test_migrated_database_enforces_owner_scoped_dataset_names(app) -> Non
 
         session.add(
             Dataset(
-                owner_id=1,
+                workspace_id=1,
                 project_id=owner_one_project.id,
                 name=name,
                 status="pending",
@@ -192,10 +188,10 @@ async def test_migrated_database_contains_accounting_and_collaboration_schema(
             )
         )
 
-    assert {"exports", "user_storage", "orgs", "teams", "memberships"} <= tables
-    assert "uq_datasets_owner_name" in dataset_constraints
+    assert {"exports", "workspace_storage", "workspaces", "workspace_members", "workspace_invites"} <= tables
+    assert "uq_datasets_workspace_name" in dataset_constraints
     assert "uq_datasets_name" not in dataset_constraints
-    assert "ix_training_runs_owner_id" in run_indexes
+    assert "ix_training_runs_workspace_id" in run_indexes
     assert image_columns["media_object_id"]["nullable"] is False
 
 

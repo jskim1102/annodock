@@ -185,3 +185,9 @@ test("bulk deletion refreshes canonical data and preserves failed selections", (
   assert.match(adminPage, /await refresh\(\)/);
   assert.match(adminPage, /for \(const id of completedIds\) next\.delete\(id\)/);
 });
+
+test("site-management breadcrumbs and fallback distinguish the page from team roles", () => {
+  assert.equal((adminPage.match(/breadcrumb="사이트 관리"/g) ?? []).length, 2);
+  assert.match(adminPage, /사이트 관리 정보를 불러오지 못했습니다\./);
+  assert.doesNotMatch(adminPage, /breadcrumb="관리자"|"관리자 정보를 불러오지 못했습니다\."/);
+});

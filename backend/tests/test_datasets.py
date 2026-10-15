@@ -55,7 +55,7 @@ async def test_dataset_crud_uses_precomputed_counts_and_removes_storage(
                     name="person",
                 ),
                 image_with_media(
-                    owner_id=dataset_row.owner_id,
+                    workspace_id=dataset_row.workspace_id,
                     dataset_id=dataset_id,
                     stem="train-a",
                     filename="train-a.jpg",
@@ -69,7 +69,7 @@ async def test_dataset_crud_uses_precomputed_counts_and_removes_storage(
                     box_count=4,
                 ),
                 image_with_media(
-                    owner_id=dataset_row.owner_id,
+                    workspace_id=dataset_row.workspace_id,
                     dataset_id=dataset_id,
                     stem="val-a",
                     filename="val-a.jpg",
@@ -85,6 +85,9 @@ async def test_dataset_crud_uses_precomputed_counts_and_removes_storage(
             ]
         )
         await session.commit()
+        # DatasetClass triggers update the DB row, not the already-loaded ORM instance.
+        await session.refresh(dataset_row, ["class_catalog_version"])
+        catalog_version = dataset_row.class_catalog_version
 
     listing = await client.get("/api/datasets?offset=0&limit=50")
     assert listing.status_code == 200
@@ -104,6 +107,7 @@ async def test_dataset_crud_uses_precomputed_counts_and_removes_storage(
     classes = await client.get(f"/api/datasets/{dataset_id}/classes")
     assert classes.status_code == 200
     assert classes.json() == {
+        "catalog_version": catalog_version,
         "classes": [
             {"class_id": 0, "name": "person"},
             {"class_id": 1, "name": "vehicle"},

@@ -26,7 +26,7 @@ from dotenv import dotenv_values
 from PIL import Image as PillowImage
 from sqlalchemy.engine import make_url
 
-from app.models import Dataset, TrainingRun, UserStorage
+from app.models import Dataset, TrainingRun, WorkspaceStorage
 from app.services import training
 from app.services.ingest import run_upload_batch_job
 from app.services.storage import contained_storage_path
@@ -272,7 +272,7 @@ def _prepare_training_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     monkeypatch.setattr(
         training,
         "spawn_worker",
-        lambda _run_id, _owner_id, _out_dir, _database_url: training.SpawnedWorker(
+        lambda _run_id, _workspace_id, _out_dir, _database_url: training.SpawnedWorker(
             pid=4242,
             pid_started_at="123456",
             boot_id="test-boot-id",
@@ -283,7 +283,7 @@ def _prepare_training_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
 def _finish_training_through_worker_boundary(
     app,
     *,
-    owner_id: int,
+    workspace_id: int,
     run_id: int,
     out_dir: Path,
 ) -> bytes:
@@ -306,7 +306,7 @@ def _finish_training_through_worker_boundary(
             "train/dfl_loss": 0.13,
         },
     )
-    callbacks.make_epoch_callback(run_id, owner_id, dsn)(trainer_state)
+    callbacks.make_epoch_callback(run_id, workspace_id, dsn)(trainer_state)
 
     train_dir = out_dir / "workdir" / "train"
     weights_dir = train_dir / "weights"
@@ -321,7 +321,7 @@ def _finish_training_through_worker_boundary(
 
     completed = train_worker.complete_run(
         run_id,
-        owner_id,
+        workspace_id,
         dsn,
         out_dir,
         SimpleNamespace(best=best_path, last=last_path, csv=csv_path),
@@ -348,7 +348,7 @@ async def test_signup_to_artifact_round_trip_enforces_owner_and_quota_boundaries
         transport=auth_transport,
         base_url="http://auth.test",
     ) as auth_client:
-        owner_id, owner_token = await _signup_and_login(
+        user_id, owner_token = await _signup_and_login(
             auth_client,
             suffix="owner",
         )
@@ -419,9 +419,12 @@ async def test_signup_to_artifact_round_trip_enforces_owner_and_quota_boundaries
             "w": 0.4,
             "h": 0.5,
         }
+        current = await owner.get(f"/api/images/{image_id}/annotations")
+        assert current.status_code == 200, current.text
         saved = await owner.put(
             f"/api/images/{image_id}/annotations",
-            json={"boxes": [saved_box]},
+            json={"boxes": [saved_box], "expected_version": current.json()["version"],
+                  "expected_catalog_version": current.json()["catalog_version"]},
         )
         assert saved.status_code == 200
         assert saved.json()["is_modified"] is True
@@ -447,14 +450,18 @@ async def test_signup_to_artifact_round_trip_enforces_owner_and_quota_boundaries
         assert isinstance(train.json()["warnings"], list)
         async with app.state.session_factory() as session:
             run = await session.get(TrainingRun, run_id)
-            assert run is not None and run.owner_id == owner_id
+            source_dataset = await session.get(Dataset, dataset_id)
+            assert source_dataset is not None
+            assert run is not None and run.workspace_id == source_dataset.workspace_id
+            assert run.created_by == user_id
+            workspace_id = run.workspace_id
             out_dir = contained_storage_path(
                 app.state.settings.storage_dir,
                 run.out_dir,
             )
         best_bytes = _finish_training_through_worker_boundary(
             app,
-            owner_id=owner_id,
+            workspace_id=workspace_id,
             run_id=run_id,
             out_dir=out_dir,
         )
@@ -479,7 +486,7 @@ async def test_signup_to_artifact_round_trip_enforces_owner_and_quota_boundaries
         ):
             hidden = await other.get(path)
             assert hidden.status_code == 404, (path, hidden.text)
-        assert other_id != owner_id
+        assert other_id != user_id
 
         exhausted_project = await exhausted.post(
             "/api/projects",
@@ -505,10 +512,10 @@ async def test_signup_to_artifact_round_trip_enforces_owner_and_quota_boundaries
             quota_dataset = await session.get(Dataset, exhausted_dataset_id)
             assert quota_dataset is not None
             quota_dataset.status = "ready"
-            quota_usage = await session.get(UserStorage, exhausted_id)
+            quota_usage = await session.get(WorkspaceStorage, quota_dataset.workspace_id)
             if quota_usage is None:
                 session.add(
-                    UserStorage(owner_id=exhausted_id, bytes_used=quota_limit)
+                    WorkspaceStorage(workspace_id=quota_dataset.workspace_id, bytes_used=quota_limit)
                 )
             else:
                 quota_usage.bytes_used = quota_limit

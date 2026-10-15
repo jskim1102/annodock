@@ -7,9 +7,10 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import func, select
 
-from app.models import RunMetric, TrainingRun
+from app.models import RunMetric, TrainingRun, Workspace, WorkspaceMember
 from app.worker import callbacks, failure, train_worker
 
 
@@ -19,9 +20,22 @@ OWNER_ID = 501
 OTHER_OWNER_ID = 502
 
 
-def make_run(*, owner_id: int, out_dir: str, state: str = "running") -> TrainingRun:
+@pytest_asyncio.fixture(autouse=True)
+async def worker_workspaces(app):
+    async with app.state.session_factory() as session:
+        for workspace_id in (OWNER_ID, OTHER_OWNER_ID):
+            session.add(Workspace(
+                id=workspace_id, kind="team", name=f"test-worker-{workspace_id}", created_by=1,
+            ))
+            await session.flush()
+            session.add(WorkspaceMember(workspace_id=workspace_id, user_id=1, role="owner"))
+        await session.commit()
+
+
+def make_run(*, workspace_id: int, out_dir: str, state: str = "running") -> TrainingRun:
     return TrainingRun(
-        owner_id=owner_id,
+        workspace_id=workspace_id,
+        created_by=1,
         dataset_id=None,
         dataset_name=f"test-worker-owner-{uuid4().hex}",
         weights="yolo26n.pt",
@@ -61,7 +75,7 @@ async def test_worker_reads_metrics_and_completion_are_owner_scoped(
 ) -> None:
     storage_dir = app.state.settings.storage_dir
     async with app.state.session_factory() as session:
-        run = make_run(owner_id=OWNER_ID, out_dir="training-runs/pending")
+        run = make_run(workspace_id=OWNER_ID, out_dir="training-runs/pending")
         session.add(run)
         await session.flush()
         run_id = run.id
@@ -98,7 +112,7 @@ async def test_worker_reads_metrics_and_completion_are_owner_scoped(
         dsn,
     )
     assert config.run_id == run_id
-    assert config.owner_id == OWNER_ID
+    assert config.workspace_id == OWNER_ID
 
     await asyncio.to_thread(
         callbacks.make_epoch_callback(run_id, OTHER_OWNER_ID, dsn),
@@ -157,7 +171,7 @@ async def test_worker_reads_metrics_and_completion_are_owner_scoped(
 
 async def test_worker_failure_update_is_owner_scoped(app) -> None:
     async with app.state.session_factory() as session:
-        run = make_run(owner_id=OWNER_ID, out_dir="training-runs/failure")
+        run = make_run(workspace_id=OWNER_ID, out_dir="training-runs/failure")
         session.add(run)
         await session.commit()
         run_id = run.id

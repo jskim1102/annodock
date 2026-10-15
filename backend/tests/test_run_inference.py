@@ -34,13 +34,13 @@ async def _persist_run_with_images(
 ) -> tuple[int, dict[str, list[tuple[int, int, Path]]], Path]:
     async with app.state.session_factory() as session:
         project = Project(
-            owner_id=1,
+            workspace_id=1,
             name=f"test-run-inference-project-{uuid4().hex}",
         )
         session.add(project)
         await session.flush()
         dataset = Dataset(
-            owner_id=1,
+            workspace_id=1,
             project_id=project.id,
             name=f"test-run-inference-dataset-{uuid4().hex}",
             status="ready",
@@ -70,7 +70,7 @@ async def _persist_run_with_images(
             source.write_bytes(contents)
             thumb.write_bytes(contents)
             image = image_with_media(
-                owner_id=dataset.owner_id,
+                workspace_id=dataset.workspace_id,
                 dataset_id=dataset.id,
                 stem=Path(filename).stem,
                 filename=filename,
@@ -104,7 +104,8 @@ async def _persist_run_with_images(
         best_path = artifacts / "best.pt"
         best_path.write_bytes(b"trusted training artifact")
         run = TrainingRun(
-            owner_id=1,
+            workspace_id=1,
+            created_by=1,
             dataset_id=dataset.id,
             dataset_name=f"test-run-inference-{uuid4().hex}",
             weights="yolo26n.pt",
