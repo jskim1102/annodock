@@ -536,7 +536,7 @@ export function updateProjectClass(
 export function updateProjectClasses(
   projectId: number,
   expectedUpdatedAt: string,
-  classes: readonly ProjectClassRow[],
+  classes: readonly (Omit<ProjectClassRow, "class_id"> & { class_id: number | null })[],
 ): Promise<{ classes: ProjectClassRow[]; catalog_versions: DatasetCatalogVersion[] }> {
   return requestJson<{ classes: ProjectClassRow[]; catalog_versions: DatasetCatalogVersion[] }>(
     `/api/projects/${projectId}/classes`,

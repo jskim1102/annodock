@@ -42,6 +42,7 @@ import {
 import { getProjectSummary } from "../utils/projectSummary";
 import { sortProjects, type ProjectSortOrder } from "../utils/projectSort";
 import { formatBytes } from "../utils/formatBytes";
+import { CLASS_COLOR_PRESETS } from "../utils/classColors";
 
 function dateLabel(value: string) {
   return new Intl.DateTimeFormat("ko-KR", {
@@ -2309,6 +2310,8 @@ function EditProjectClassesDialog({
   const [rows, setRows] = useState(
     project.classes.map((item) => ({ ...item })),
   );
+  // Negative IDs identify unsaved rows locally; only null is sent for additions.
+  const nextDraftClassId = useRef(-1);
   const [colorClassId, setColorClassId] = useState<number | null>(null);
   const [draggedClassId, setDraggedClassId] = useState<number | null>(null);
   const [dragOverClassId, setDragOverClassId] = useState<number | null>(null);
@@ -2328,7 +2331,7 @@ function EditProjectClassesDialog({
     project.classes.find((item) => item.class_id === classId);
   const changedRows = rows.filter((row) => {
     const original = findOriginal(row.class_id);
-    if (!original) return false;
+    if (!original) return true;
     return original.name !== row.name.trim() || original.color !== row.color;
   });
   const orderChanged = rows.some(
@@ -2336,6 +2339,7 @@ function EditProjectClassesDialog({
   );
   const hasChanges = orderChanged || changedRows.length > 0;
   const hasBlankName = rows.some((row) => row.name.trim().length === 0);
+  const hasDuplicateName = new Set(rows.map((row) => row.name.trim())).size !== rows.length;
 
   const moveClassToIndex = (classId: number, targetIndex: number) => {
     setRows((current) => {
@@ -2354,12 +2358,12 @@ function EditProjectClassesDialog({
   };
 
   const save = async () => {
-    if (busy || !hasChanges || hasBlankName) return;
+    if (busy || !hasChanges || hasBlankName || hasDuplicateName) return;
     setBusy(true);
     setError(null);
     try {
       await updateProjectClasses(project.id, project.updated_at, rows.map((row) => ({
-        class_id: row.class_id,
+        class_id: row.class_id < 0 ? null : row.class_id,
         name: row.name.trim(),
         color: row.color,
       })));
@@ -2505,13 +2509,28 @@ function EditProjectClassesDialog({
             </div>
           ))}
         </div>
+        <button
+          className="btn btn-ghost btn-sm add-class-button"
+          type="button"
+          disabled={busy || rows.length >= 200}
+          onClick={() => {
+            if (busy || rows.length >= 200) return;
+            const classId = nextDraftClassId.current--;
+            setRows((current) => [...current, {
+              class_id: classId,
+              name: "",
+              color: CLASS_COLOR_PRESETS[current.length % CLASS_COLOR_PRESETS.length].value,
+            }]);
+          }}
+        ><Icon name="plus" size={14} /> 클래스 추가</button>
+        {hasDuplicateName ? <div className="error-text" role="alert">이미 있는 클래스 이름입니다.</div> : null}
         {error ? <div className="error-text project-dialog-error" role="alert">{error}</div> : null}
         <div className="dialog-actions">
           <button className="btn btn-secondary" type="button" disabled={busy} onClick={onClose}>취소</button>
           <button
             className="btn btn-primary"
             type="button"
-            disabled={busy || !hasChanges || hasBlankName}
+            disabled={busy || !hasChanges || hasBlankName || hasDuplicateName}
             onClick={() => void save()}
           >{busy ? "저장 중…" : "저장"}</button>
         </div>

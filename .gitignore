@@ -34,6 +34,9 @@ backend/weights/
 .cloudflared/
 deploy/*.credentials.json
 
+# annodock.com landing pages are kept out of the public repo.
+deploy/landing/
+
 # --- 대시보드에서 제외 (harness) ---
 /url.txt
 /logo-assets/

@@ -22,9 +22,13 @@ export function DatasetProgressCell({ dataset, workspaceId, revision, onOpen }: 
     void getDatasetProgress(dataset.id, workspaceId).then((value) => { if (active) setProgress(value); }).catch(() => {});
     return () => { active = false; };
   }, [dataset.id, workspaceId, revision]);
+  const summary = progress ? `${progress.labeled}/${progress.total} · ${progress.total ? Math.round(progress.labeled / progress.total * 100) : 0}%` : "—";
   return <div className="dataset-progress-cell">
-    {progress ? <><DatasetProgressBar progress={progress} /><span className="mono">{progress.labeled}/{progress.total} · {progress.total ? Math.round(progress.labeled / progress.total * 100) : 0}%</span></> : <span>—</span>}
-    <button className="btn btn-ghost btn-sm" onClick={onOpen} aria-label={`${dataset.name} 진행률`}>진행률 ›</button>
+    <div className="dataset-progress-summary">
+      {progress ? <DatasetProgressBar progress={progress} /> : null}
+      <span className="dataset-progress-count mono" title={summary}>{summary}</span>
+    </div>
+    <button className="btn btn-ghost btn-sm dataset-progress-open" onClick={onOpen} aria-label={`${dataset.name} 진행률`}>진행률 ›</button>
   </div>;
 }
 
@@ -102,9 +106,9 @@ export function DatasetProgressPanel({ dataset, workspaceId, canManage, onClose,
         <tr><td>가져온 라벨</td><td>—</td><td>{progress.imported_labeled}</td>{canManage ? <td /> : null}</tr>
       </tbody></table>
       {canManage ? <section><h3>남은 {progress.unlabeled}장을 나눠 맡기기</h3>
-        <div className="assignment-members">{members.filter((member) => ["owner", "admin", "editor"].includes(member.role)).map((member) => <label key={member.user_id} className="checkbox">
+        <div className="assignment-members">{members.filter((member) => ["owner", "admin", "editor"].includes(member.role)).map((member) => <label key={member.user_id} className="assignment-member">
           <input type="checkbox" checked={selected.includes(member.user_id)} disabled={busy} onChange={(event) => setSelected((ids) => event.target.checked ? [...ids.filter((id) => id !== member.user_id), member.user_id] : ids.filter((id) => id !== member.user_id))} />
-          {memberName(member.user_id)}</label>)}</div>
+          <span>{memberName(member.user_id)}</span></label>)}</div>
         {selected.length ? <p>선택 {selected.length}명 → 1인당 약 {Math.ceil(progress.unlabeled / selected.length)}장</p> : null}
         <button className="btn btn-primary" disabled={busy || selected.length === 0} onClick={distribute}>배정하기</button>
       </section> : null}

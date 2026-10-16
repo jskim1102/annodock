@@ -194,7 +194,8 @@ class ProjectClassUpdated(ProjectClassRow):
 
 
 class ProjectClassReplacement(ProjectClassCreate):
-    class_id: int = Field(ge=0)
+    # Existing IDs must appear exactly once; null denotes a new catalog entry.
+    class_id: int | None = Field(ge=0)
 
 
 class ProjectClassBulkUpdate(BaseModel):
@@ -967,7 +968,7 @@ async def replace_project_classes(
     session: Session,
     current_workspace: AdminWorkspaceDep,
 ) -> ProjectClassList:
-    """Atomically reorder the catalog and every persisted class reference."""
+    """Atomically add/reorder classes and preserve persisted class references."""
     active_job_statement = (
         select(UploadJob.id)
         .join(Dataset, Dataset.id == UploadJob.dataset_id)
@@ -1030,7 +1031,7 @@ async def replace_project_classes(
         )
     ).all()
     current_class_ids = [row.class_id for row in current_classes]
-    requested_class_ids = [row.class_id for row in body.classes]
+    requested_class_ids = [row.class_id for row in body.classes if row.class_id is not None]
     if (
         len(requested_class_ids) != len(current_class_ids)
         or set(requested_class_ids) != set(current_class_ids)
@@ -1117,7 +1118,12 @@ async def replace_project_classes(
     class_id_remap = {
         row.class_id: new_class_id
         for new_class_id, row in enumerate(body.classes)
+        if row.class_id is not None
     }
+    added_classes = [
+        (class_id, row) for class_id, row in enumerate(body.classes)
+        if row.class_id is None
+    ]
     project_image_ids = select(Image.id).where(Image.dataset_id.in_(dataset_ids))
 
     try:
@@ -1197,8 +1203,27 @@ async def replace_project_classes(
                 for new_class_id, row in enumerate(body.classes)
             ]
         )
+        # Preserve sparse child catalogs, while making every new class available
+        # in all datasets, including children that do not yet contain labels.
+        session.add_all([
+            DatasetClass(dataset_id=dataset_id, class_id=class_id, name=row.name)
+            for dataset_id in dataset_ids
+            for class_id, row in added_classes
+        ])
         project.updated_at = func.now()
         await session.flush()
+        if added_classes and dataset_ids:
+            await session.execute(
+                update(Dataset)
+                .where(Dataset.id.in_(dataset_ids))
+                .values(class_count=(
+                    select(func.count())
+                    .select_from(DatasetClass)
+                    .where(DatasetClass.dataset_id == Dataset.id)
+                    .scalar_subquery()
+                ))
+                .execution_options(synchronize_session=False)
+            )
         catalog_versions = await _catalog_versions(session, project_id)
         await session.commit()
     except IntegrityError as error:
